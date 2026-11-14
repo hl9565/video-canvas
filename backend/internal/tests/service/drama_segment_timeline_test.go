@@ -14,6 +14,7 @@ import (
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
 	"video-canvas/internal/provider/modelcfg"
+	"video-canvas/internal/repository"
 	"video-canvas/internal/service"
 	"video-canvas/internal/service/dramasegmentfake"
 )
@@ -145,6 +146,15 @@ func TestDramaMediaIntegration_RejectsTimelineOverrunWithModelCap(t *testing.T) 
 		}
 		seg := model.DramaSegment{UserID: e.user, EpisodeID: ep.ID, Seq: 0, Seconds: segSeconds}
 		if err := e.db.Create(&seg).Error; err != nil {
+			t.Fatal(err)
+		}
+		initial, err := defaultTaskLimits().InitialCredits(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.store.WithTx(context.Background(), func(tx repository.GenerationTaskTx) error {
+			return tx.EnsureCredit(context.Background(), e.user, initial)
+		}); err != nil {
 			t.Fatal(err)
 		}
 		return e, "seg:" + idcodec.Encode(seg.ID)
