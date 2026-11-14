@@ -18,8 +18,8 @@ export function useDramaVideoModel(dramaId: string, projectModel = "") {
     [prefs.videoModel, projectModel, remote.models],
   );
   const setModel = useCallback(
-    (key: string) => useStudioPrefsStore.getState().patch(dramaId, { videoModel: key }),
-    [dramaId],
+    (key: string) => useStudioPrefsStore.getState().setVideoModel(dramaId, key, model?.key),
+    [dramaId, model?.key],
   );
   return {
     models: remote.models,

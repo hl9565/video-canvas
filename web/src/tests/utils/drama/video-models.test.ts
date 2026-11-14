@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import type { Capabilities, ModelInfo, ParamField } from "@/api/model/type";
 import {
+  durationChoices,
+  effectiveDuration,
   fitDuration,
   modelMaxSeconds,
   modelSummary,
@@ -139,6 +141,45 @@ describe("提交参数：时长跟片段、比例跟短剧", () => {
     const bare = segmentParams(caps({ params: {} }), { seconds: 8, ratio: "9:16", overrides: {} });
     expect(bare).toEqual({});
   });
+
+  test("未开放、小数或越界 overrides 不会被下发（跨模型切回来也不串味）", () => {
+    const withSeed = caps({
+      params: {
+        ...caps().params,
+        seed: {
+          type: "number",
+          label: "随机种子",
+          open: true,
+          min: -1,
+          max: 4_294_967_295,
+          step: 1,
+          default: 3_916_315_536,
+        },
+        locked: { type: "number", label: "锁定", open: false, default: 7 },
+      },
+    });
+    expect(
+      segmentParams(withSeed, {
+        seconds: 5,
+        ratio: "9:16",
+        overrides: { seed: -1, locked: 99 },
+      }),
+    ).toEqual({ duration: 5, aspect_ratio: "9:16", seed: -1 });
+    expect(
+      segmentParams(withSeed, {
+        seconds: 5,
+        ratio: "9:16",
+        overrides: { seed: 4_294_967_296 },
+      }).seed,
+    ).toBeUndefined();
+    expect(
+      segmentParams(withSeed, {
+        seconds: 5,
+        ratio: "9:16",
+        overrides: { seed: 1.8 },
+      }).seed,
+    ).toBeUndefined();
+  });
 });
 
 describe("默认模型", () => {
@@ -162,5 +203,67 @@ describe("默认模型", () => {
     expect(pickVideoModel(list, "gone", "second")?.key).toBe("second");
     expect(pickVideoModel(list, "", "nope")?.key).toBe("first");
     expect(pickVideoModel(list, "", "gone")?.key).toBe("first");
+  });
+});
+
+describe("2s、未开放锁定与非整除 step 时长", () => {
+  test("fitDuration / effectiveDuration 处理缺失、open:false 与 step", () => {
+    expect(fitDuration(undefined, 2)).toEqual({ value: 2, adjusted: false });
+
+    const lockedCaps = caps({
+      params: {
+        duration: { type: "number", label: "时长", open: false, default: 2, min: 2, max: 15 },
+      },
+    });
+    expect(effectiveDuration(lockedCaps, 5)).toEqual({ value: 2, adjusted: true });
+    expect(effectiveDuration(lockedCaps, 2)).toEqual({ value: 2, adjusted: false });
+    expect(modelMaxSeconds(lockedCaps)).toBe(2);
+
+    const steppedCaps = caps({
+      params: {
+        duration: {
+          type: "number",
+          label: "时长",
+          open: true,
+          min: 2,
+          max: 15,
+          step: 4,
+          default: 6,
+        },
+      },
+    });
+    // max=15 不在 step=4 网格上，真实最大可达为 2 + floor(13/4)*4 = 14
+    expect(modelMaxSeconds(steppedCaps)).toBe(14);
+    expect(effectiveDuration(steppedCaps, 5)).toEqual({ value: 6, adjusted: true });
+    expect(effectiveDuration(steppedCaps, 15)).toEqual({ value: 14, adjusted: true });
+    expect(effectiveDuration(steppedCaps, 2)).toEqual({ value: 2, adjusted: false });
+
+    // 未开放时 segmentParams 不下发可控参数，但 effectiveDuration 仍返回锁定值
+    expect(segmentParams(lockedCaps, { seconds: 5, ratio: "16:9", overrides: {} })).toEqual({});
+  });
+
+  test("durationChoices 展示真实可选秒数（含 2s，不被白名单截断）", () => {
+    const fullCaps = caps({
+      params: {
+        duration: {
+          type: "number",
+          label: "时长",
+          open: true,
+          min: 2,
+          max: 15,
+          step: 1,
+          default: 5,
+        },
+      },
+    });
+    expect(durationChoices(fullCaps, 5)).toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+
+    const enumCaps = caps({
+      params: {
+        duration: { type: "enum", label: "时长", open: true, options: ["2", "5"], default: "5" },
+      },
+    });
+    expect(durationChoices(enumCaps, 4)).toEqual([2, 4, 5]);
+    expect(durationChoices(undefined, 2)).toContain(2);
   });
 });

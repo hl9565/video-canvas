@@ -21,6 +21,7 @@ import {
   effectiveValue,
   manualRefs,
   openParams,
+  parseStrictInt,
   refKindsOf,
   refUploadError,
   REF_KEYS,
@@ -179,66 +180,159 @@ function SegmentedControl({
   );
 }
 
-/** 数字参数（如时长）：滑块 + 数字输入框 + 单位，滑块下标注最短 / 最长 */
-function NumberControl({
+/** 数字参数（如时长、seed）：大范围隐藏滑轨，严格整数不截断小数，并区分「恢复默认」与「随机 (-1)」 */
+export function NumberControl({
   field,
   value,
+  hasOverride,
   disabled,
   invalid,
+  error,
   onChange,
 }: {
   field: ParamEntry;
   value: unknown;
+  hasOverride?: boolean;
   disabled?: boolean;
   invalid?: boolean;
+  error?: string;
   onChange: (value: unknown) => void;
 }) {
-  const min = field.min ?? 0;
+  const isSeed = field.name === "seed";
+  const min = field.min ?? (isSeed ? -1 : 0);
   const max = field.max ?? min;
+  const wideRange = isSeed || max - min > 10_000;
+  const allowRandom = isSeed && min <= -1 && max >= -1;
   const n = typeof value === "number" ? value : Number(value);
   const current = Number.isFinite(n) ? n : min;
   const unit = field.unit ?? "";
+
+  const [draft, setDraft] = useState<{ base: unknown; text: string } | null>(null);
+  const activeDraft = draft && draft.base === value ? draft.text : null;
+  const displayValue = activeDraft ?? (value === undefined || value === null ? "" : String(value));
+  const draftError =
+    activeDraft !== null && activeDraft !== "" && parseStrictInt(activeDraft) === null
+      ? `${field.label}需要是整数`
+      : undefined;
+
+  const effective = value ?? field.default;
+  const overridden = hasOverride ?? (value !== undefined && value !== field.default);
+  const effectiveNum = typeof effective === "number" ? effective : Number(effective);
+  const statusText = !overridden
+    ? allowRandom && effectiveNum === -1
+      ? "当前按模型默认：随机 (-1)"
+      : effective !== undefined && effective !== null
+        ? `当前按模型默认：${effective}${unit}`
+        : "当前未设置"
+    : allowRandom && effectiveNum === -1
+      ? "当前：随机 (-1)"
+      : effective !== undefined && effective !== null
+        ? `当前覆盖：${effective}${unit}`
+        : "当前未设置";
+  const shownError = draftError ?? error;
+
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-1.5">
       <div className="flex items-center gap-2">
-        <input
-          type="range"
-          aria-label={field.label}
-          min={min}
-          max={max}
-          step={field.step ?? 1}
-          value={Math.min(Math.max(current, min), max)}
-          disabled={disabled}
-          className="nodrag accent-foreground h-1.5 min-w-0 flex-1 cursor-pointer disabled:opacity-50"
-          onChange={(event) => onChange(Number(event.target.value))}
-        />
+        {!wideRange && (
+          <input
+            type="range"
+            aria-label={field.label}
+            min={min}
+            max={max}
+            step={field.step ?? 1}
+            value={Math.min(Math.max(current, min), max)}
+            disabled={disabled}
+            className="nodrag accent-foreground h-1.5 min-w-0 flex-1 cursor-pointer disabled:opacity-50"
+            onChange={(event) => {
+              setDraft(null);
+              onChange(Number(event.target.value));
+            }}
+          />
+        )}
         <Input
-          type="number"
+          type="text"
           inputMode="numeric"
-          min={min}
-          max={max}
-          step={field.step ?? 1}
           disabled={disabled}
-          aria-invalid={invalid}
+          aria-invalid={Boolean(invalid || shownError)}
           aria-label={`${field.label}（数值）`}
-          className="h-7 w-16 px-2 text-xs tabular-nums"
-          value={value === undefined || value === null ? "" : String(value)}
+          placeholder={field.default !== undefined ? String(field.default) : undefined}
+          className={cn("h-7 px-2 text-xs tabular-nums", wideRange ? "w-28" : "w-16")}
+          value={displayValue}
           onChange={(event) => {
             const raw = event.target.value;
-            onChange(raw === "" ? undefined : Number(raw));
+            if (raw === "") {
+              if (field.default === undefined) {
+                setDraft(null);
+                onChange(undefined);
+              } else {
+                setDraft({ base: value, text: "" });
+              }
+              return;
+            }
+            const parsed = parseStrictInt(raw);
+            if (parsed !== null) {
+              setDraft(null);
+              onChange(parsed);
+              return;
+            }
+            setDraft({ base: value, text: raw });
+          }}
+          onBlur={() => {
+            if (activeDraft === "") {
+              setDraft(null);
+              onChange(undefined);
+            }
           }}
         />
         {unit && <span className="text-muted-foreground text-xs">{unit}</span>}
       </div>
-      <div className="text-muted-foreground flex justify-between text-[10px]">
+      {(isSeed || wideRange) && (
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-muted-foreground text-[11px] tabular-nums">{statusText}</span>
+          {overridden && (
+            <Button
+              type="button"
+              variant="outline"
+              size="xs"
+              disabled={disabled}
+              onClick={() => {
+                setDraft(null);
+                onChange(undefined);
+              }}
+            >
+              恢复默认
+            </Button>
+          )}
+          {allowRandom && (
+            <Button
+              type="button"
+              variant={effectiveNum === -1 ? "secondary" : "outline"}
+              size="xs"
+              disabled={disabled}
+              onClick={() => {
+                setDraft(null);
+                onChange(-1);
+              }}
+            >
+              随机 (-1)
+            </Button>
+          )}
+        </div>
+      )}
+      {shownError && <p className="text-destructive text-xs">{shownError}</p>}
+      <div className="text-muted-foreground flex justify-between text-[10px] tabular-nums">
         <span>
-          最短 {min}
-          {unit}
+          {wideRange
+            ? `范围 ${min} – ${max}${allowRandom ? "（-1 为随机）" : ""}`
+            : `最短 ${min}${unit}`}
         </span>
-        <span>
-          最长 {max}
-          {unit}
-        </span>
+        {!wideRange && (
+          <span>
+            最长 {max}
+            {unit}
+          </span>
+        )}
       </div>
     </div>
   );
@@ -266,8 +360,10 @@ function ParamRow({
       <NumberControl
         field={field}
         value={value}
+        hasOverride={params[field.name] !== undefined}
         disabled={disabled}
         invalid={invalid}
+        error={error}
         onChange={set}
       />
     );
@@ -305,7 +401,7 @@ function ParamRow({
     <div className="flex flex-col gap-1">
       <span className="text-muted-foreground text-xs">{field.label}</span>
       {control}
-      {error && <p className="text-destructive text-xs">{error}</p>}
+      {field.type !== "number" && error && <p className="text-destructive text-xs">{error}</p>}
     </div>
   );
 }

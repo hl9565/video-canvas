@@ -11,13 +11,13 @@ import (
 
 // ParamHint 是对一个生成参数的预填建议，键是模板里的参数名。字段都可省略，只覆盖给出的部分。
 type ParamHint struct {
-	Options []any `json:"options,omitempty"` // enum：可选值（字符串或数字）
-	Default any   `json:"default,omitempty"` // 默认值，类型随参数
-	Min     *int  `json:"min,omitempty"`     // number：最小值
-	Max     *int  `json:"max,omitempty"`     // number：最大值
-	Step    *int  `json:"step,omitempty"`    // number：步长
-	Open    *bool `json:"open,omitempty"`    // 是否开放给用户
-	Remove  bool  `json:"remove,omitempty"`  // true：从模板里去掉这个参数（模型没有这一项）
+	Options []any  `json:"options,omitempty"` // enum：可选值（字符串或数字）
+	Default any    `json:"default,omitempty"` // 默认值，类型随参数
+	Min     *int64 `json:"min,omitempty"`     // number：最小值
+	Max     *int64 `json:"max,omitempty"`     // number：最大值
+	Step    *int   `json:"step,omitempty"`    // number：步长
+	Open    *bool  `json:"open,omitempty"`    // 是否开放给用户
+	Remove  bool   `json:"remove,omitempty"`  // true：从模板里去掉这个参数（模型没有这一项）
 }
 
 // maxParamHints 是一份草稿里最多的预填建议数，防止插件返回过大的结构。
@@ -66,12 +66,27 @@ func paramHintIssues(name string, h ParamHint) []string {
 	default:
 		out = append(out, "默认值必须是字符串、数字或布尔值")
 	}
+	domMin, domMax, fixedStep := numberDomain(name)
+	hintMin := int64(0)
+	if fixedStep {
+		hintMin = domMin
+	}
 	for _, f := range []struct {
 		label string
-		v     *int
-	}{{"min", h.Min}, {"max", h.Max}, {"step", h.Step}} {
-		if f.v != nil && (*f.v < 0 || *f.v > maxNumberValue) {
-			out = append(out, fmt.Sprintf("%s 必须在 0 – %d 之间", f.label, maxNumberValue))
+		v     *int64
+	}{{"min", h.Min}, {"max", h.Max}} {
+		if f.v != nil && (*f.v < hintMin || *f.v > domMax) {
+			out = append(out, fmt.Sprintf("%s 必须在 %d – %d 之间", f.label, hintMin, domMax))
+		}
+	}
+	if h.Min != nil && h.Max != nil && *h.Min > *h.Max {
+		out = append(out, "min 不能大于 max")
+	}
+	if h.Step != nil {
+		if fixedStep && *h.Step != 1 {
+			out = append(out, "step 必须为 1")
+		} else if !fixedStep && (*h.Step < 0 || int64(*h.Step) > domMax) {
+			out = append(out, fmt.Sprintf("step 必须在 0 – %d 之间", domMax))
 		}
 	}
 	return out

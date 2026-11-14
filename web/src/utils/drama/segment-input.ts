@@ -11,7 +11,8 @@ import {
 } from "@/utils/tasks/capabilities";
 
 import type { DramaAssetType, RefAsset } from "./segment-assets";
-import { durationField, fitDuration, segmentParams } from "./video-models";
+import { timelineOverrun, timelineOverrunMessage } from "./timeline";
+import { durationField, effectiveDuration, segmentParams } from "./video-models";
 
 /** 提示词里一个引用在这次请求里的去向（参考素材条据此画） */
 export type RefView = {
@@ -191,15 +192,23 @@ export function planSegmentInput(args: {
 
   const notices = [...bindings.notices];
   const duration = durationField(caps);
-  if (duration) {
-    const fit = fitDuration(duration, args.seconds);
-    if (fit.adjusted) notices.push(`片段 ${args.seconds}s 超出模型范围，按 ${fit.value}s 生成`);
+  const fit = effectiveDuration(caps, args.seconds);
+  if (duration && fit.adjusted) {
+    notices.push(
+      duration.open === false
+        ? `模型固定为 ${fit.value}s，将按 ${fit.value}s 生成`
+        : `片段 ${args.seconds}s 超出模型范围，按 ${fit.value}s 生成`,
+    );
   }
+  const tl = timelineOverrun(prompt, fit.value);
+  const errors = tl.overrun
+    ? { ...built.errors, timeline: timelineOverrunMessage(tl.end, fit.value) }
+    : built.errors;
   const images = built.input.images;
   return {
     op,
     input: built.input,
-    errors: built.errors,
+    errors,
     notices,
     refs: refViews(linked, bindings),
     imageCount: Array.isArray(images) ? images.length : 0,

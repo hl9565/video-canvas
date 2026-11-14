@@ -40,7 +40,7 @@ type GitHubClient struct {
 	http *http.Client
 }
 
-// NewGitHubClient 创建客户端；repo 形如 zaylora/video-canvas。
+// NewGitHubClient 创建客户端；repo 形如 hl9565/video-canvas。
 func NewGitHubClient(repo string, opts Options) *GitHubClient {
 	if opts.BaseURL == "" {
 		opts.BaseURL = defaultBaseURL

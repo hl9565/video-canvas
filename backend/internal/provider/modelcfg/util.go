@@ -5,6 +5,7 @@ package modelcfg
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strconv"
 )
@@ -77,13 +78,16 @@ func stringify(v any) string {
 	return string(b)
 }
 
-// NormalizeJSON 把 UseNumber 解出来的 json.Number 转成 int（放得下的整数）或 float64，
-// 这样既方便后续按普通数字使用，又不丢失大整数精度。会原地修改 map 与 slice。
+// NormalizeJSON 把 UseNumber 解出来的 json.Number 转成 int（放得下的整数）、int64 或 float64，
+// 这样既方便后续按普通数字使用，又不丢失大整数精度（32 位架构也不会因转 int 溢出）。会原地修改 map 与 slice。
 func NormalizeJSON(v any) any {
 	switch t := v.(type) {
 	case json.Number:
 		if i, err := t.Int64(); err == nil {
-			return int(i)
+			if i >= math.MinInt && i <= math.MaxInt {
+				return int(i)
+			}
+			return i
 		}
 		f, err := t.Float64()
 		if err != nil {
@@ -104,14 +108,17 @@ func NormalizeJSON(v any) any {
 	return v
 }
 
+// maxSafeJSONInt 是 IEEE 754 float64 / JS Number 可精确往返的最大整数绝对值（2^53 - 1）。
+const maxSafeJSONInt int64 = 1<<53 - 1
+
 // normalizeConfigNumber 把配置树里的 json.Number 规范化：
-// 落在 ±2^53 内的整数与小数变成 float64（与标准库默认行为一致），更大的整数保留为 int，避免 ID 类数字丢精度。
+// 落在 ±(2^53-1) 内的整数与小数变成 float64（与标准库默认行为一致），更大的整数保留为 int64，避免 ID 类数字丢精度。
 func normalizeConfigNumber(v any) any {
 	switch t := v.(type) {
 	case json.Number:
 		if i, err := t.Int64(); err == nil {
-			if i > 1<<53 || i < -(1<<53) {
-				return int(i)
+			if i > maxSafeJSONInt || i < -maxSafeJSONInt {
+				return i
 			}
 			return float64(i)
 		}

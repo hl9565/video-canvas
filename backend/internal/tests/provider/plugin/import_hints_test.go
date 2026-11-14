@@ -54,13 +54,17 @@ func TestExecutorImportParamHints(t *testing.T) {
 	})
 
 	for name, hints := range map[string]string{
-		"参数名不合法":    `{"Resolution": {options: ["2K"]}}`,
-		"可选值是对象":    `{resolution: {options: [{value: "2K"}]}}`,
-		"可选值是空字符串":  `{resolution: {options: [""]}}`,
-		"默认值是对象":    `{resolution: {default: {}}}`,
-		"最大值超出范围":   `{duration: {max: 99999}}`,
-		"建议不是对象的映射": `[1, 2]`,
-		"最小值不是整数":   `{duration: {min: 1.5}}`,
+		"参数名不合法":       `{"Resolution": {options: ["2K"]}}`,
+		"可选值是对象":       `{resolution: {options: [{value: "2K"}]}}`,
+		"可选值是空字符串":     `{resolution: {options: [""]}}`,
+		"默认值是对象":       `{resolution: {default: {}}}`,
+		"最大值超出范围":      `{duration: {max: 99999}}`,
+		"建议不是对象的映射":    `[1, 2]`,
+		"最小值不是整数":      `{duration: {min: 1.5}}`,
+		"seed低于-1":     `{seed: {min: -2}}`,
+		"seed超过uint32": `{seed: {max: 4294967296}}`,
+		"seed最小大于最大":   `{seed: {min: 10, max: 5}}`,
+		"seed步长非1":     `{seed: {min: -1, max: 4294967295, step: 2}}`,
 	} {
 		t.Run("不合规："+name, func(t *testing.T) {
 			code := importCode(hints)
@@ -71,4 +75,16 @@ func TestExecutorImportParamHints(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("合法 seed 预填建议通过导入校验", func(t *testing.T) {
+		code := importCode(`{seed: {min: -1, max: 4294967295, step: 1, default: 3916315536}}`)
+		drafts, err := execWith(code, nil).Import(context.Background(), textSnap(srv.URL, code).Runtime(), map[string]any{})
+		if err != nil || len(drafts) != 1 || drafts[0].ParamHints == nil {
+			t.Fatalf("seed 合法 hint 被拒：err=%v drafts=%+v", err, drafts)
+		}
+		got := drafts[0].ParamHints["seed"]
+		if got.Min == nil || *got.Min != -1 || got.Max == nil || *got.Max != 4294967295 || got.Step == nil || *got.Step != 1 {
+			t.Fatalf("seed hint 字段不对：%+v", got)
+		}
+	})
 }

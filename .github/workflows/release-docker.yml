@@ -202,6 +202,7 @@ jobs:
         with:
           context: .
           file: ./backend/Dockerfile
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-backend.outputs.tags }}
           labels: ${{ steps.meta-backend.outputs.labels }}
@@ -217,6 +218,7 @@ jobs:
         with:
           context: ./web
           file: ./web/Dockerfile
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-web.outputs.tags }}
           labels: ${{ steps.meta-web.outputs.labels }}
@@ -230,6 +232,7 @@ jobs:
         with:
           context: ./agent
           file: ./agent/Dockerfile
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-agent.outputs.tags }}
           labels: ${{ steps.meta-agent.outputs.labels }}
@@ -242,6 +245,7 @@ jobs:
         with:
           context: .
           file: ./backend/Dockerfile.updater
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-updater.outputs.tags }}
           labels: ${{ steps.meta-updater.outputs.labels }}

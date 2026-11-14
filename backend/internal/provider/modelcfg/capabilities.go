@@ -113,8 +113,8 @@ type ParamField struct {
 	Open    bool   `json:"open"`              // true：出现在画布参数面板；false：不出现，按 default 发送
 	Options []any  `json:"options,omitempty"` // enum：可选值（字符串或数字）
 	Default any    `json:"default,omitempty"`
-	Min     *int   `json:"min,omitempty"`    // number：画布上拖动滑块的范围
-	Max     *int   `json:"max,omitempty"`    // number
+	Min     *int64 `json:"min,omitempty"`    // number：画布上拖动滑块的范围
+	Max     *int64 `json:"max,omitempty"`    // number
 	Step    *int   `json:"step,omitempty"`   // number：步长，省略按 1
 	Unit    string `json:"unit,omitempty"`   // 展示用的单位
 	Spec    bool   `json:"spec,omitempty"`   // 可作为规格价格的条件维度（enum / boolean）

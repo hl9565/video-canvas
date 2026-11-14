@@ -101,4 +101,66 @@ describe("片场：生成按钮的拦截原因", () => {
     );
     expect(html).toContain("正在转写");
   });
+
+  test("时间轴超过模型生效时长或转写秒数不匹配时给出清晰提示且拦截越界", () => {
+    const html = render(
+      {
+        format: "h3",
+        assets: [],
+        assetsStatus: "ready",
+        adaptStateOf: () => "stale",
+        adaptErrors: {},
+        video: {
+          models: [],
+          status: "ready",
+          setModel: () => {},
+          model: {
+            key: "vid-2s",
+            kind: "video",
+            label: "2s",
+            pricing: {},
+            capabilities: {
+              ops: ["i2v"],
+              refs: {
+                image: { on: true, max: 9, max_mb: 10 },
+                audio: { on: false, max: 0, max_mb: 0 },
+                video: { on: false, max: 0, max_mb: 0 },
+              },
+              prompt: { max_length: 2000 },
+              params: {
+                duration: {
+                  type: "number",
+                  label: "时长",
+                  open: false,
+                  default: 2,
+                  min: 2,
+                  max: 15,
+                },
+              },
+            },
+          },
+        } as unknown as Studio["video"],
+        actions: { adapt: async () => true } as unknown as Studio["actions"],
+      },
+      <PromptPane
+        segment={{
+          ...seg,
+          seconds: 5,
+          adaptations: {
+            h3: {
+              prompt: "[Shot 2] At 00:04.000, cut",
+              sourceHash: "h",
+              seconds: 5,
+              edited: false,
+              updatedAt: "",
+            },
+          },
+        }}
+      />,
+    );
+    expect(html).toContain("4s");
+    expect(html).toContain("2s");
+    // 片段标 5s 而模型锁定 2s 时不直接给错误“按 5s 重转”按钮
+    expect(html).toContain("alert");
+  });
 });

@@ -251,4 +251,21 @@ describe("planSegmentInput：时长与校验", () => {
     });
     expect(plan.input).toEqual({});
   });
+
+  test("模型锁定 2s 时按最终生效 2s 拦截 0-4 秒时间轴越界", () => {
+    const locked2s = video();
+    locked2s.params = {
+      duration: { type: "number", label: "时长", open: false, min: 2, max: 15, default: 2 },
+    };
+    const plan = planSegmentInput({
+      ...base,
+      seconds: 5,
+      caps: locked2s,
+      prompt: "0-4秒：人物推门",
+      assets: [],
+    });
+    expect(plan.errors.timeline).toContain("4s");
+    expect(plan.errors.timeline).toContain("2s");
+    expect(plan.notices.join("")).toContain("模型固定为 2s");
+  });
 });

@@ -15,9 +15,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { SPRING } from "@/lib/motion";
 import { cn } from "@/lib/utils";
-import { formatLabel } from "@/utils/drama/adaptation";
+import { adaptationDurationMismatch, formatLabel } from "@/utils/drama/adaptation";
 import { Autosaver } from "@/utils/drama/autosave";
 import { splitByEpisode, type RefAsset } from "@/utils/drama/segment-assets";
+import { timelineOverrun, timelineOverrunMessage } from "@/utils/drama/timeline";
+import { effectiveDuration } from "@/utils/drama/video-models";
 
 import { ASSET_DRAG_TYPE } from "./library";
 import { adaptKey, useStudio, type DraftKind } from "./use-studio";
@@ -41,9 +43,21 @@ export function readDroppedAsset(data: DataTransfer): { id: string; label: strin
  * 顶栏模型是 Seedance 时只有原稿；是 H3 / 通用时多一个转写标签，可以把原稿转写成那种格式、对照、手改。
  */
 export function PromptPane({ segment }: { segment: Segment }) {
-  const { format } = useStudio();
+  const { format, drafts, video } = useStudio();
   if (format === "seedance") {
-    return <AutosavedPrompt segment={segment} kind="source" />;
+    const effectiveSec = effectiveDuration(video?.model?.capabilities, segment.seconds).value;
+    const liveSource = drafts?.[`${segment.id}:source`] ?? segment.prompt;
+    const tl = timelineOverrun(liveSource, effectiveSec);
+    return (
+      <div className="grid gap-2">
+        {tl.overrun && (
+          <Bar tone="destructive" icon={<CircleX />}>
+            {timelineOverrunMessage(tl.end, effectiveSec)}
+          </Bar>
+        )}
+        <AutosavedPrompt segment={segment} kind="source" />
+      </div>
+    );
   }
   // 换格式整块重挂：默认标签按新格式重新判断
   return <AdaptTabs key={format} segment={segment} format={format} />;
@@ -53,13 +67,17 @@ type View = "source" | "adapted";
 
 /** 原稿 / 转写两个标签 + 转写按钮 */
 function AdaptTabs({ segment, format }: { segment: Segment; format: AdaptFormat }) {
-  const { actions, adaptStateOf, adaptErrors } = useStudio();
+  const { actions, adaptStateOf, adaptErrors, drafts, video } = useStudio();
   const adaptation = segment.adaptations[format];
   const [view, setView] = useState<View>(adaptation ? "adapted" : "source");
   const state = adaptStateOf(segment);
   const busy = state === "busy";
   const error = adaptErrors[adaptKey(segment.id, format)];
   const label = formatLabel(format);
+  const effectiveSec = effectiveDuration(video?.model?.capabilities, segment.seconds).value;
+  const durationMismatch = adaptationDurationMismatch(adaptation, effectiveSec);
+  const liveAdapted = adaptation ? (drafts?.[`${segment.id}:${format}`] ?? adaptation.prompt) : "";
+  const tl = adaptation ? timelineOverrun(liveAdapted, effectiveSec) : { overrun: false, end: 0 };
 
   const run = useCallback(async () => {
     setView("adapted");
@@ -126,14 +144,26 @@ function AdaptTabs({ segment, format }: { segment: Segment; format: AdaptFormat 
               {error}
             </Bar>
           )}
-          {state === "stale" && !busy && (
+          {tl.overrun && !busy && (
+            <Bar
+              tone="destructive"
+              icon={<CircleX />}
+              action={segment.seconds === effectiveSec ? "重新转写" : undefined}
+              onAction={segment.seconds === effectiveSec ? () => void run() : undefined}
+            >
+              {timelineOverrunMessage(tl.end, effectiveSec)}
+            </Bar>
+          )}
+          {state === "stale" && !busy && !tl.overrun && (
             <Bar
               tone="warning"
               icon={<TriangleAlert />}
-              action="重新转写"
-              onAction={() => void run()}
+              action={segment.seconds === effectiveSec ? "重新转写" : undefined}
+              onAction={segment.seconds === effectiveSec ? () => void run() : undefined}
             >
-              原稿已修改
+              {durationMismatch
+                ? `该${label}转写稿按 ${adaptation?.seconds}s 生成，当前将按 ${effectiveSec}s 生成${segment.seconds !== effectiveSec ? "（请先同步片段时长后再转写，或手改）" : ""}`
+                : "原稿已修改"}
             </Bar>
           )}
           {adaptation ? (
@@ -196,8 +226,8 @@ function Bar({
 }: {
   tone: "destructive" | "warning";
   icon: React.ReactNode;
-  action: string;
-  onAction: () => void;
+  action?: string;
+  onAction?: () => void;
   children: React.ReactNode;
 }) {
   return (
@@ -212,9 +242,11 @@ function Bar({
     >
       {icon}
       <span className="min-w-0 flex-1">{children}</span>
-      <Button variant="ghost" size="xs" className="shrink-0" onClick={onAction}>
-        {action}
-      </Button>
+      {action && onAction && (
+        <Button variant="ghost" size="xs" className="shrink-0" onClick={onAction}>
+          {action}
+        </Button>
+      )}
     </div>
   );
 }

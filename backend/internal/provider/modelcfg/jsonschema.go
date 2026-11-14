@@ -44,17 +44,23 @@ func object(desc string, props obj, required ...string) obj {
 	return o
 }
 
-// paramFieldSchema 是 capabilities.params 里单个生成参数的 Schema。
-func paramFieldSchema() obj {
+// paramFieldSchema 是 capabilities.params 里单个生成参数的 Schema；isSeed 为真时使用 seed 专用整数域。
+func paramFieldSchema(minBound, maxBound int64, isSeed bool) obj {
+	step := obj{"type": "integer", "minimum": 1, "description": "number 的步长，省略按 1"}
+	minDesc := "number 的最小值（画布滑块范围）"
+	if isSeed {
+		step = obj{"type": "integer", "minimum": 1, "maximum": 1, "description": "seed 的步长固定为 1"}
+		minDesc = "seed 的最小值（-1 表示随机，或 ≥ 0）"
+	}
 	return object("生成参数", obj{
 		"type":    enum("参数类型", ParamEnum, ParamNumber, ParamBoolean),
 		"label":   str("画布参数面板里的控件标题"),
 		"open":    boolean("是否开放给用户：true 出现在画布参数面板，false 不出现、按 default 发送"),
 		"options": obj{"type": "array", "maxItems": maxEnumOptions, "description": "enum 的可选值（字符串或数字）", "items": obj{"type": []string{"string", "number"}}},
 		"default": obj{"description": "默认值，类型需与参数类型一致；enum 的默认值必须在 options 里"},
-		"min":     obj{"type": "integer", "minimum": 1, "maximum": maxNumberValue, "description": "number 的最小值（画布滑块范围）"},
-		"max":     obj{"type": "integer", "minimum": 1, "maximum": maxNumberValue, "description": "number 的最大值"},
-		"step":    obj{"type": "integer", "minimum": 1, "description": "number 的步长，省略按 1"},
+		"min":     obj{"type": "integer", "minimum": minBound, "maximum": maxBound, "description": minDesc},
+		"max":     obj{"type": "integer", "minimum": minBound, "maximum": maxBound, "description": "number 的最大值"},
+		"step":    step,
 		"unit":    str("展示用的单位，如 秒"),
 		"spec":    boolean("可作为规格价格的条件维度（enum / boolean）"),
 		"fanout":  boolean("生成数量：一次提交拆成 N 个任务（enum，取值为 1 – 8 的整数，至多一个）"),
@@ -83,8 +89,10 @@ func capabilitiesSchema() obj {
 			"max_length": obj{"type": "integer", "minimum": 1, "maximum": maxPromptLength, "description": "提示词字数上限"},
 		}, "max_length"),
 		"params": obj{
-			"type": "object", "additionalProperties": paramFieldSchema(),
-			"description": "生成参数：参数名 -> 定义。书写顺序就是画布参数面板的显示顺序；参数名会作为任务输入的键传给插件",
+			"type":                 "object",
+			"properties":           obj{seedParamName: paramFieldSchema(minSeedValue, maxSeedValue, true)},
+			"additionalProperties": paramFieldSchema(minNumberValue, maxNumberValue, false),
+			"description":          "生成参数：参数名 -> 定义。书写顺序就是画布参数面板的显示顺序；参数名会作为任务输入的键传给插件",
 		},
 		"context": object("上下文能力（仅 text / agent）", obj{
 			"window": obj{"type": "integer", "minimum": 1, "maximum": maxContextWin, "description": "上下文窗口（Token）"},

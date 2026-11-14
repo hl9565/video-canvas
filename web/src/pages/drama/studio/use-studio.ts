@@ -26,9 +26,11 @@ import { useDramaVideoModel } from "@/hooks/use-drama-video-model";
 import { useCreditsStore } from "@/store/credits";
 import { useDramaJobsStore } from "@/store/drama";
 import { segmentKey, useDramaSegmentsStore } from "@/store/drama-segments";
-import { useStudioPrefs, useStudioPrefsStore } from "@/store/drama-studio";
+import { overridesForModel, useStudioPrefs, useStudioPrefsStore } from "@/store/drama-studio";
 import {
+  adaptationDurationMismatch,
   adaptState,
+  evaluateSeedanceBatch,
   formatLabel,
   segmentNos,
   sha256Hex,
@@ -41,6 +43,12 @@ import {
 import { reloadSegments } from "@/utils/drama/segment-events";
 import type { RefAsset } from "@/utils/drama/segment-assets";
 import { planSegmentInput, type SegmentPlan } from "@/utils/drama/segment-input";
+import {
+  formatTimelineSeconds,
+  timelineOverrun,
+  timelineOverrunMessage,
+} from "@/utils/drama/timeline";
+import { effectiveDuration } from "@/utils/drama/video-models";
 import {
   applyOrder,
   batchTargets,
@@ -84,6 +92,8 @@ export type Studio = {
    * 其他格式有转写稿时是转写稿、没有时是原稿；参考素材条和报价跟着它变
    */
   prompt: string;
+  /** 未存盘的草稿内容（键为 segmentId:source 或 segmentId:format），供编辑与时间轴实时校验共用 */
+  drafts?: Readonly<Record<string, string>>;
   /** 记下编辑中的文字；kind 默认原稿，转写稿传格式 */
   setDraft: (id: string, text: string, kind?: DraftKind) => void;
   /** 顶栏视频模型要的提示词格式（按后台配置的 prompt_format） */
@@ -192,6 +202,17 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
   } = useDramaAssets(drama.canvasId, settled);
   const video = useDramaVideoModel(dramaId, drama.videoModel);
   const prefs = useStudioPrefs(dramaId);
+  const activeModelKey = video.model?.key ?? "";
+  const modelOverrides = useMemo(
+    () => overridesForModel(prefs, activeModelKey || undefined),
+    [activeModelKey, prefs],
+  );
+  useEffect(() => {
+    if (!activeModelKey || Object.keys(prefs.overrides).length === 0) return;
+    useStudioPrefsStore
+      .getState()
+      .migrateLegacyOverrides(dramaId, drama.videoModel || activeModelKey);
+  }, [activeModelKey, drama.videoModel, dramaId, prefs.overrides]);
   const availableCredits = useCreditsStore((state) => state.credits?.available ?? null);
 
   const selected = useMemo(
@@ -220,9 +241,11 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
       if (!segment.adaptations[format]) return "none";
       const hash = hashOf(sourceOf(segment));
       // 指纹还没算出来先按最新，算完会重新渲染
-      return hash === undefined ? "fresh" : adaptState(segment, format, hash);
+      return hash === undefined
+        ? "fresh"
+        : adaptState(segment, format, hash, effectiveDuration(caps, segment.seconds).value);
     },
-    [adapting, format, hashOf, sourceOf],
+    [adapting, caps, format, hashOf, sourceOf],
   );
   const prompt = useMemo(() => {
     if (!selected) return "";
@@ -238,11 +261,11 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
             prompt,
             seconds: selected.seconds,
             ratio: drama.ratio,
-            overrides: prefs.overrides,
+            overrides: modelOverrides,
             assets,
           })
         : null,
-    [assets, caps, drama.ratio, prefs.overrides, prompt, selected],
+    [assets, caps, drama.ratio, modelOverrides, prompt, selected],
   );
   const credits = useMemo(() => {
     if (!plan || !video.model || Object.keys(plan.input).length === 0) return undefined;
@@ -398,7 +421,7 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         prompt: segment.prompt,
         seconds: segment.seconds,
         ratio: drama.ratio,
-        overrides: prefs.overrides,
+        overrides: modelOverrides,
         assets: latest,
       });
       const firstError = Object.values(built.errors)[0];
@@ -410,30 +433,82 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         return { ok: false as const, message: describeSubmitError(e).message };
       }
     },
-    [drama.ratio, prefs.overrides, video.model],
+    [drama.ratio, modelOverrides, video.model],
   );
 
   /**
-   * 提交前确认这个片段在当前格式下用哪份文字：Seedance 用原稿；
-   * 其他格式要有转写稿，原稿在转写后改过就问一次「重新转写并生成 / 仍用当前转写稿」。
-   * 返回要提交的片段快照（prompt 已换成要交的文字），不提交返回 null
+   * 决定这个片段要提交哪份提示词：
+   * 1) 始终按模型最终生效时长校验实际时间轴，实际越界禁止绕过（不可走“仍用当前转写稿”）；
+   * 2) 无时间轴越界时，原稿文字过期或转写时长变化可由用户选择保留或重新转写。
    */
   const resolveSubmit = useCallback(
     async (segment: Segment): Promise<Segment | null> => {
       let current = latestOf(segment.id) ?? segment;
-      if (format === "seedance") return current;
+      const effectiveSec = effectiveDuration(caps, current.seconds).value;
+      if (format === "seedance") {
+        const tl = timelineOverrun(current.prompt, effectiveSec);
+        if (tl.overrun) {
+          toast.error(timelineOverrunMessage(tl.end, effectiveSec));
+          return null;
+        }
+        return current;
+      }
       const adaptation = current.adaptations[format];
       if (!adaptation) {
         toast.error(`先把原稿转写为 ${formatLabel(format)}`);
         return null;
       }
-      if (adaptation.sourceHash !== (await sha256Hex(current.prompt))) {
+      const label = formatLabel(format);
+      const tl = timelineOverrun(adaptation.prompt, effectiveSec);
+      if (tl.overrun) {
+        if (current.seconds !== effectiveSec) {
+          toast.error(
+            `当前 ${label} 转写稿时间轴写到 ${formatTimelineSeconds(tl.end)}s，超过模型实际生成时长 ${effectiveSec}s；请先将片段时长调为 ${effectiveSec}s 后重新转写，或手动修改时间轴`,
+          );
+          return null;
+        }
+        const picked = await chooseOption<"readapt">({
+          title: "转写稿时间轴超过生成时长",
+          description: `当前 ${label} 转写稿时间轴写到 ${formatTimelineSeconds(tl.end)}s，超过片段时长 ${effectiveSec}s${adaptation.edited ? "；重新转写会覆盖你手改的修改" : ""}，不能直接提交。`,
+          options: [{ value: "readapt", label: "重新转写并生成", primary: true }],
+        });
+        if (picked !== "readapt") return null;
+        if (!(await adapt(current, { force: true }))) {
+          toast.error("转写失败，没有提交");
+          return null;
+        }
+        current = latestOf(segment.id) ?? current;
+        const nextText = submitText(current, format);
+        const nextEffective = effectiveDuration(caps, current.seconds).value;
+        const nextTl = timelineOverrun(nextText, nextEffective);
+        if (nextTl.overrun) {
+          toast.error(timelineOverrunMessage(nextTl.end, nextEffective));
+          return null;
+        }
+        return { ...current, prompt: nextText };
+      }
+
+      const textStale = adaptation.sourceHash !== (await sha256Hex(current.prompt));
+      const durationStale = adaptationDurationMismatch(adaptation, effectiveSec);
+      if (textStale || durationStale) {
+        const reasons: string[] = [];
+        if (textStale) reasons.push("原稿在转写后改过");
+        if (durationStale) {
+          reasons.push(`转写稿按 ${adaptation.seconds}s 生成，当前将按 ${effectiveSec}s 生成`);
+        }
+        const canReadapt = current.seconds === effectiveSec;
         const picked = await chooseOption({
-          title: "原稿在转写后改过",
-          description: `当前 ${formatLabel(format)} 转写稿是按旧原稿转的${adaptation.edited ? "，并且被你手改过，重新转写会覆盖这些修改" : ""}。`,
+          title: textStale ? "原稿在转写后改过" : "生成时长与转写时不一致",
+          description:
+            `${reasons.join("；")}${adaptation.edited ? "，并且被你手改过，重新转写会覆盖这些修改" : ""}。` +
+            (!canReadapt
+              ? `若要按 ${effectiveSec}s 重新转写，请先将片段时长改为 ${effectiveSec}s。`
+              : ""),
           options: [
-            { value: "keep", label: "仍用当前转写稿生成" },
-            { value: "readapt", label: "重新转写并生成", primary: true },
+            { value: "keep", label: "仍用当前转写稿生成", primary: !canReadapt },
+            ...(canReadapt
+              ? [{ value: "readapt" as const, label: "重新转写并生成", primary: true }]
+              : []),
           ],
         });
         if (!picked) return null;
@@ -443,11 +518,18 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
             return null;
           }
           current = latestOf(segment.id) ?? current;
+          const nextText = submitText(current, format);
+          const nextEffective = effectiveDuration(caps, current.seconds).value;
+          const nextTl = timelineOverrun(nextText, nextEffective);
+          if (nextTl.overrun) {
+            toast.error(timelineOverrunMessage(nextTl.end, nextEffective));
+            return null;
+          }
         }
       }
       return { ...current, prompt: submitText(current, format) };
     },
-    [adapt, format, latestOf],
+    [adapt, caps, format, latestOf],
   );
 
   const generate = useCallback<Studio["actions"]["generate"]>(
@@ -469,7 +551,7 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
           prompt: current.prompt,
           seconds: current.seconds,
           ratio: drama.ratio,
-          overrides: prefs.overrides,
+          overrides: modelOverrides,
           assets: latest,
         });
         if (preview.deadLabels.length > 0) {
@@ -496,8 +578,8 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
       flushEditors,
       freshAssets,
       markSubmitting,
+      modelOverrides,
       no,
-      prefs.overrides,
       resolveSubmit,
       submitVideo,
       submitting,
@@ -506,42 +588,86 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
   );
 
   /**
-   * 目标格式需要转写时，批量前先把待生成片段分组：未转写 / 已过期的问一次
-   * 「转写后生成 / 只生成已转写的」；转写失败的跳过。返回要提交的片段（prompt 已换成转写稿），取消为 null
+   * 批量前按模型生效时长复核所有片段：
+   * 1) Seedance 过滤时间轴越界的片段；
+   * 2) 其他格式把时间轴超限片段排除出「直接提交」集合（仅允许重转且重转后再校验），绝不走「仍用旧稿」。
    */
   const prepareBatch = useCallback(
     async (targets: Segment[]): Promise<Segment[] | null> => {
-      if (format === "seedance") return targets;
+      const effectiveSecondsOf = (item: Segment) => effectiveDuration(caps, item.seconds).value;
+      if (format === "seedance") {
+        const checked = evaluateSeedanceBatch(targets, effectiveSecondsOf);
+        if (checked.blocked.length === 0) return checked.ready;
+        if (checked.ready.length === 0) {
+          toast.error(`以下片段时间轴超过生成时长，不能提交：片段 ${segmentNos(checked.blocked)}`);
+          return null;
+        }
+        const go = await confirm({
+          title: `有 ${checked.blocked.length} 个片段时间轴超过生成时长`,
+          description: `片段 ${segmentNos(checked.blocked)} 的时间轴超出实际生成时长，本次不会提交；是否先生成其余 ${checked.ready.length} 个片段？`,
+          confirmLabel: "仅生成其余片段",
+        });
+        return go ? checked.ready : null;
+      }
+
       const hashes = new Map(
         await Promise.all(
           targets.map(async (item) => [item.id, await sha256Hex(item.prompt)] as const),
         ),
       );
-      const split = splitBatch(targets, format, (item) => hashes.get(item.id) ?? "");
-      const pending = [...split.none, ...split.stale];
+      const split = splitBatch(
+        targets,
+        format,
+        (item) => hashes.get(item.id) ?? "",
+        effectiveSecondsOf,
+      );
+      const pending = [...split.none, ...split.stale, ...split.overrun];
       let picked: "adapt" | "ready" = "ready";
       if (pending.length > 0) {
         const label = formatLabel(format);
+        const parts = [`已就绪 ${split.ready.length} 个`];
+        if (split.none.length > 0) parts.push(`未转写 ${split.none.length} 个`);
+        if (split.stale.length > 0) parts.push(`已过期 ${split.stale.length} 个`);
+        if (split.overrun.length > 0) parts.push(`时间轴超限须重转 ${split.overrun.length} 个`);
+        if (split.blocked.length > 0) {
+          parts.push(`时长与模型锁定秒数不符且超限 ${split.blocked.length} 个（须先手动调整）`);
+        }
         const choice = await chooseOption({
           title: `有 ${pending.length} 个片段需要先转写为 ${label}`,
           description:
-            `已就绪 ${split.ready.length} 个；未转写 ${split.none.length} 个；已过期 ${split.stale.length} 个。` +
-            (split.edited > 0 ? `其中 ${split.edited} 个转写稿被手改过，将被覆盖。` : ""),
+            `${parts.join("；")}。` +
+            (split.edited > 0 ? `其中 ${split.edited} 个转写稿被手改过，重新转写会覆盖。` : ""),
           options: [
-            { value: "ready", label: "只生成已转写的" },
-            { value: "adapt", label: "转写后生成", primary: true },
+            ...(split.ready.length > 0
+              ? [{ value: "ready" as const, label: "只生成已就绪的" }]
+              : []),
+            { value: "adapt" as const, label: "转写后生成", primary: true },
           ],
         });
         if (!choice) return null;
         picked = choice;
+      } else if (split.blocked.length > 0) {
+        if (split.ready.length === 0) {
+          toast.error(
+            `以下片段时间轴超过生成时长且无法自动重转，请先调整时长或手改时间轴：片段 ${segmentNos(split.blocked)}`,
+          );
+          return null;
+        }
+        const go = await confirm({
+          title: `有 ${split.blocked.length} 个片段时间轴超过生成时长`,
+          description: `片段 ${segmentNos(split.blocked)} 的时间轴超出实际生成时长且片段秒数尚未同步，本次将跳过；是否先生成其余 ${split.ready.length} 个片段？`,
+          confirmLabel: "仅生成其余片段",
+        });
+        if (!go) return null;
       }
-      const ids = split.ready.map((item) => item.id);
+
+      const ids = new Set(split.ready.map((item) => item.id));
       if (picked === "adapt" && pending.length > 0) {
         const failed: Segment[] = [];
         const queue = [...pending];
         const worker = async () => {
           for (let item = queue.shift(); item; item = queue.shift()) {
-            if (await adapt(item, { force: true })) ids.push(item.id);
+            if (await adapt(item, { force: true })) ids.add(item.id);
             else failed.push(item);
           }
         };
@@ -551,15 +677,31 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         if (failed.length > 0) {
           toast.error(`${failed.length} 个片段转写失败，已跳过：片段 ${segmentNos(failed)}`);
         }
+      } else if (split.blocked.length > 0 && pending.length > 0) {
+        toast.warning(
+          `片段 ${segmentNos(split.blocked)} 时间轴超过模型生效时长且秒数未同步，已跳过`,
+        );
       }
-      return targets
-        .filter((item) => ids.includes(item.id))
-        .map((item) => {
-          const current = latestOf(item.id) ?? item;
-          return { ...current, prompt: submitText(current, format) };
-        });
+
+      const finalTargets: Segment[] = [];
+      const stillOverrun: Segment[] = [];
+      for (const item of targets) {
+        if (!ids.has(item.id)) continue;
+        const current = latestOf(item.id) ?? item;
+        const text = submitText(current, format);
+        const sec = effectiveSecondsOf(current);
+        if (!text || timelineOverrun(text, sec).overrun) {
+          stillOverrun.push(current);
+          continue;
+        }
+        finalTargets.push({ ...current, prompt: text });
+      }
+      if (stillOverrun.length > 0) {
+        toast.error(`以下片段时间轴仍超出生成时长，已跳过：片段 ${segmentNos(stillOverrun)}`);
+      }
+      return finalTargets;
     },
-    [adapt, format, latestOf],
+    [adapt, caps, format, latestOf],
   );
 
   const batch = useCallback<Studio["actions"]["batch"]>(async () => {
@@ -588,7 +730,7 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         prompt: item.prompt,
         seconds: item.seconds,
         ratio: drama.ratio,
-        overrides: prefs.overrides,
+        overrides: modelOverrides,
         assets: latest,
       });
       planned.deadLabels.forEach((label) => dead.add(label));
@@ -624,8 +766,8 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
     freshAssets,
     key,
     markSubmitting,
+    modelOverrides,
     no,
-    prefs.overrides,
     prepareBatch,
     submitVideo,
     video.model,
@@ -633,9 +775,8 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
 
   const add = useCallback<Studio["actions"]["add"]>(async () => {
     try {
-      const max = video.model?.capabilities.params?.duration?.max;
       const created = await addSegment(dramaId, no, {
-        seconds: max ? Math.min(DEFAULT_SECONDS, max) : DEFAULT_SECONDS,
+        seconds: effectiveDuration(video.model?.capabilities, DEFAULT_SECONDS).value,
       });
       useDramaSegmentsStore.getState().apply(dramaId, no, created);
       setSelectedId(created.id);
@@ -713,11 +854,13 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
   }, []);
 
   const setOverride = useCallback(
-    (name: string, value: unknown) =>
+    (name: string, value: unknown) => {
+      if (!activeModelKey) return;
       useStudioPrefsStore
         .getState()
-        .patch(dramaId, { overrides: { ...prefs.overrides, [name]: value } }),
-    [dramaId, prefs.overrides],
+        .setModelOverride(dramaId, activeModelKey, name, value, drama.videoModel || activeModelKey);
+    },
+    [activeModelKey, drama.videoModel, dramaId],
   );
 
   return {
@@ -732,9 +875,10 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
     assets,
     assetsStatus,
     video,
-    overrides: prefs.overrides,
+    overrides: modelOverrides,
     setOverride,
     prompt,
+    drafts,
     setDraft,
     format,
     adapting,

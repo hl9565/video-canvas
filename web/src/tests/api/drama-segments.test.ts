@@ -230,17 +230,31 @@ describe("api/drama：片段请求", () => {
 });
 
 describe("api/drama：转写稿（片场平台适配）", () => {
-  test("adaptations 映射为 camelCase；缺省为空对象", () => {
+  test("adaptations 映射为 camelCase；带上可选 seconds，缺省不虚构", () => {
     const seg = mapSegment(
       rawSegment({
         adaptations: {
-          h3: { prompt: "integrated", source_hash: "abc", edited: true, updated_at: "t" },
+          h3: {
+            prompt: "integrated",
+            source_hash: "abc",
+            seconds: 2,
+            edited: true,
+            updated_at: "t",
+          },
+          generic: {
+            prompt: "legacy",
+            source_hash: "def",
+            edited: false,
+            updated_at: "t2",
+          },
         },
       }),
     );
     expect(seg.adaptations).toEqual({
-      h3: { prompt: "integrated", sourceHash: "abc", edited: true, updatedAt: "t" },
+      h3: { prompt: "integrated", sourceHash: "abc", seconds: 2, edited: true, updatedAt: "t" },
+      generic: { prompt: "legacy", sourceHash: "def", edited: false, updatedAt: "t2" },
     });
+    expect("seconds" in (seg.adaptations.generic ?? {})).toBe(false);
     expect(mapSegment(rawSegment({ adaptations: undefined })).adaptations).toEqual({});
   });
 

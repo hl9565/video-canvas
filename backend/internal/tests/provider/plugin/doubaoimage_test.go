@@ -65,7 +65,7 @@ func doubaoimageCaps(_ string) modelcfg.Capabilities {
 	enum := func(opts ...any) modelcfg.ParamField {
 		return modelcfg.ParamField{Type: modelcfg.ParamEnum, Label: "x", Open: true, Options: opts, Default: opts[0]}
 	}
-	num := func(lo, hi int) modelcfg.ParamField {
+	num := func(lo, hi int64) modelcfg.ParamField {
 		return modelcfg.ParamField{Type: modelcfg.ParamNumber, Label: "x", Open: true, Min: &lo, Max: &hi}
 	}
 	caps := modelcfg.Capabilities{Prompt: modelcfg.PromptSpec{MaxLength: 10000}}

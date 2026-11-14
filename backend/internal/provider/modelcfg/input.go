@@ -228,16 +228,61 @@ func normalizeEnumParam(f ParamField, raw any) (any, string) {
 }
 
 func normalizeNumberParam(f ParamField, raw any) (any, string) {
-	n, ok := asNumber(raw)
+	i, msg := parseStrictNumberInt64(raw)
 	switch {
-	case !ok || n != math.Trunc(n):
-		return nil, "必须是整数"
-	case f.Min != nil && n < float64(*f.Min):
+	case msg != "":
+		return nil, msg
+	case f.Min != nil && i < *f.Min:
 		return nil, fmt.Sprintf("不能小于 %d", *f.Min)
-	case f.Max != nil && n > float64(*f.Max):
+	case f.Max != nil && i > *f.Max:
 		return nil, fmt.Sprintf("不能大于 %d", *f.Max)
+	case i < -maxSafeJSONInt || i > maxSafeJSONInt:
+		return nil, "超出安全整数范围"
 	}
-	return n, ""
+	return float64(i), ""
+}
+
+// parseStrictNumberInt64 在转成 float64 前优先提取精确 int64，避免 ±2^53 外的 json.Number 静默舍入或 32 位溢出。
+func parseStrictNumberInt64(raw any) (int64, string) {
+	switch t := raw.(type) {
+	case json.Number:
+		if i, err := t.Int64(); err == nil {
+			return i, ""
+		}
+		f, err := t.Float64()
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) || math.Trunc(f) != f {
+			return 0, "必须是整数"
+		}
+		if f < float64(-maxSafeJSONInt) || f > float64(maxSafeJSONInt) {
+			return 0, "超出安全整数范围"
+		}
+		return int64(f), ""
+	case int:
+		return int64(t), ""
+	case int64:
+		return t, ""
+	case int32:
+		return int64(t), ""
+	case uint64:
+		if t > math.MaxInt64 {
+			return 0, "超出安全整数范围"
+		}
+		return int64(t), ""
+	case uint:
+		if uint64(t) > math.MaxInt64 {
+			return 0, "超出安全整数范围"
+		}
+		return int64(t), ""
+	default:
+		n, ok := asNumber(raw)
+		if !ok || math.Trunc(n) != n {
+			return 0, "必须是整数"
+		}
+		if n < float64(-maxSafeJSONInt) || n > float64(maxSafeJSONInt) {
+			return 0, "超出安全整数范围"
+		}
+		return int64(n), ""
+	}
 }
 
 // normalizeBoolParam 接受布尔值，以及表单常见的 "true" / "false" 字符串。

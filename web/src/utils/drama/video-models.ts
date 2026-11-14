@@ -1,6 +1,6 @@
 import type { Capabilities, ModelInfo, ParamField } from "@/api/model/type";
 import { ratioParam } from "@/utils/canvas/node-frame";
-import { matchOption, PROMPT_FORMATS } from "@/utils/tasks/capabilities";
+import { matchOption, PROMPT_FORMATS, validateParamValue } from "@/utils/tasks/capabilities";
 
 /** 短剧分镜单段时长的合法范围与缺省（契约 §10 的 max_seconds） */
 export const STORYBOARD_SECONDS = { min: 4, max: 60, fallback: 15 } as const;
@@ -29,11 +29,31 @@ export const durationField = (caps: Capabilities | undefined): ParamField | unde
 const numericOptions = (field: ParamField): number[] =>
   (field.options ?? []).map(Number).filter((n) => Number.isFinite(n));
 
-/** 模型单段时长上限（秒）；没有时长参数为 null */
+const DEFAULT_SECOND_CHOICES = [2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 30];
+
+const positiveStep = (field: ParamField): number => (field.step && field.step > 0 ? field.step : 1);
+
+const stepAlignedMax = (
+  min: number | undefined,
+  max: number | undefined,
+  step: number,
+): number | undefined => {
+  if (max === undefined || min === undefined || step <= 1) return max;
+  if (max <= min) return min;
+  return min + Math.floor((max - min) / step) * step;
+};
+
+/** 模型单段时长上限（秒）；未开放时长参数时返回其锁定默认值；没有时长参数为 null */
 export function modelMaxSeconds(caps: Capabilities | undefined): number | null {
   const field = durationField(caps);
   if (!field) return null;
-  if (field.type === "number") return field.max ?? null;
+  if (field.open === false) {
+    const locked = Number(field.default);
+    return Number.isFinite(locked) && locked > 0 ? locked : null;
+  }
+  if (field.type === "number") {
+    return stepAlignedMax(field.min, field.max, positiveStep(field)) ?? null;
+  }
   const options = numericOptions(field);
   return options.length > 0 ? Math.max(...options) : null;
 }
@@ -46,22 +66,80 @@ export function storyboardMaxSeconds(info: ModelInfo | undefined): number {
 }
 
 /**
- * 把片段时长适配到模型的时长参数：数字参数夹在 min–max；枚举取不小于它的最近选项，都比它小就取最大。
- * adjusted 表示和片段原时长不一样，提交时提示用户。
+ * 把片段时长适配到模型的时长参数：
+ * 1) 未开放参数（open === false）：固定采用模型 default；
+ * 2) number：按 min/max 及 step 网格向上对齐最近合法值，且不超过按 step 对齐后的上限；
+ * 3) enum：取不小于它的最近选项，都比它小就取最大。
+ * adjusted 表示最终提交值与片段原时长不一样，提交时提示用户并以此校验时间轴。
  */
 export function fitDuration(
-  field: ParamField,
+  field: ParamField | undefined,
   seconds: number,
 ): { value: number; adjusted: boolean } {
+  if (!field) return { value: seconds, adjusted: false };
+  if (field.open === false) {
+    const locked = Number(field.default);
+    if (Number.isFinite(locked) && locked > 0) {
+      return { value: locked, adjusted: locked !== seconds };
+    }
+    return { value: seconds, adjusted: false };
+  }
   let value = seconds;
   if (field.type === "number") {
-    if (field.min !== undefined) value = Math.max(field.min, value);
-    if (field.max !== undefined) value = Math.min(field.max, value);
+    const step = positiveStep(field);
+    const min = field.min;
+    const max = stepAlignedMax(min, field.max, step);
+    if (min !== undefined) value = Math.max(min, value);
+    if (max !== undefined) value = Math.min(max, value);
+    if (min !== undefined && step > 1) {
+      const snapped = min + Math.ceil((value - min) / step) * step;
+      value = max !== undefined ? Math.min(max, snapped) : snapped;
+    }
   } else {
     const options = numericOptions(field).sort((a, b) => a - b);
     if (options.length > 0) value = options.find((option) => option >= seconds) ?? options.at(-1)!;
   }
   return { value, adjusted: value !== seconds };
+}
+
+/** 根据模型能力计算片段本次最终提交的生效时长（秒） */
+export function effectiveDuration(
+  caps: Capabilities | undefined,
+  seconds: number,
+): { value: number; adjusted: boolean } {
+  return fitDuration(durationField(caps), seconds);
+}
+
+/** 计算片场时长下拉框展示的全部候选秒数（严格反映模型合法选项 + 当前值） */
+export function durationChoices(caps: Capabilities | undefined, currentSeconds?: number): number[] {
+  const field = durationField(caps);
+  let base: number[];
+  if (!field) {
+    base = DEFAULT_SECOND_CHOICES.filter((s) => s <= STORYBOARD_SECONDS.fallback);
+  } else if (field.open === false) {
+    const locked = Number(field.default);
+    base = Number.isFinite(locked) && locked > 0 ? [locked] : [];
+  } else if (field.type === "enum") {
+    base = numericOptions(field);
+  } else {
+    const step = positiveStep(field);
+    const min = Math.max(1, field.min ?? 1);
+    const max = stepAlignedMax(min, field.max, step) ?? Math.max(min, STORYBOARD_SECONDS.fallback);
+    if (max >= min && Math.floor((max - min) / step) <= 60) {
+      base = [];
+      for (let v = min; v <= max; v += step) base.push(v);
+    } else {
+      base = [
+        min,
+        ...DEFAULT_SECOND_CHOICES.filter((s) => s >= min && s <= max && (s - min) % step === 0),
+        ...(max >= min ? [max] : []),
+      ];
+    }
+  }
+  if (typeof currentSeconds === "number" && Number.isFinite(currentSeconds) && currentSeconds > 0) {
+    base.push(currentSeconds);
+  }
+  return [...new Set(base)].sort((a, b) => a - b);
 }
 
 /** 模型的一行摘要：「Seedance · 参考图 ≤9 · 参考音频 · ≤15s」；通用格式不显示格式名 */
@@ -88,7 +166,9 @@ export function segmentParams(
   const params: Record<string, unknown> = {};
   if (!caps) return params;
   const duration = durationField(caps);
-  if (duration) params.duration = fitDuration(duration, options.seconds).value;
+  if (duration && duration.open !== false) {
+    params.duration = fitDuration(duration, options.seconds).value;
+  }
   const ratio = ratioParam(caps);
   if (ratio && options.ratio) {
     const hit = matchOption(ratio, options.ratio);
@@ -96,13 +176,11 @@ export function segmentParams(
   }
   for (const [name, value] of Object.entries(options.overrides)) {
     const field = caps.params?.[name];
-    if (!field || name === "duration" || name === ratio?.name) continue;
-    if (field.type === "enum") {
-      const hit = matchOption(field, value);
-      if (hit !== undefined) params[name] = hit;
-    } else if (value !== undefined) {
-      params[name] = value;
-    }
+    if (!field || !field.open || name === "duration" || name === ratio?.name) continue;
+    if (value === undefined || value === null || (typeof value === "string" && value.trim() === ""))
+      continue;
+    const checked = validateParamValue(field, value);
+    if ("value" in checked) params[name] = checked.value;
   }
   return params;
 }

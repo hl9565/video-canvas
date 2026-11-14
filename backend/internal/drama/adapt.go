@@ -111,7 +111,7 @@ func ValidateAdapt(format, source, adapted string, seconds int) error {
 			}
 		}
 	}
-	if end, over := timelineOverrun(adapted, seconds); over {
+	if end, over := TimelineOverrun(adapted, seconds); over {
 		return invalidOutput("时间轴写到" + strconv.FormatFloat(end, 'f', -1, 64) + "秒，超过片段时长" + strconv.Itoa(seconds) + "秒")
 	}
 	return nil

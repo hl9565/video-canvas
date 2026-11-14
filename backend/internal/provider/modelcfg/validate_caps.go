@@ -6,6 +6,7 @@ package modelcfg
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"unicode/utf8"
@@ -13,18 +14,22 @@ import (
 
 // 固定上下限（只拦手误，不代表某个平台的真实上限）。
 const (
-	maxRefCount     = 50
-	minRefMB        = 1
-	maxRefMB        = 500
-	maxPromptLength = 1_000_000
-	maxParams       = 20
-	maxEnumOptions  = 20
-	maxNumberValue  = 3600
-	maxFanout       = 8
-	maxContextWin   = 10_000_000
-	minContextOut   = 256
-	maxContextOut   = 1_000_000
-	maxSystemLen    = 20_000
+	maxRefCount           = 50
+	minRefMB              = 1
+	maxRefMB              = 500
+	maxPromptLength       = 1_000_000
+	maxParams             = 20
+	maxEnumOptions        = 20
+	minNumberValue  int64 = 1
+	maxNumberValue  int64 = 3600
+	seedParamName         = "seed"
+	minSeedValue    int64 = -1
+	maxSeedValue    int64 = 4294967295
+	maxFanout             = 8
+	maxContextWin         = 10_000_000
+	minContextOut         = 256
+	maxContextOut         = 1_000_000
+	maxSystemLen          = 20_000
 )
 
 var paramNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
@@ -140,7 +145,7 @@ func validateParams(params ParamSet, add func(path, msg string)) {
 	for _, e := range params {
 		validateParamName(e.Name, seen, add)
 		seen[e.Name] = true
-		if validateParam("params."+e.Name, e.ParamField, add) && e.Fanout {
+		if validateParam("params."+e.Name, e.Name, e.ParamField, add) && e.Fanout {
 			fanouts++
 		}
 	}
@@ -162,7 +167,7 @@ func validateParamName(name string, seen map[string]bool, add func(path, msg str
 }
 
 // validateParam 校验单个生成参数的定义；类型合法返回 true（调用方据此统计 fanout）。
-func validateParam(base string, f ParamField, add func(path, msg string)) bool {
+func validateParam(base, name string, f ParamField, add func(path, msg string)) bool {
 	if strings.TrimSpace(f.Label) == "" {
 		add(base+".label", "不能为空（画布用它作为控件标题）")
 	}
@@ -170,7 +175,7 @@ func validateParam(base string, f ParamField, add func(path, msg string)) bool {
 	case ParamEnum:
 		validateEnumParam(base, f, add)
 	case ParamNumber:
-		validateNumberParam(base, f, add)
+		validateNumberParam(base, name, f, add)
 	case ParamBoolean:
 		validateBoolParam(base, f, add)
 	default:
@@ -221,31 +226,73 @@ func validateEnumParam(base string, f ParamField, add func(path, msg string)) {
 	}
 }
 
-func validateNumberParam(base string, f ParamField, add func(path, msg string)) {
+// numberDomain 返回指定 number 参数的配置允许范围，并指明步长是否固定为 1。
+func numberDomain(name string) (lo, hi int64, fixedStep bool) {
+	if name == seedParamName {
+		return minSeedValue, maxSeedValue, true
+	}
+	return minNumberValue, maxNumberValue, false
+}
+
+func validateNumberParam(base, name string, f ParamField, add func(path, msg string)) {
 	if f.Min == nil || f.Max == nil {
 		add(base, "number 参数必须设置最小值 min 和最大值 max")
 		return
 	}
-	lo, hi, step := *f.Min, *f.Max, 1
+	lo, hi, step := *f.Min, *f.Max, int64(1)
 	if f.Step != nil {
-		step = *f.Step
+		step = int64(*f.Step)
 	}
-	rangeMsg := fmt.Sprintf("允许范围 1 ≤ 最小 ≤ 默认 ≤ 最大 ≤ %d", maxNumberValue)
-	if lo < 1 || hi > maxNumberValue || lo > hi {
+	domMin, domMax, fixedStep := numberDomain(name)
+	rangeMsg := fmt.Sprintf("允许范围 %d ≤ 最小 ≤ 默认 ≤ 最大 ≤ %d", domMin, domMax)
+	if lo < domMin || hi > domMax || lo > hi {
 		add(base+".min", rangeMsg)
+	}
+	if fixedStep && step != 1 {
+		add(base+".step", "seed 参数步长固定为 1")
+		return
 	}
 	if step < 1 {
 		add(base+".step", "步长必须是不小于 1 的整数")
 		return
 	}
-	d, ok := toFloat(f.Default)
+	d, ok := exactNumberInt64(f.Default)
 	switch {
-	case f.Default == nil || !ok || d != float64(int(d)):
+	case f.Default == nil || !ok:
 		add(base+".default", "必须设置整数默认值")
-	case int(d) < lo || int(d) > hi:
+	case d < lo || d > hi:
 		add(base+".default", fmt.Sprintf("默认值必须在 %d – %d 之间", lo, hi))
-	case (int(d)-lo)%step != 0:
+	case (d-lo)%step != 0:
 		add(base+".default", fmt.Sprintf("默认值与最小值的差必须是步长 %d 的整数倍", step))
+	}
+}
+
+func exactNumberInt64(v any) (int64, bool) {
+	switch t := v.(type) {
+	case int64:
+		return t, true
+	case int:
+		return int64(t), true
+	case int32:
+		return int64(t), true
+	case uint:
+		if uint64(t) > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(t), true
+	case uint64:
+		if t > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(t), true
+	case uint32:
+		return int64(t), true
+	default:
+		d, ok := toFloat(v)
+		if !ok || math.IsNaN(d) || math.IsInf(d, 0) || math.Trunc(d) != d || d < float64(-maxSafeJSONInt) || d > float64(maxSafeJSONInt) {
+			return 0, false
+		}
+		return int64(d), true
 	}
 }
 

@@ -58,6 +58,11 @@ func (s *GenerationTaskService) Create(ctx context.Context, userID uint64, idemp
 	if err != nil {
 		return nil, err
 	}
+	if hasSegmentNode(nodes) && inputDurationSeconds(input) > 0 {
+		if err := checkSegmentTimeline(input, 0); err != nil {
+			return nil, err
+		}
+	}
 
 	// 5. 生成数量必须与节点数一致；计价（每个任务的积分）在拆分前算，生成数量参数本身不交给插件
 	caps := snap.Model.Capabilities

@@ -61,7 +61,8 @@ func (s *DramaSegmentService) Adapt(ctx context.Context, userID, sid uint64, req
 	}
 	defer s.adapting.Delete(key)
 	source := row.Prompt
-	out, credits, err := s.adapter.AdaptSegment(ctx, p, req.Format, drama.AdaptInput{Source: source, Seconds: row.Seconds, Ratio: p.Ratio})
+	adaptSeconds := row.Seconds
+	out, credits, err := s.adapter.AdaptSegment(ctx, p, req.Format, drama.AdaptInput{Source: source, Seconds: adaptSeconds, Ratio: p.Ratio})
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +78,7 @@ func (s *DramaSegmentService) Adapt(ctx context.Context, userID, sid uint64, req
 		if err != nil {
 			return err
 		}
-		all[req.Format] = model.DramaSegmentAdaptation{Prompt: out, SourceHash: drama.SourceHash(source), UpdatedAt: time.Now()}
+		all[req.Format] = model.DramaSegmentAdaptation{Prompt: out, SourceHash: drama.SourceHash(source), Seconds: adaptSeconds, UpdatedAt: time.Now()}
 		if locked.Adaptations, err = json.Marshal(all); err != nil {
 			return err
 		}
@@ -104,6 +105,7 @@ func editAdaptation(row *model.DramaSegment, edit *model.DramaSegmentAdaptationE
 	if !ok {
 		return errcode.ErrDramaAdaptMissing
 	}
+	// 保留原有的 Seconds（含旧稿为 0 的情况），避免把手改后的当前片段时长记为当初生成时长。
 	current.Prompt, current.Edited, current.UpdatedAt = edit.Prompt, true, time.Now()
 	all[edit.Format] = current
 	row.Adaptations, err = json.Marshal(all)

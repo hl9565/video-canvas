@@ -1,5 +1,7 @@
-import type { AdaptFormat, Segment } from "@/api/drama/type";
+import type { AdaptFormat, Segment, SegmentAdaptation } from "@/api/drama/type";
 import type { Capabilities } from "@/api/model/type";
+
+import { timelineOverrun } from "./timeline";
 
 /**
  * 片场的提示词格式：分镜原稿固定是 Seedance 写法；顶栏视频模型是别的写法时，
@@ -104,11 +106,35 @@ export function sha256HexSync(text: string): string {
   return toHex(out);
 }
 
-/** 某格式转写稿的状态；promptHash 是当前原稿的指纹 */
-export function adaptState(segment: Segment, format: AdaptFormat, promptHash: string): AdaptState {
+/** 已知转写稿生成时长且与本次实际生成时长不一致时返回 true；存量未知时长（seconds === undefined）不误报 */
+export function adaptationDurationMismatch(
+  adaptation: SegmentAdaptation | undefined,
+  effectiveSeconds: number | undefined,
+): boolean {
+  return (
+    !!adaptation &&
+    effectiveSeconds !== undefined &&
+    adaptation.seconds !== undefined &&
+    adaptation.seconds !== effectiveSeconds
+  );
+}
+
+/** 某格式转写稿的状态；promptHash 是当前原稿的指纹，effectiveSeconds 传入时同时核对生成时长是否一致 */
+export function adaptState(
+  segment: Segment,
+  format: AdaptFormat,
+  promptHash: string,
+  effectiveSeconds?: number,
+): AdaptState {
   const adaptation = segment.adaptations[format];
   if (!adaptation) return "none";
-  return adaptation.sourceHash === promptHash ? "fresh" : "stale";
+  if (
+    adaptation.sourceHash !== promptHash ||
+    adaptationDurationMismatch(adaptation, effectiveSeconds)
+  ) {
+    return "stale";
+  }
+  return "fresh";
 }
 
 /** 这个格式下要提交的文字：Seedance 交原稿，其他交转写稿（没有为空串） */
@@ -118,33 +144,76 @@ export function submitText(segment: Segment, format: TargetFormat): string {
 }
 
 export type BatchSplit = {
-  /** 转写稿是最新的，可以直接提交 */
+  /** 转写稿是最新的且时间轴未超出实际生成时长，可以直接提交 */
   ready: Segment[];
   /** 还没有这个格式的转写稿 */
   none: Segment[];
-  /** 原稿在转写后改过 */
+  /** 原稿在转写后改过或生成时长变化，但时间轴未超限的旧稿 */
   stale: Segment[];
-  /** 过期稿里被手改过的个数（重新转写会覆盖） */
+  /** 现有转写稿时间轴超过生成时长，且片段秒数等于模型生效秒数（可重新转写修复，绝不走“仍用旧稿”） */
+  overrun: Segment[];
+  /** 现有转写稿时间轴超过模型实际生成时长且片段秒数尚未同步（无法靠重转自动修正，必须调时长或手改） */
+  blocked: Segment[];
+  /** 过期或超限稿里被手改过的个数（重新转写会覆盖） */
   edited: number;
 };
 
-/** 批量生成前把待生成片段按转写稿状态分组 */
+/** 批量生成前把待生成片段按转写稿状态与时间轴合法性分组 */
 export function splitBatch(
   targets: readonly Segment[],
   format: AdaptFormat,
   hashOf: (segment: Segment) => string,
+  effectiveSecondsOf?: (segment: Segment) => number,
 ): BatchSplit {
-  const split: BatchSplit = { ready: [], none: [], stale: [], edited: 0 };
+  const split: BatchSplit = { ready: [], none: [], stale: [], overrun: [], blocked: [], edited: 0 };
   for (const segment of targets) {
-    const state = adaptState(segment, format, hashOf(segment));
-    if (state === "fresh") split.ready.push(segment);
-    else if (state === "none") split.none.push(segment);
-    else {
+    const adaptation = segment.adaptations[format];
+    if (!adaptation) {
+      split.none.push(segment);
+      continue;
+    }
+    const effectiveSec = effectiveSecondsOf ? effectiveSecondsOf(segment) : segment.seconds;
+    const tl = timelineOverrun(adaptation.prompt, effectiveSec);
+    if (tl.overrun) {
+      if (segment.seconds === effectiveSec) {
+        split.overrun.push(segment);
+        if (adaptation.edited) split.edited += 1;
+      } else {
+        split.blocked.push(segment);
+      }
+      continue;
+    }
+    const state = adaptState(
+      segment,
+      format,
+      hashOf(segment),
+      effectiveSecondsOf ? effectiveSec : undefined,
+    );
+    if (state === "fresh") {
+      split.ready.push(segment);
+    } else {
       split.stale.push(segment);
-      if (segment.adaptations[format]?.edited) split.edited += 1;
+      if (adaptation.edited) split.edited += 1;
     }
   }
   return split;
+}
+
+/** Seedance（原稿直接提交）批量提交前过滤时间轴越界的片段 */
+export function evaluateSeedanceBatch(
+  targets: readonly Segment[],
+  effectiveSecondsOf: (segment: Segment) => number,
+): { ready: Segment[]; blocked: Segment[] } {
+  const ready: Segment[] = [];
+  const blocked: Segment[] = [];
+  for (const segment of targets) {
+    if (timelineOverrun(segment.prompt, effectiveSecondsOf(segment)).overrun) {
+      blocked.push(segment);
+    } else {
+      ready.push(segment);
+    }
+  }
+  return { ready, blocked };
 }
 
 /** 片段号：「01、03」 */

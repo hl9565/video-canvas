@@ -453,6 +453,8 @@ export type AdaptFormat = "h3" | "generic";
 export interface BackendSegmentAdaptation {
   prompt: string;
   source_hash: string;
+  /** 转写时对应的片段时长（秒）；存量旧数据未记录时省略 */
+  seconds?: number;
   edited: boolean;
   updated_at: string;
 }
@@ -463,6 +465,8 @@ export interface SegmentAdaptation {
   prompt: string;
   /** 转写时原稿全文的 SHA-256（小写 hex）；与当前原稿不同 = 已过期 */
   sourceHash: string;
+  /** 转写时对应的片段时长（秒）；存量未知时长为 undefined */
+  seconds?: number;
   /** 用户手改过；重新转写前要确认覆盖 */
   edited: boolean;
   updatedAt: string;

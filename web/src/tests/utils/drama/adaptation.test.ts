@@ -4,7 +4,9 @@ import { createHash } from "node:crypto";
 import type { Segment } from "@/api/drama/type";
 import type { Capabilities } from "@/api/model/type";
 import {
+  adaptationDurationMismatch,
   adaptState,
+  evaluateSeedanceBatch,
   formatLabel,
   sha256Hex,
   sha256HexSync,
@@ -121,5 +123,56 @@ describe("批量拆分", () => {
     expect(split.none.map((s) => s.id)).toEqual(["b"]);
     expect(split.stale.map((s) => s.id)).toEqual(["c", "d"]);
     expect(split.edited).toBe(1);
+  });
+
+  test("区分可保留的旧时长稿与禁止“仍用旧稿”的时间轴越界稿，存量未知时长不误报", () => {
+    const list = [
+      // 原稿一致且无 seconds（存量旧稿）：视为 ready（不虚构旧时长）
+      seg({ id: "legacy", seconds: 2, prompt: "P", adaptations: { h3: ad("At 00:01.000", "h") } }),
+      // 5s 生成的稿放到 2s，且无时间轴越界：归为 stale（可选重转或保留）
+      seg({
+        id: "mismatch-ok",
+        seconds: 2,
+        prompt: "P",
+        adaptations: { h3: { ...ad("无时间轴特写", "h"), seconds: 5 } },
+      }),
+      // 时间轴超过 2s 且片段本身也是 2s：归为 overrun（只能重转，不能进 ready）
+      seg({
+        id: "overrun-adaptable",
+        seconds: 2,
+        prompt: "P",
+        adaptations: { h3: { ...ad("[Shot 2] At 00:04.000", "h"), seconds: 5 } },
+      }),
+      // 模型锁定 2s，但片段仍标 5s 且稿有 At 00:04.000：归为 blocked（不能靠重转修复）
+      seg({
+        id: "overrun-locked",
+        seconds: 5,
+        prompt: "P",
+        adaptations: { h3: { ...ad("[Shot 2] At 00:04.000", "h"), seconds: 5 } },
+      }),
+    ];
+    expect(adaptationDurationMismatch(list[0].adaptations.h3, 2)).toBe(false);
+    expect(adaptationDurationMismatch(list[1].adaptations.h3, 2)).toBe(true);
+
+    const split = splitBatch(
+      list,
+      "h3",
+      () => "h",
+      () => 2,
+    );
+    expect(split.ready.map((s) => s.id)).toEqual(["legacy"]);
+    expect(split.stale.map((s) => s.id)).toEqual(["mismatch-ok"]);
+    expect(split.overrun.map((s) => s.id)).toEqual(["overrun-adaptable"]);
+    expect(split.blocked.map((s) => s.id)).toEqual(["overrun-locked"]);
+  });
+
+  test("Seedance 批量生成前拦截时间轴超出模型生效时长的片段", () => {
+    const list = [
+      seg({ id: "ok", seconds: 5, prompt: "0-2秒：推近" }),
+      seg({ id: "bad", seconds: 5, prompt: "0-4秒：走路" }),
+    ];
+    const checked = evaluateSeedanceBatch(list, () => 2);
+    expect(checked.ready.map((s) => s.id)).toEqual(["ok"]);
+    expect(checked.blocked.map((s) => s.id)).toEqual(["bad"]);
   });
 });

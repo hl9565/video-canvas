@@ -11,7 +11,7 @@ import (
 	"video-canvas/internal/provider/modelcfg"
 )
 
-func mcInt(v int) *int { return &v }
+func mcInt(v int64) *int64 { return &v }
 
 // mcVideoCaps 是视频模型的测试能力：三种生成方式，图片最多 2 张、音频最多 1 个，视频素材关闭。
 func mcVideoCaps() modelcfg.Capabilities {
@@ -244,4 +244,63 @@ func TestAsAssetID(t *testing.T) {
 			t.Errorf("AsAssetID(%#v) = %d, %v，期望 %d, %v", tt.in, got, ok, tt.want, tt.ok)
 		}
 	}
+}
+
+func TestValidateInput_Seed与32位安全整数(t *testing.T) {
+	caps := modelcfg.Capabilities{
+		Prompt: modelcfg.PromptSpec{MaxLength: 100},
+		Params: modelcfg.ParamSet{
+			{Name: "duration", ParamField: modelcfg.ParamField{Type: modelcfg.ParamNumber, Label: "时长", Open: true, Min: mcInt(2), Max: mcInt(15), Default: 5.0}},
+			{Name: "seed", ParamField: modelcfg.ParamField{Type: modelcfg.ParamNumber, Label: "随机种子", Open: true, Min: mcInt(-1), Max: mcInt(4294967295), Default: float64(3916315536)}},
+		},
+	}
+
+	got, errs := modelcfg.ValidateInput(modelcfg.KindVideo, caps, map[string]any{"prompt": "hi"})
+	if len(errs) > 0 || got["seed"] != float64(3916315536) {
+		t.Fatalf("默认固定 seed 未正确回填：got=%v errs=%v", got, errs)
+	}
+
+	for _, validSeed := range []any{-1.0, 0.0, json.Number("0"), json.Number("3916315536"), json.Number("4294967295"), int64(4294967295)} {
+		got, errs := modelcfg.ValidateInput(modelcfg.KindVideo, caps, map[string]any{"prompt": "hi", "seed": validSeed})
+		if len(errs) > 0 {
+			t.Fatalf("seed=%#v 应通过，实际报错：%v", validSeed, errs)
+		}
+		if got["seed"] == nil {
+			t.Fatalf("seed=%#v 结果为空", validSeed)
+		}
+	}
+
+	for _, invalidSeed := range []any{1.5, 3916315536.5, -2.0, json.Number("4294967296"), json.Number("9007199254740993"), "123"} {
+		if _, errs := modelcfg.ValidateInput(modelcfg.KindVideo, caps, map[string]any{"prompt": "hi", "seed": invalidSeed}); len(errs) == 0 {
+			t.Fatalf("seed=%#v 应被拒绝", invalidSeed)
+		}
+	}
+
+	// 未设上下限的数字参数也不能接受超过 2^53-1 的不安全 json.Number 静默舍入
+	unbounded := modelcfg.Capabilities{
+		Prompt: modelcfg.PromptSpec{MaxLength: 100},
+		Params: modelcfg.ParamSet{{Name: "seed", ParamField: modelcfg.ParamField{Type: modelcfg.ParamNumber, Label: "随机种子", Open: true}}},
+	}
+	if _, errs := modelcfg.ValidateInput(modelcfg.KindVideo, unbounded, map[string]any{"prompt": "hi", "seed": json.Number("9007199254740993")}); len(errs) == 0 {
+		t.Fatal("9007199254740993 超出安全整数范围，应在 float 舍入前被拒绝")
+	}
+
+	norm := modelcfg.NormalizeJSON(map[string]any{"big": json.Number("4294967295"), "unsafe": json.Number("9007199254740993")}).(map[string]any)
+	assertExactInt64 := func(key string, want int64) {
+		t.Helper()
+		switch v := norm[key].(type) {
+		case int:
+			if int64(v) != want {
+				t.Fatalf("%s 值应为 %d，实际 %d", key, want, v)
+			}
+		case int64:
+			if v != want {
+				t.Fatalf("%s 值应为 %d，实际 %d", key, want, v)
+			}
+		default:
+			t.Fatalf("%s 应保持精确整数类型，实际 %#v (%T)", key, norm[key], norm[key])
+		}
+	}
+	assertExactInt64("big", 4294967295)
+	assertExactInt64("unsafe", 9007199254740993)
 }

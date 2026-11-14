@@ -179,6 +179,7 @@ const mapAdaptations = (raw: BackendSegmentView["adaptations"]): Segment["adapta
     out[format as AdaptFormat] = {
       prompt: item.prompt ?? "",
       sourceHash: item.source_hash ?? "",
+      ...(typeof item.seconds === "number" && item.seconds > 0 ? { seconds: item.seconds } : {}),
       edited: !!item.edited,
       updatedAt: item.updated_at ?? "",
     };

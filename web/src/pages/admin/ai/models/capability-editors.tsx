@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
-import { OP_LABEL } from "@/utils/tasks/capabilities";
+import { OP_LABEL, parseStrictInt } from "@/utils/tasks/capabilities";
 
 /** 一个字段的固定范围提示（来自后端固定上下限，和 backend/internal/provider/modelcfg/validate_caps.go 一致） */
 export const LIMITS = {
@@ -24,6 +24,7 @@ export const LIMITS = {
   refMb: [1, 500],
   promptLength: [1, 1_000_000],
   numberValue: [1, 3600],
+  seedValue: [-1, 4_294_967_295],
   enumOptions: 20,
   fanout: [1, 8],
   contextWindow: [1, 10_000_000],
@@ -55,12 +56,13 @@ const REF_USED: Record<RefKind, string> = {
   video: "全能参考",
 };
 
-/** 整数输入框：空输入当作 0，超出范围标红（范围来自后端固定上下限） */
-function IntInput({
+/** 整数输入框：严格整数校验（保留非法输入并标红提示，绝不静默截断小数），超出范围标红 */
+export function IntInput({
   id,
   value,
   range,
   label,
+  disabled,
   className,
   onChange,
 }: {
@@ -68,25 +70,46 @@ function IntInput({
   value: number | undefined;
   range?: readonly [number, number];
   label: string;
+  disabled?: boolean;
   className?: string;
   onChange: (value: number | undefined) => void;
 }) {
+  const [draft, setDraft] = useState<{ base: number | undefined; text: string } | null>(null);
+  const activeDraft = draft && draft.base === value ? draft.text : null;
+  const display = activeDraft ?? (value === undefined ? "" : String(value));
+  const invalidDraft =
+    activeDraft !== null && activeDraft !== "" && parseStrictInt(activeDraft) === null;
   const out = value !== undefined && range && (value < range[0] || value > range[1]);
   return (
-    <Input
-      id={id}
-      type="number"
-      inputMode="numeric"
-      aria-label={label}
-      aria-invalid={!!out}
-      title={range ? `允许范围 ${range[0]} – ${range[1]}` : undefined}
-      className={cn("h-8 w-24 tabular-nums", className)}
-      value={value === undefined ? "" : String(value)}
-      onChange={(event) => {
-        const raw = event.target.value;
-        onChange(raw === "" ? undefined : Math.trunc(Number(raw)));
-      }}
-    />
+    <span className="inline-flex flex-col gap-0.5">
+      <Input
+        id={id}
+        type="text"
+        inputMode="numeric"
+        aria-label={label}
+        aria-invalid={invalidDraft || !!out}
+        disabled={disabled}
+        title={range ? `允许范围 ${range[0]} – ${range[1]}` : undefined}
+        className={cn("h-8 w-24 tabular-nums", className)}
+        value={display}
+        onChange={(event) => {
+          const raw = event.target.value;
+          if (raw === "") {
+            setDraft(null);
+            onChange(undefined);
+            return;
+          }
+          const parsed = parseStrictInt(raw);
+          if (parsed !== null) {
+            setDraft(null);
+            onChange(parsed);
+            return;
+          }
+          setDraft({ base: value, text: raw });
+        }}
+      />
+      {invalidDraft && <span className="text-destructive text-[11px]">请输入整数</span>}
+    </span>
   );
 }
 
@@ -342,21 +365,26 @@ function OptionsEditor({
   );
 }
 
-/** number 参数：最小 / 最大 / 默认 / 步长，下方滑轨示意 */
+/** number 参数：最小 / 最大 / 默认 / 步长；seed 使用专用整数域且隐藏无意义滑轨 */
 function NumberEditor({
+  name,
   field,
   onChange,
 }: {
+  name: string;
   field: ParamField;
   onChange: (next: ParamField) => void;
 }) {
+  const isSeed = name === "seed";
+  const domainRange = isSeed ? LIMITS.seedValue : LIMITS.numberValue;
   const min = field.min;
   const max = field.max;
   const def = typeof field.default === "number" ? field.default : undefined;
-  const step = field.step ?? 1;
+  const step = isSeed ? 1 : (field.step ?? 1);
+  const wideRange = isSeed || (min !== undefined && max !== undefined && max - min > 10_000);
   const set = (patch: Partial<ParamField>) => onChange({ ...field, ...patch });
   const pct =
-    min !== undefined && max !== undefined && def !== undefined && max > min
+    !wideRange && min !== undefined && max !== undefined && def !== undefined && max > min
       ? Math.min(100, Math.max(0, ((def - min) / (max - min)) * 100))
       : 0;
   return (
@@ -375,10 +403,14 @@ function NumberEditor({
             <IntInput
               label={`${field.label}${text}`}
               value={value}
-              range={key === "step" ? [1, LIMITS.numberValue[1]] : LIMITS.numberValue}
-              className="w-16"
+              disabled={isSeed && key === "step"}
+              range={key === "step" ? (isSeed ? [1, 1] : [1, LIMITS.numberValue[1]]) : domainRange}
+              className={isSeed && key !== "step" ? "w-28" : "w-16"}
               onChange={(next) => set({ [key]: next } as Partial<ParamField>)}
             />
+            {isSeed && key === "step" && (
+              <span className="text-muted-foreground text-[11px]">步长固定为 1</span>
+            )}
           </label>
         ))}
         <label className="flex items-center gap-1.5">
@@ -391,19 +423,27 @@ function NumberEditor({
           />
         </label>
       </div>
-      <div className="px-1">
-        <div className="bg-muted relative h-1.5 rounded-full" aria-hidden>
-          <div className="bg-foreground/40 h-full rounded-full" style={{ width: `${pct}%` }} />
-          <span
-            className="bg-foreground absolute top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full"
-            style={{ left: `${pct}%` }}
-          />
+      {wideRange ? (
+        <p className="text-muted-foreground px-1 text-[11px] tabular-nums">
+          {isSeed
+            ? `允许范围 ${LIMITS.seedValue[0]} – ${LIMITS.seedValue[1]}（-1 为随机）`
+            : `允许范围 ${min} – ${max}`}
+        </p>
+      ) : (
+        <div className="px-1">
+          <div className="bg-muted relative h-1.5 rounded-full" aria-hidden>
+            <div className="bg-foreground/40 h-full rounded-full" style={{ width: `${pct}%` }} />
+            <span
+              className="bg-foreground absolute top-1/2 size-3 -translate-x-1/2 -translate-y-1/2 rounded-full"
+              style={{ left: `${pct}%` }}
+            />
+          </div>
+          <div className="text-muted-foreground mt-1 flex justify-between text-[10px] tabular-nums">
+            <span>最短 {min ?? "?"}</span>
+            <span>最长 {max ?? "?"}</span>
+          </div>
         </div>
-        <div className="text-muted-foreground mt-1 flex justify-between text-[10px] tabular-nums">
-          <span>最短 {min ?? "?"}</span>
-          <span>最长 {max ?? "?"}</span>
-        </div>
-      </div>
+      )}
     </div>
   );
 }
@@ -475,7 +515,7 @@ export function ParamRowEditor({
       </div>
       <div className="mt-3">
         {field.type === "enum" && <OptionsEditor name={name} field={field} onChange={onChange} />}
-        {field.type === "number" && <NumberEditor field={field} onChange={onChange} />}
+        {field.type === "number" && <NumberEditor name={name} field={field} onChange={onChange} />}
         {field.type === "boolean" && (
           <label className="flex items-center gap-2 text-xs">
             默认开启

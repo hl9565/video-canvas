@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # 生产环境更新脚本（Linux / macOS），无需克隆仓库，可直接通过管道运行：
-#   curl -fsSL https://raw.githubusercontent.com/zaylora/video-canvas/master/scripts/update.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/hl9565/video-canvas/master/scripts/update.sh | bash
 #
-# 流程：改 IMAGE_TAG → 取目标版本的 compose 文件 → 确保有 Agent 服务令牌 → 拉镜像 → 备份数据库和 Agent 的数据（在线）→ 重建 → 等新版本健康
-# 任何一步失败都会退回更新前的 IMAGE_TAG 和 compose 文件。后台「一键升级」（updater 容器）调用的也是这个脚本。
+# 流程：读取并保留 IMAGE_OWNER / APP_UPDATE_REPO → 改 IMAGE_TAG → 取目标版本的 compose 与 update.sh（失败中止）→ 确保有 Agent 服务令牌 → 拉镜像 → 备份数据库和 Agent 的数据（在线）→ 重建 → 等新版本健康
+# 任何一步失败都会退回更新前的 IMAGE_TAG、compose 与 update.sh。后台「一键升级」（updater 容器）调用的也是这个脚本。
 set -euo pipefail
 
-REPO="zaylora/video-canvas"
-RAW="https://raw.githubusercontent.com/$REPO"
+DEFAULT_REPO="hl9565/video-canvas"
+DEFAULT_OWNER="hl9565"
+REPO_ARG=""
+REPO=""
+RAW=""
 ROOT=""
 TAG=""
 BACKUP=true
@@ -29,8 +32,9 @@ usage() {
 
 选项：
   --dir PATH           部署目录（deploy.sh 生成 .env 的目录）
-  --tag VERSION        目标版本，如 0.4.0（也可用于回退，如 --tag 0.3.2）；
+  --tag VERSION        目标版本，如 0.6.11（也可用于回退，如 --tag 0.6.10）；
                        不带时取 GitHub 上最新的正式版本。latest 也可以，但失败时无法回退
+  --repo OWNER/REPO    指定检查更新及下载 compose/update.sh 的 GitHub 仓库（默认读取 .env APP_UPDATE_REPO 或 hl9565/video-canvas）
   --no-backup          不备份数据库（不推荐）
   --keep-backups N     保留最近 N 份备份，默认 3
   --timeout SECONDS    等新版本健康的最长时间，默认 600（老库首次迁移可能较慢）
@@ -49,6 +53,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --dir)          ROOT="${2:?--dir 需要参数}"; shift 2 ;;
     --tag)          TAG="${2:?--tag 需要参数}"; shift 2 ;;
+    --repo)         REPO_ARG="${2:?--repo 需要参数}"; shift 2 ;;
     --no-backup)    BACKUP=false; shift ;;
     --keep-backups) KEEP_BACKUPS="${2:?--keep-backups 需要参数}"; shift 2 ;;
     --timeout)      TIMEOUT="${2:?--timeout 需要参数}"; shift 2 ;;
@@ -136,19 +141,50 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   rm -rf "$LOCK_DIR" && mkdir "$LOCK_DIR"
 fi
 echo $$ > "$LOCK_DIR/pid"
-trap 'rm -rf "$LOCK_DIR" "$COMPOSE_FILE.next"' EXIT
+UPDATE_FILE="$ROOT/update.sh"
+trap 'rm -rf "$LOCK_DIR" "$COMPOSE_FILE.next" "$UPDATE_FILE.next"' EXIT
 
 env_value() {
   grep -E "^$1=" "$ENV_FILE" | tail -n1 | cut -d= -f2- || true
 }
 
-set_tag() {
-  if grep -qE '^IMAGE_TAG=' "$ENV_FILE"; then
-    sed -i.bak "s|^IMAGE_TAG=.*|IMAGE_TAG=$1|" "$ENV_FILE" && rm -f "$ENV_FILE.bak"
+set_env_key() {
+  local key="$1" val="$2"
+  if grep -qE "^${key}=" "$ENV_FILE"; then
+    sed -i.bak "s|^${key}=.*|${key}=${val}|" "$ENV_FILE" && rm -f "$ENV_FILE.bak"
   else
-    echo "IMAGE_TAG=$1" >> "$ENV_FILE"
+    printf '\n%s=%s\n' "$key" "$val" >> "$ENV_FILE"
   fi
 }
+
+set_tag() {
+  set_env_key "IMAGE_TAG" "$1"
+}
+
+ENV_UPDATE_REPO="$(env_value APP_UPDATE_REPO)"
+if [ -n "$REPO_ARG" ]; then
+  REPO="$REPO_ARG"
+elif [ -n "${VIDEO_CANVAS_REPO:-}" ]; then
+  REPO="$VIDEO_CANVAS_REPO"
+elif [ -n "$ENV_UPDATE_REPO" ]; then
+  REPO="$ENV_UPDATE_REPO"
+else
+  REPO="$DEFAULT_REPO"
+fi
+case "$REPO" in
+  *..*) fail failed "仓库名不合法：$REPO" ;;
+esac
+printf '%s' "$REPO" | grep -qE '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+$' \
+  || fail failed "仓库名不合法（应为 owner/name）：$REPO"
+RAW="https://raw.githubusercontent.com/$REPO"
+
+# 读取并保留 .env 中的 IMAGE_OWNER 与 APP_UPDATE_REPO（缺失时补写 fork 默认值，绝不回落上游 zaylora）
+OLD_OWNER="$(env_value IMAGE_OWNER)"
+ACTIVE_OWNER="${IMAGE_OWNER:-${OLD_OWNER:-$DEFAULT_OWNER}}"
+[ -n "$OLD_OWNER" ] || set_env_key "IMAGE_OWNER" "$ACTIVE_OWNER"
+if [ -n "$REPO_ARG" ] || [ -z "$ENV_UPDATE_REPO" ]; then
+  set_env_key "APP_UPDATE_REPO" "$REPO"
+fi
 
 # latest_release 读 GitHub 上最新正式版本的版本号（不含 v）
 latest_release() {
@@ -161,13 +197,13 @@ OLD_TAG="$(env_value IMAGE_TAG)"
 OLD_TAG="${OLD_TAG:-latest}"
 if [ -z "$TAG" ]; then
   TAG="$(latest_release || true)"
-  [ -n "$TAG" ] || fail failed "无法从 GitHub 获取最新版本号，请用 --tag 指定，如 --tag 0.4.0"
+  [ -n "$TAG" ] || fail failed "无法从 $REPO 获取最新版本号，请用 --tag 指定，如 --tag 0.6.11"
 fi
 NEW_TAG="$TAG"
 PG_USER="$(env_value POSTGRES_USER)"; PG_USER="${PG_USER:-postgres}"
 PG_DB="$(env_value POSTGRES_DB)"; PG_DB="${PG_DB:-video_canvas}"
 
-echo "==> 部署目录：$ROOT"
+echo "==> 部署目录：$ROOT（仓库：$REPO，镜像 Owner：$ACTIVE_OWNER）"
 status prepare running "当前版本 $OLD_TAG，目标版本 $NEW_TAG"
 if [ "$NEW_TAG" = "latest" ] || [ "$OLD_TAG" = "latest" ]; then
   echo "[提示] 使用 latest 时无法确认版本、也无法在失败时自动回退；建议改用具体版本号（--tag x.y.z）。" >&2
@@ -176,11 +212,19 @@ fi
 # ---------- 回退 ----------
 
 COMPOSE_REPLACED=false
+UPDATE_REPLACED=false
+UPDATE_CREATED=false
 
 restore_files() {
   [ "$NEW_TAG" != "$OLD_TAG" ] && set_tag "$OLD_TAG"
   if [ "$COMPOSE_REPLACED" = true ] && [ -f "$COMPOSE_FILE.bak" ]; then
     mv -f "$COMPOSE_FILE.bak" "$COMPOSE_FILE"
+  fi
+  if [ "$UPDATE_REPLACED" = true ] && [ -f "$UPDATE_FILE.bak" ]; then
+    mv -f "$UPDATE_FILE.bak" "$UPDATE_FILE"
+    chmod +x "$UPDATE_FILE"
+  elif [ "$UPDATE_CREATED" = true ]; then
+    rm -f "$UPDATE_FILE"
   fi
 }
 
@@ -239,18 +283,41 @@ rollback() {
 
 [ "$NEW_TAG" != "$OLD_TAG" ] && set_tag "$NEW_TAG"
 
-status compose running "获取 $NEW_TAG 的 docker-compose.yml"
+status compose running "获取 $NEW_TAG ($REPO) 的 docker-compose.yml 与 update.sh"
 ref="v$NEW_TAG"
 [ "$NEW_TAG" = "latest" ] && ref="master"
-if command -v curl >/dev/null 2>&1 && curl -fsSL --max-time 30 "$RAW/$ref/docker-compose.yml" -o "$COMPOSE_FILE.next"; then
-  if ! cmp -s "$COMPOSE_FILE.next" "$COMPOSE_FILE"; then
-    cp "$COMPOSE_FILE" "$COMPOSE_FILE.bak"
-    mv "$COMPOSE_FILE.next" "$COMPOSE_FILE"
-    COMPOSE_REPLACED=true
-    echo "    已更新 docker-compose.yml（旧文件备份为 docker-compose.yml.bak）"
-  fi
+command -v curl >/dev/null 2>&1 || { restore_files; fail failed "未找到 curl，无法获取 $ref 部署配置"; }
+if ! curl -fsSL --max-time 30 "$RAW/$ref/docker-compose.yml" -o "$COMPOSE_FILE.next" || [ ! -s "$COMPOSE_FILE.next" ]; then
+  rm -f "$COMPOSE_FILE.next"
+  restore_files
+  fail failed "无法从 $REPO ($ref) 获取 docker-compose.yml，已中止更新（绝不回落其他仓库）"
+fi
+if ! curl -fsSL --max-time 30 "$RAW/$ref/scripts/update.sh" -o "$UPDATE_FILE.next" || [ ! -s "$UPDATE_FILE.next" ]; then
+  rm -f "$COMPOSE_FILE.next" "$UPDATE_FILE.next"
+  restore_files
+  fail failed "无法从 $REPO ($ref) 获取 scripts/update.sh，已中止更新（绝不回落其他仓库）"
+fi
+if ! cmp -s "$COMPOSE_FILE.next" "$COMPOSE_FILE"; then
+  cp "$COMPOSE_FILE" "$COMPOSE_FILE.bak"
+  mv -f "$COMPOSE_FILE.next" "$COMPOSE_FILE"
+  COMPOSE_REPLACED=true
+  echo "    已更新 docker-compose.yml（旧文件备份为 docker-compose.yml.bak）"
 else
-  echo "[提示] 无法获取 $ref 的 compose 文件，沿用本地版本。" >&2
+  rm -f "$COMPOSE_FILE.next"
+fi
+if [ ! -f "$UPDATE_FILE" ]; then
+  mv -f "$UPDATE_FILE.next" "$UPDATE_FILE"
+  chmod +x "$UPDATE_FILE"
+  UPDATE_CREATED=true
+  echo "    已写入 update.sh"
+elif ! cmp -s "$UPDATE_FILE.next" "$UPDATE_FILE"; then
+  cp "$UPDATE_FILE" "$UPDATE_FILE.bak"
+  mv -f "$UPDATE_FILE.next" "$UPDATE_FILE"
+  chmod +x "$UPDATE_FILE"
+  UPDATE_REPLACED=true
+  echo "    已更新 update.sh（旧文件备份为 update.sh.bak）"
+else
+  rm -f "$UPDATE_FILE.next"
 fi
 
 # ---------- 1b. 确保有 Agent 服务令牌 ----------
@@ -350,7 +417,7 @@ if ! wait_ready "$NEW_TAG"; then
   rollback "新版本在 $TIMEOUT 秒内没有就绪"
 fi
 
-rm -f "$COMPOSE_FILE.bak"
+rm -f "$COMPOSE_FILE.bak" "$UPDATE_FILE.bak"
 if [ "$PRUNE" = true ]; then
   echo "==> 清理悬空镜像"
   docker image prune --force >/dev/null

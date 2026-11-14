@@ -18,8 +18,9 @@ func (s *DramaSegmentService) Generate(ctx context.Context, userID, sid uint64, 
 		return nil, errcode.ErrInvalidParams
 	}
 	var project *model.DramaProject
+	var rowSeconds int
 	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
-		p, ep, _, err := lockSegment(ctx, tx, userID, sid)
+		p, ep, row, err := lockSegment(ctx, tx, userID, sid)
 		if err != nil {
 			return err
 		}
@@ -34,10 +35,14 @@ func (s *DramaSegmentService) Generate(ctx context.Context, userID, sid uint64, 
 			return errcode.ErrDramaJobBusy
 		}
 		project = p
+		rowSeconds = row.Seconds
 		return nil
 	})
 	if err != nil {
 		return nil, segmentError(err)
+	}
+	if err := checkSegmentTimeline(req.Input, rowSeconds); err != nil {
+		return nil, err
 	}
 	result, err := s.tasks.Create(ctx, userID, key, &model.CreateGenerationTaskReq{Kind: model.KindVideo, ModelID: req.ModelID, CanvasID: idcodec.ID(project.CanvasID), NodeID: segmentNode(sid), Input: req.Input})
 	if err != nil {

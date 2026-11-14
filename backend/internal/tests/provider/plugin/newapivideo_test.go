@@ -65,7 +65,7 @@ func (e *newAPIVideoEnv) snapshot(baseURL string) *provider.Snapshot {
 
 // newAPIVideoCaps 是 sd2.5-c1 的能力：文生、图生、多素材参考（30 图 + 10 视频 + 10 音频），时长 5–30 秒。
 func newAPIVideoCaps() modelcfg.Capabilities {
-	minSec, maxSec := 5, 30
+	var minSec, maxSec int64 = 5, 30
 	return modelcfg.Capabilities{
 		Ops: []string{modelcfg.OpT2V, modelcfg.OpI2V, modelcfg.OpOmni},
 		Refs: modelcfg.Refs{

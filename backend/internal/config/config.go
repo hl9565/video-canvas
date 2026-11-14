@@ -23,7 +23,7 @@ type Config struct {
 }
 
 // DefaultUpdateRepo 是检查新版本用的 GitHub 仓库。
-const DefaultUpdateRepo = "zaylora/video-canvas"
+const DefaultUpdateRepo = "hl9565/video-canvas"
 
 // Update 是后台「检查新版本」的配置：读 GitHub Releases 的最新正式版本，只提示、不自动升级。
 type Update struct {

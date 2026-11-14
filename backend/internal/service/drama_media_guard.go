@@ -2,12 +2,18 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"math"
 	"slices"
+	"strconv"
 	"strings"
 
+	"video-canvas/internal/drama"
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/provider/modelcfg"
 	"video-canvas/internal/repository"
 )
 
@@ -50,12 +56,20 @@ func guardDramaGeneration(ctx context.Context, tx repository.GenerationTaskTx, t
 	if !ok {
 		return errcode.ErrInvalidParams
 	}
-	p, ep, _, err := lockSegment(ctx, dtx, task.UserID, sid)
+	p, ep, row, err := lockSegment(ctx, dtx, task.UserID, sid)
 	if err != nil {
 		return segmentError(err)
 	}
 	if task.CanvasProjectID == nil || *task.CanvasProjectID != p.CanvasID || task.Kind != model.KindVideo {
 		return errcode.ErrInvalidParams
+	}
+	if len(task.InputJSON) > 0 {
+		var in map[string]any
+		if err := json.Unmarshal(task.InputJSON, &in); err == nil {
+			if err := checkSegmentTimeline(in, row.Seconds); err != nil {
+				return err
+			}
+		}
 	}
 	jobs, err := dtx.Jobs(ctx, p.UserID, p.ID, true)
 	if err != nil {
@@ -65,4 +79,55 @@ func guardDramaGeneration(ctx context.Context, tx repository.GenerationTaskTx, t
 		return errcode.ErrDramaJobBusy
 	}
 	return checkDramaMediaTasks(ctx, dtx, p, []model.DramaEpisode{*ep}, task.IdempotencyKey)
+}
+
+func hasSegmentNode(nodes []string) bool {
+	for _, nodeID := range nodes {
+		if strings.HasPrefix(nodeID, "seg:") {
+			return true
+		}
+	}
+	return false
+}
+
+// checkSegmentTimeline 校验短剧片段提交的提示词时间轴是否超出最终生效的生成时长。
+func checkSegmentTimeline(input map[string]any, fallbackSeconds int) error {
+	prompt, _ := input["prompt"].(string)
+	sec := inputDurationSeconds(input)
+	if sec <= 0 {
+		sec = fallbackSeconds
+	}
+	if sec <= 0 {
+		return nil
+	}
+	if end, over := drama.TimelineOverrun(prompt, sec); over {
+		return errcode.ErrTaskInput.WithMsg(fmt.Sprintf("%s提示词时间轴写到 %s 秒，超过生成时长 %d 秒，请调整提示词或重新转写",
+			taskUserVisibleErrPrefix, strconv.FormatFloat(end, 'f', -1, 64), sec))
+	}
+	return nil
+}
+
+func inputDurationSeconds(input map[string]any) int {
+	if input == nil {
+		return 0
+	}
+	switch v := input[modelcfg.DurationParam].(type) {
+	case int:
+		return max(v, 0)
+	case int64:
+		return int(max(v, 0))
+	case float64:
+		if !math.IsNaN(v) && !math.IsInf(v, 0) && v > 0 {
+			return int(math.Round(v))
+		}
+	case json.Number:
+		if f, err := v.Float64(); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f > 0 {
+			return int(math.Round(f))
+		}
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) && f > 0 {
+			return int(math.Round(f))
+		}
+	}
+	return 0
 }

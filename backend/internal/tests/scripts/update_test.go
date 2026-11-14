@@ -47,6 +47,51 @@ esac
 exit 0
 `
 
+const fakeCurl = `#!/usr/bin/env bash
+echo "$*" >> "$FAKE_DIR/curl_calls.log"
+rc() { cat "$FAKE_DIR/$1" 2>/dev/null || echo "${2:-0}"; }
+out=""
+url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -H|--max-time) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+global_rc="$(rc curl_rc 0)"
+[ "$global_rc" = "0" ] || exit "$global_rc"
+case "$url" in
+  */docker-compose.yml)
+    c_rc="$(rc curl_compose_rc 0)"
+    [ "$c_rc" = "0" ] || exit "$c_rc"
+    if [ -f "$FAKE_DIR/remote_compose" ]; then
+      cat "$FAKE_DIR/remote_compose" > "$out"
+    else
+      printf 'services: {}\n' > "$out"
+    fi
+    ;;
+  */scripts/update.sh)
+    u_rc="$(rc curl_update_rc 0)"
+    [ "$u_rc" = "0" ] || exit "$u_rc"
+    if [ -f "$FAKE_DIR/remote_update" ]; then
+      cat "$FAKE_DIR/remote_update" > "$out"
+    else
+      printf '#!/usr/bin/env bash\n# stub update.sh\n' > "$out"
+    fi
+    ;;
+  */releases/latest)
+    l_rc="$(rc curl_latest_rc 0)"
+    [ "$l_rc" = "0" ] || exit "$l_rc"
+    printf '{"tag_name":"v1.1.0"}\n'
+    ;;
+  *)
+    exit 22
+    ;;
+esac
+`
+
 const sqliteDump = "SQLite format 3\x00fake-agent-data"
 
 type env struct {
@@ -65,7 +110,7 @@ func newEnv(t *testing.T) *env {
 		}
 	}
 	write(filepath.Join(e.bin, "docker"), fakeDocker, 0o755)
-	write(filepath.Join(e.bin, "curl"), "#!/bin/sh\nexit 22\n", 0o755) // 取不到新版 compose 文件：沿用本地的
+	write(filepath.Join(e.bin, "curl"), fakeCurl, 0o755)
 	envFile := "IMAGE_TAG=1.0.0\nPOSTGRES_USER=postgres\nPOSTGRES_DB=video_canvas\nAGENT_SERVICE_TOKEN=" + strings.Repeat("a", 64) + "\n"
 	write(filepath.Join(e.root, ".env"), envFile, 0o644)
 	write(filepath.Join(e.root, "docker-compose.yml"), "services: {}\n", 0o644)
@@ -312,4 +357,149 @@ func TestUpdate_RollbackShowsAgentLogs(t *testing.T) {
 	if !strings.Contains(out, "AGENT-LOG-MARKER") {
 		t.Errorf("回退时应打印 agent 的日志：\n%s", out)
 	}
+}
+
+func (e *env) curlCalls() string {
+	b, _ := os.ReadFile(filepath.Join(e.fake, "curl_calls.log"))
+	return string(b)
+}
+
+func TestUpdate_ForkRepoAndOwnerDefaultsAndOverrides(t *testing.T) {
+	t.Run("defaults_to_hl9565_when_missing", func(t *testing.T) {
+		e := newEnv(t)
+		out, code, _ := e.run("--tag", "1.1.0")
+		if code != 0 {
+			t.Fatalf("应成功：%d\n%s", code, out)
+		}
+		if got := e.envValue("IMAGE_OWNER"); got != "hl9565" {
+			t.Errorf("IMAGE_OWNER = %q, want hl9565", got)
+		}
+		if got := e.envValue("APP_UPDATE_REPO"); got != "hl9565/video-canvas" {
+			t.Errorf("APP_UPDATE_REPO = %q, want hl9565/video-canvas", got)
+		}
+		cc := e.curlCalls()
+		if !strings.Contains(cc, "https://raw.githubusercontent.com/hl9565/video-canvas/v1.1.0/docker-compose.yml") ||
+			!strings.Contains(cc, "https://raw.githubusercontent.com/hl9565/video-canvas/v1.1.0/scripts/update.sh") {
+			t.Errorf("未从 fork 仓库拉取目标 tag 的 compose/script：\n%s", cc)
+		}
+		if strings.Contains(strings.ToLower(out+cc), "zaylora") {
+			t.Errorf("不应出现上游仓库回落：\n%s\n%s", out, cc)
+		}
+	})
+
+	t.Run("preserves_existing_owner_and_repo", func(t *testing.T) {
+		e := newEnv(t)
+		raw := mustRead(t, filepath.Join(e.root, ".env"))
+		if err := os.WriteFile(filepath.Join(e.root, ".env"), []byte(raw+"IMAGE_OWNER=custom-owner\nAPP_UPDATE_REPO=custom-owner/vc\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if out, code, _ := e.run("--tag", "1.1.0"); code != 0 {
+			t.Fatalf("%s", out)
+		}
+		if got := e.envValue("IMAGE_OWNER"); got != "custom-owner" {
+			t.Errorf("应保留已有 IMAGE_OWNER：%q", got)
+		}
+		if got := e.envValue("APP_UPDATE_REPO"); got != "custom-owner/vc" {
+			t.Errorf("应保留已有 APP_UPDATE_REPO：%q", got)
+		}
+		if cc := e.curlCalls(); !strings.Contains(cc, "https://raw.githubusercontent.com/custom-owner/vc/v1.1.0/docker-compose.yml") {
+			t.Errorf("应使用保留的仓库拉取：\n%s", cc)
+		}
+	})
+
+	t.Run("repo_flag_overrides_update_repo", func(t *testing.T) {
+		e := newEnv(t)
+		if out, code, _ := e.run("--tag", "1.1.0", "--repo", "my-org/my-vc"); code != 0 {
+			t.Fatalf("%s", out)
+		}
+		if got := e.envValue("APP_UPDATE_REPO"); got != "my-org/my-vc" {
+			t.Errorf("--repo 应写入 APP_UPDATE_REPO：%q", got)
+		}
+		if cc := e.curlCalls(); !strings.Contains(cc, "https://raw.githubusercontent.com/my-org/my-vc/v1.1.0/scripts/update.sh") {
+			t.Errorf("应按 --repo 拉取：\n%s", cc)
+		}
+	})
+
+	t.Run("rejects_invalid_repo", func(t *testing.T) {
+		e := newEnv(t)
+		_, code, st := e.run("--tag", "1.1.0", "--repo", "../bad")
+		if code == 0 || st["state"] != "failed" {
+			t.Fatalf("非法仓库应直接拒绝：%d %v", code, st)
+		}
+		if strings.Contains(e.calls(), "compose pull") {
+			t.Errorf("非法仓库不应继续拉镜像：\n%s", e.calls())
+		}
+	})
+}
+
+func TestUpdate_ComposeOrScriptDownloadFailureAbortsCleanly(t *testing.T) {
+	for name, setup := range map[string]func(e *env){
+		"compose下载失败": func(e *env) { e.set("curl_compose_rc", "22") },
+		"脚本下载失败":      func(e *env) { e.set("curl_update_rc", "22") },
+		"compose为空":   func(e *env) { e.set("remote_compose", "") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			setup(e)
+			out, code, st := e.run("--tag", "1.1.0")
+			if code == 0 || st["state"] != "failed" || st["phase"] != "compose" {
+				t.Fatalf("应 fail-closed 中止：%d %v\n%s", code, st, out)
+			}
+			if got := e.envValue("IMAGE_TAG"); got != "1.0.0" {
+				t.Errorf("IMAGE_TAG 应还原为 1.0.0：%q", got)
+			}
+			if got := mustRead(t, filepath.Join(e.root, "docker-compose.yml")); got != "services: {}\n" {
+				t.Errorf("docker-compose.yml 不应被破坏：%q", got)
+			}
+			if strings.Contains(e.calls(), "compose pull") || strings.Contains(e.calls(), "compose up") {
+				t.Errorf("下载配置失败绝不能继续拉镜像或重建：\n%s", e.calls())
+			}
+			if strings.Contains(strings.ToLower(out+e.curlCalls()), "zaylora") {
+				t.Errorf("失败后绝不能回落其他仓库：\n%s\n%s", out, e.curlCalls())
+			}
+		})
+	}
+}
+
+func TestUpdate_ComposeUpdateAndRollbackRestoresFiles(t *testing.T) {
+	t.Run("removes_new_update_sh_and_restores_compose_on_rollback", func(t *testing.T) {
+		e := newEnv(t)
+		e.set("remote_compose", "services:\n  backend:\n    image: ghcr.io/hl9565/video-canvas-backend:1.1.0\n")
+		e.set("remote_update", "#!/usr/bin/env bash\necho new-update\n")
+		e.set("health", "backend starting\nagent healthy\nweb\n")
+		out, code, st := e.run("--tag", "1.1.0", "--timeout", "1")
+		if code == 0 || st["phase"] != "rollback" || st["state"] != "failed_needs_attention" {
+			t.Fatalf("预期进入 rollback 流程并失败：%d %v\n%s", code, st, out)
+		}
+		if got := mustRead(t, filepath.Join(e.root, "docker-compose.yml")); got != "services: {}\n" {
+			t.Errorf("回退后 docker-compose.yml 应恢复旧版：%q", got)
+		}
+		if _, err := os.Stat(filepath.Join(e.root, "update.sh")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("升级前不存在 update.sh 时回退应清理新建文件，err=%v", err)
+		}
+		if got := e.envValue("IMAGE_TAG"); got != "1.0.0" {
+			t.Errorf("IMAGE_TAG 应退回 1.0.0：%q", got)
+		}
+	})
+
+	t.Run("restores_existing_update_sh_on_pull_failure", func(t *testing.T) {
+		e := newEnv(t)
+		oldUpdate := "#!/usr/bin/env bash\necho old-update\n"
+		if err := os.WriteFile(filepath.Join(e.root, "update.sh"), []byte(oldUpdate), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		e.set("remote_compose", "services:\n  backend:\n    image: ghcr.io/hl9565/video-canvas-backend:1.1.0\n")
+		e.set("remote_update", "#!/usr/bin/env bash\necho new-update\n")
+		e.set("pull_rc", "1")
+		out, code, st := e.run("--tag", "1.1.0")
+		if code == 0 || st["state"] != "failed" {
+			t.Fatalf("拉镜像失败应中止：%d %v\n%s", code, st, out)
+		}
+		if got := mustRead(t, filepath.Join(e.root, "docker-compose.yml")); got != "services: {}\n" {
+			t.Errorf("恢复后 docker-compose.yml 应为旧版：%q", got)
+		}
+		if got := mustRead(t, filepath.Join(e.root, "update.sh")); got != oldUpdate {
+			t.Errorf("恢复后 update.sh 应为旧版：%q", got)
+		}
+	})
 }

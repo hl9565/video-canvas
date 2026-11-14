@@ -229,7 +229,7 @@ const mktVideoKey = "video-a"
 // mktVideoSnapshot 是支持全能参考、参考视频和有声的视频模型：每次出片 20 积分。
 func mktVideoSnapshot() *provider.Snapshot {
 	one := 4
-	maxDur, minDur := 15, 4
+	var maxDur, minDur int64 = 15, 4
 	return &provider.Snapshot{
 		Model: provider.ModelSnapshot{Key: mktVideoKey, Kind: modelcfg.KindVideo, UpstreamModel: "up",
 			Pricing: modelcfg.Pricing{Billing: modelcfg.BillingPerCall, Unit: 20},

@@ -65,7 +65,7 @@ func (e *soraEnv) snapshot(baseURL string, caps modelcfg.Capabilities) *provider
 
 // soraCaps 是文生 + 图生，开放 duration 与 size 两个参数。
 func soraCaps() modelcfg.Capabilities {
-	minSec, maxSec := 4, 12
+	var minSec, maxSec int64 = 4, 12
 	return modelcfg.Capabilities{
 		Ops:    []string{modelcfg.OpT2V, modelcfg.OpI2V},
 		Refs:   modelcfg.Refs{Image: modelcfg.RefSpec{On: true, Max: 1, MaxMB: 10}},

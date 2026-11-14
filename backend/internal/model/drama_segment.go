@@ -23,9 +23,11 @@ type DramaSegment struct {
 }
 
 // DramaSegmentAdaptation 是一份转写稿；SourceHash 是转写时原稿的 SHA-256，与当前原稿不同即已过期。
+// Seconds 记录转写时对应片段时长（秒）；旧数据未知时长时保持 0（omitempty 省略，不虚构历史时长）。
 type DramaSegmentAdaptation struct {
 	Prompt     string    `json:"prompt"`
 	SourceHash string    `json:"source_hash"`
+	Seconds    int       `json:"seconds,omitempty"`
 	Edited     bool      `json:"edited"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }

@@ -15,7 +15,7 @@ import (
 	"video-canvas/internal/service"
 )
 
-func intPtr(n int) *int { return &n }
+func intPtr(n int64) *int64 { return &n }
 
 // 登记一个启用的视频模型与图片、文本模型；video 带可调的时长参数。
 func dramaModelRegistry(registry *dramaRegistry, duration *modelcfg.ParamField) {

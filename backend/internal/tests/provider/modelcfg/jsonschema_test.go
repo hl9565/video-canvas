@@ -120,3 +120,25 @@ func TestJSONSchema_APIFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestJSONSchema_Seed专用整数域(t *testing.T) {
+	var schema map[string]any
+	if err := json.Unmarshal(modelcfg.JSONSchema(), &schema); err != nil {
+		t.Fatal(err)
+	}
+	caps := schema["properties"].(map[string]any)["capabilities"].(map[string]any)
+	params := caps["properties"].(map[string]any)["params"].(map[string]any)
+
+	addProps := params["additionalProperties"].(map[string]any)["properties"].(map[string]any)
+	if addProps["min"].(map[string]any)["minimum"] != 1.0 || addProps["max"].(map[string]any)["maximum"] != 3600.0 {
+		t.Fatalf("普通参数范围被破坏：%v", addProps)
+	}
+
+	seedProps := params["properties"].(map[string]any)["seed"].(map[string]any)["properties"].(map[string]any)
+	if seedProps["min"].(map[string]any)["minimum"] != -1.0 || seedProps["max"].(map[string]any)["maximum"] != 4294967295.0 {
+		t.Fatalf("seed Schema 范围不对：%v", seedProps)
+	}
+	if seedProps["step"].(map[string]any)["maximum"] != 1.0 {
+		t.Fatalf("seed step 应锁定为 1：%v", seedProps["step"])
+	}
+}

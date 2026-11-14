@@ -300,6 +300,22 @@ func TestParseModel_能力规则(t *testing.T) {
 		{"enum 没有默认值", func(m map[string]any) { delete(mcParam(m, "resolution"), "default") }, "capabilities.params.resolution.default", "默认值"},
 		{"number 缺 min / max", func(m map[string]any) { delete(mcParam(m, "duration"), "max") }, "capabilities.params.duration", "min"},
 		{"number 最大值超过 3600", func(m map[string]any) { mcParam(m, "duration")["max"] = 3601 }, "capabilities.params.duration.min", "3600"},
+		{"number 最小值超过上限", func(m map[string]any) { mcParam(m, "duration")["min"] = 0 }, "capabilities.params.duration.min", "3600"},
+		{"seed 最小值小于 -1", func(m map[string]any) {
+			mcParams(m)["seed"] = map[string]any{"type": "number", "label": "种子", "open": true, "min": -2, "max": int64(4294967295), "default": -1}
+		}, "capabilities.params.seed.min", "4294967295"},
+		{"seed 最大值超过 uint32", func(m map[string]any) {
+			mcParams(m)["seed"] = map[string]any{"type": "number", "label": "种子", "open": true, "min": -1, "max": int64(4294967296), "default": -1}
+		}, "capabilities.params.seed.min", "4294967295"},
+		{"seed 步长不为 1", func(m map[string]any) {
+			mcParams(m)["seed"] = map[string]any{"type": "number", "label": "种子", "open": true, "min": -1, "max": int64(4294967295), "step": 2, "default": -1}
+		}, "capabilities.params.seed.step", "固定为 1"},
+		{"seed 默认值小数", func(m map[string]any) {
+			mcParams(m)["seed"] = map[string]any{"type": "number", "label": "种子", "open": true, "min": -1, "max": int64(4294967295), "default": 3916315536.5}
+		}, "capabilities.params.seed.default", "整数"},
+		{"seed 默认值超出范围且不丢精度", func(m map[string]any) {
+			mcParams(m)["seed"] = map[string]any{"type": "number", "label": "种子", "open": true, "min": -1, "max": int64(4294967295), "default": int64(9007199254740993)}
+		}, "capabilities.params.seed.default", "4294967295"},
 		{"number 最小值大于最大值", func(m map[string]any) { mcParam(m, "duration")["min"] = 20 }, "capabilities.params.duration.min", ""},
 		{"number 默认值超出范围", func(m map[string]any) { mcParam(m, "duration")["default"] = 13 }, "capabilities.params.duration.default", "4 – 12"},
 		{"number 默认值不是步长整数倍", func(m map[string]any) {
@@ -514,6 +530,12 @@ func TestParseModel_合法变体(t *testing.T) {
 		}},
 		{"不开放的参数有默认值", func(m map[string]any) {
 			mcParams(m)["seed"] = map[string]any{"type": "number", "label": "种子", "open": false, "min": 1, "max": 100, "default": 7}
+		}},
+		{"seed 支持 -1..4294967295 与固定默认值", func(m map[string]any) {
+			mcParams(m)["seed"] = map[string]any{"type": "number", "label": "种子", "open": true, "min": -1, "max": int64(4294967295), "step": 1, "default": int64(3916315536)}
+		}},
+		{"seed 默认 -1", func(m map[string]any) {
+			mcParams(m)["seed"] = map[string]any{"type": "number", "label": "种子", "open": true, "min": -1, "max": int64(4294967295), "default": -1}
 		}},
 		{"number 不写步长", func(m map[string]any) { delete(mcParam(m, "duration"), "step") }},
 	}

@@ -64,7 +64,7 @@ func (e *xaiEnv) snapshot(baseURL, upstreamModel string, caps modelcfg.Capabilit
 
 // xaiCaps 开放全部媒体与 duration / resolution / aspect_ratio / generate_audio / video_action。
 func xaiCaps() modelcfg.Capabilities {
-	min1, max15 := 1, 15
+	var min1, max15 int64 = 1, 15
 	enum := func(label string, opts ...any) modelcfg.ParamField {
 		return modelcfg.ParamField{Type: modelcfg.ParamEnum, Label: label, Open: true, Options: opts, Default: opts[0]}
 	}

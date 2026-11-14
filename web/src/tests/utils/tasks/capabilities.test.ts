@@ -230,6 +230,31 @@ describe("buildTaskInput", () => {
       "整数",
     );
     expect(buildTaskInput(video(), { prompt: "x", duration: "8" }).input.duration).toBe(8);
+
+    const withSeed: ReturnType<typeof video> = {
+      ...video(),
+      params: {
+        ...video().params,
+        seed: {
+          type: "number",
+          label: "随机种子",
+          open: true,
+          min: -1,
+          max: 4_294_967_295,
+          step: 1,
+          default: 3_916_315_536,
+        },
+      },
+    };
+    expect(buildTaskInput(withSeed, { prompt: "x" }).input.seed).toBe(3_916_315_536);
+    expect(buildTaskInput(withSeed, { prompt: "x", seed: -1 }).input.seed).toBe(-1);
+    expect(buildTaskInput(withSeed, { prompt: "x", seed: "0" }).input.seed).toBe(0);
+    expect(buildTaskInput(withSeed, { prompt: "x", seed: "4294967295" }).input.seed).toBe(
+      4_294_967_295,
+    );
+    for (const invalid of [1.8, "1.8", "1e2", "9007199254740993", -2, 4_294_967_296]) {
+      expect(buildTaskInput(withSeed, { prompt: "x", seed: invalid }).errors.seed).toBeDefined();
+    }
   });
 
   test("图生：必须有图片；连线 + 手动添加合并去重，超上限报错", () => {

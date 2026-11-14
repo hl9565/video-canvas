@@ -6,15 +6,18 @@ import { OpTabs } from "@/components/canvas/op-tabs";
 import { VideoParamPanel } from "@/components/canvas/video-param-panel";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { TAP } from "@/lib/motion";
+import { cn } from "@/lib/utils";
 import type { ComposerRef } from "@/utils/conversation/submission";
 import {
   currentOp,
+  effectiveValue,
   emptyBindings,
   isAutoOp,
   OP_LABEL,
   openParams,
   opDisabledHint,
   paramSummary,
+  validateParamValue,
 } from "@/utils/tasks/capabilities";
 
 /** 参数面板用不到上游连线，素材口为空 */
@@ -59,13 +62,25 @@ export function ParamsPopover({
     refs.some((ref) => ref.kind === "image"),
   );
   const showOps = ops.length > 1 && !isAutoOp(caps);
-  if (openParams(caps).length === 0 && !showOps) return null;
+  const open = openParams(caps);
+  if (open.length === 0 && !showOps) return null;
+  const paramErrors: Record<string, string> = {};
+  for (const field of open) {
+    const value = effectiveValue(field, params, field.name);
+    if (value === undefined || value === null || value === "") continue;
+    const checked = validateParamValue(field, value);
+    if ("error" in checked) paramErrors[field.name] = checked.error;
+  }
+  const hasParamErrors = Object.keys(paramErrors).length > 0;
   return (
     <Popover>
       <PopoverTrigger
         render={<motion.button type="button" whileTap={TAP} />}
         aria-label="生成参数"
-        className="text-foreground hover:bg-muted focus-visible:ring-ring/50 inline-flex h-8 max-w-56 items-center gap-1.5 rounded-[10px] px-2.5 text-[13px] outline-none focus-visible:ring-3"
+        className={cn(
+          "hover:bg-muted focus-visible:ring-ring/50 inline-flex h-8 max-w-56 items-center gap-1.5 rounded-[10px] px-2.5 text-[13px] outline-none focus-visible:ring-3",
+          hasParamErrors ? "text-destructive" : "text-foreground",
+        )}
       >
         <SlidersHorizontal className="size-4 shrink-0" />
         <span className="truncate">
@@ -92,8 +107,8 @@ export function ParamsPopover({
           caps={caps}
           params={params}
           bindings={NO_BINDINGS}
-          errors={{}}
-          showErrors={false}
+          errors={paramErrors}
+          showErrors={hasParamErrors}
           onChange={onChange}
           onAddRef={NOOP}
           onRemoveRef={NOOP}

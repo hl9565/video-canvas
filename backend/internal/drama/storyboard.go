@@ -31,7 +31,7 @@ func (o StoryboardOutput) ValidateMaxSeconds(limit int) error {
 		if segment.Seconds < 1 || segment.Seconds > limit || !nonemptyText(segment.Prompt) {
 			return invalidOutput("片段须有提示词，时长须为正整数且不超过max_seconds")
 		}
-		if end, over := timelineOverrun(segment.Prompt, segment.Seconds); over {
+		if end, over := TimelineOverrun(segment.Prompt, segment.Seconds); over {
 			return invalidOutput("提示词时间轴写到" + strconv.FormatFloat(end, 'f', -1, 64) + "秒，超过该片段seconds，须改为不超过seconds或拆段")
 		}
 	}
@@ -61,9 +61,9 @@ var timelineRange = regexp.MustCompile(`(\d+(?:\.\d+)?)\s*[-~～–—至到]\s*
 // timelineCut 识别 H3 写法的切点：`At 00:03.500`。
 var timelineCut = regexp.MustCompile(`\bAt\s+(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?`)
 
-// timelineOverrun 判断提示词里写的时间轴是否超出片段时长，返回最大的越界时间点。
+// TimelineOverrun 判断提示词里写的时间轴是否超出片段时长，返回最大的越界时间点。
 // 宽松解析，只认明确的区间终点和切点；认不准的写法一律放过，不误杀。
-func timelineOverrun(prompt string, seconds int) (float64, bool) {
+func TimelineOverrun(prompt string, seconds int) (float64, bool) {
 	limit := float64(seconds) + 0.001
 	worst := 0.0
 	for _, loc := range timelineRange.FindAllStringSubmatchIndex(prompt, -1) {

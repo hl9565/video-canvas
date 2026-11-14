@@ -500,26 +500,50 @@ export type BuiltInput = {
   errors: Record<string, string>;
 };
 
+/** 严格整数解析：拒绝小数、科学计数法、非安全整数与多余字符，防止静默截断 */
+export function parseStrictInt(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^-?\d+$/.test(trimmed)) return null;
+  const n = Number(trimmed);
+  if (!Number.isSafeInteger(n)) return null;
+  return Object.is(n, -0) ? 0 : n;
+}
+
 /** 某个参数值在字段定义下是否成立；成立返回规范化后的值，否则返回错误文案 */
-function checkParam(field: ParamField, value: unknown): { value: unknown } | { error: string } {
+export function validateParamValue(
+  field: ParamField,
+  value: unknown,
+): { value: unknown } | { error: string } {
   switch (field.type) {
     case "enum": {
       const option = matchOption(field, value);
       return option === undefined ? { error: `请重新选择${field.label}` } : { value: option };
     }
     case "number": {
-      const n = typeof value === "number" ? value : Number(value);
-      if (!Number.isFinite(n) || !Number.isInteger(n)) return { error: `${field.label}需要是整数` };
+      let n: number;
+      if (typeof value === "number") {
+        n = value;
+      } else if (typeof value === "string") {
+        const parsed = parseStrictInt(value);
+        if (parsed === null) return { error: `${field.label}需要是整数` };
+        n = parsed;
+      } else {
+        return { error: `${field.label}需要是整数` };
+      }
+      if (!Number.isFinite(n) || !Number.isInteger(n) || !Number.isSafeInteger(n))
+        return { error: `${field.label}需要是整数` };
       if (field.min !== undefined && n < field.min)
         return { error: `${field.label}不能小于 ${field.min}` };
       if (field.max !== undefined && n > field.max)
         return { error: `${field.label}不能大于 ${field.max}` };
-      return { value: n };
+      return { value: Object.is(n, -0) ? 0 : n };
     }
     default:
       return { value: value === true || value === "true" };
   }
 }
+
+const checkParam = validateParamValue;
 
 /** 提交时素材引用写成「图片1」这种编号，序号按 input 里同类素材的顺序 */
 const REF_WORD: Record<RefKind, string> = { image: "图片", video: "视频", audio: "音频" };
@@ -812,13 +836,15 @@ export function switchModelParams(
   return { params: kept, droppedNames, droppedLabels };
 }
 
-/** 参数摘要，如「Auto · 720P · 5秒 · 声音开」：开放给用户的参数当前取值，按书写顺序 */
+/** 参数摘要，如「Auto · 720P · 5秒 · 声音开 · 随机种子」：开放给用户的参数当前取值，按书写顺序 */
 export function paramSummary(caps: Capabilities | undefined, params: Record<string, unknown>) {
   return openParams(caps)
     .map((field) => {
       const value = effectiveValue(field, params, field.name);
       if (field.type === "boolean") return `${field.label}${value === true ? "开" : "关"}`;
-      return value === undefined || value === null ? "" : `${value}${field.unit ?? ""}`;
+      if (value === undefined || value === null) return "";
+      if (field.name === "seed") return Number(value) === -1 ? "随机种子" : `种子 ${value}`;
+      return `${value}${field.unit ?? ""}`;
     })
     .filter(Boolean)
     .join(" · ");

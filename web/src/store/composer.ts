@@ -84,8 +84,15 @@ export const useComposerStore = create<ComposerState>((set) => ({
     }),
   setParam: (modelKey, name, value) =>
     set((state) => {
-      const { [modelKey]: old, ...rest } = state.paramsByModel;
-      return { paramsByModel: { ...rest, [modelKey]: { ...old, [name]: value } } };
+      const next = { ...state.paramsByModel[modelKey] };
+      if (value === undefined) delete next[name];
+      else next[name] = value;
+      if (Object.keys(next).length === 0) {
+        const rest = { ...state.paramsByModel };
+        delete rest[modelKey];
+        return { paramsByModel: rest };
+      }
+      return { paramsByModel: { ...state.paramsByModel, [modelKey]: next } };
     }),
   setText: (text) => set({ text }),
   fill: (text) => set((state) => ({ text, fillSeq: state.fillSeq + 1 })),

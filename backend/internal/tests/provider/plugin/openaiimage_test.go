@@ -68,7 +68,7 @@ func openaiimageCaps() modelcfg.Capabilities {
 	enum := func(opts ...any) modelcfg.ParamField {
 		return modelcfg.ParamField{Type: modelcfg.ParamEnum, Label: "x", Open: true, Options: opts}
 	}
-	lo, hi := 1, 10
+	var lo, hi int64 = 1, 10
 	caps := modelcfg.Capabilities{Prompt: modelcfg.PromptSpec{MaxLength: 10000}}
 	caps.Ops = []string{modelcfg.OpT2I, modelcfg.OpI2I}
 	caps.Refs = modelcfg.Refs{Image: modelcfg.RefSpec{On: true, Max: 9, MaxMB: 10}}
