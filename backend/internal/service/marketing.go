@@ -55,6 +55,8 @@ type MarketingRepo interface {
 	ProjectScriptIDs(ctx context.Context, userID, projectID uint64) ([]uint64, error)
 	CoverKeys(ctx context.Context, userID uint64, assetIDs []uint64) (map[uint64]string, error)
 	FailRate7d(ctx context.Context, stepKey string, since time.Time) (float64, error)
+	// ListUnsettledRuns 返回全部尚未终态的运行，供持锁恢复扫描使用。
+	ListUnsettledRuns(ctx context.Context, limit int) ([]model.MarketingStepRun, error)
 }
 
 // MarketingAssets 是营销服务读取素材的入口（素材服务实现）。
@@ -105,22 +107,23 @@ type MarketingDeps struct {
 
 // MarketingService 是营销工作室业务：项目与轮次、环节编排（River job）、拆解与脚本编辑、出片、发到画布。
 type MarketingService struct {
-	repo     MarketingRepo
-	steps    *stepkit.Registry
-	resolver *stepkit.Resolver
-	runner   *stepkit.Runner
-	models   provider.Registry
-	assets   MarketingAssets
-	tasks    MarketingTaskCreator
-	canvases MarketingCanvasCreator
-	frames   MarketingFrames
-	credits  StepCreditPolicy
-	bc       ws.Broadcaster
-	now      func() time.Time
+	repo                 MarketingRepo
+	steps                *stepkit.Registry
+	resolver             *stepkit.Resolver
+	runner               *stepkit.Runner
+	models               provider.Registry
+	assets               MarketingAssets
+	tasks                MarketingTaskCreator
+	canvases             MarketingCanvasCreator
+	frames               MarketingFrames
+	credits              StepCreditPolicy
+	bc                   ws.Broadcaster
+	now                  func() time.Time
+	legacyDrainCompleted bool
 }
 
 // NewMarketingService 创建营销服务；Broadcaster 为 nil 时换成空实现。
-func NewMarketingService(d MarketingDeps) *MarketingService {
+func NewMarketingService(d MarketingDeps, opts ...MarketingOption) *MarketingService {
 	s := &MarketingService{repo: d.Repo, steps: d.Steps, resolver: d.Resolver, runner: stepkit.NewRunner(d.Caller), models: d.Models,
 		assets: d.Assets, tasks: d.Tasks, canvases: d.Canvases, frames: d.Frames, credits: d.Credits, bc: d.Broadcaster, now: d.Now}
 	if s.bc == nil {
@@ -128,6 +131,9 @@ func NewMarketingService(d MarketingDeps) *MarketingService {
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	return s
 }

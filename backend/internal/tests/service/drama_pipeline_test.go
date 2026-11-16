@@ -13,6 +13,7 @@ import (
 	"video-canvas/internal/llmgateway"
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
+	"video-canvas/internal/pkg/idcodec"
 	"video-canvas/internal/provider"
 	"video-canvas/internal/provider/modelcfg"
 	"video-canvas/internal/repository"
@@ -118,6 +119,50 @@ func (r *dramaMemory) UpdateProject(_ context.Context, userID, id uint64, revisi
 	}
 	r.project.Revision++
 	return nil
+}
+func (r *dramaMemory) BumpProjectNewSchemaEpisodeVersions(_ context.Context, userID, dramaID uint64) error {
+	if userID != r.project.UserID || dramaID != r.project.ID {
+		return repository.ErrNotFound
+	}
+	for i := range r.episodes {
+		ep := &r.episodes[i]
+		if ep.UserID == userID && ep.DramaID == dramaID && !ep.DeletedAt.Valid && (ep.EditSchema == 1 || r.episodeHasFrozenManifestComposeJob(userID, dramaID, ep)) {
+			ep.SegmentVersion++
+		}
+	}
+	return nil
+}
+
+func (r *dramaMemory) episodeHasFrozenManifestComposeJob(userID, dramaID uint64, ep *model.DramaEpisode) bool {
+	for i := range r.jobs {
+		j := &r.jobs[i]
+		if j.UserID != userID || j.DramaID != dramaID || j.DeletedAt.Valid || j.Step != "compose" || len(j.InputJSON) == 0 {
+			continue
+		}
+		isPublished := ep.FinalComposeJobID != nil && j.ID == *ep.FinalComposeJobID
+		isActive := j.Status == "queued" || j.Status == "running" || j.Status == "paused"
+		if !isPublished && !isActive {
+			continue
+		}
+		var payload struct {
+			EpisodeID json.RawMessage `json:"episode_id"`
+			Manifest  map[string]any  `json:"manifest"`
+		}
+		if err := json.Unmarshal(j.InputJSON, &payload); err != nil || payload.Manifest == nil {
+			continue
+		}
+		var epID uint64
+		if err := json.Unmarshal(payload.EpisodeID, &epID); err == nil && epID == ep.ID {
+			return true
+		}
+		var epStr string
+		if err := json.Unmarshal(payload.EpisodeID, &epStr); err == nil {
+			if want, _ := json.Marshal(ep.ID); epStr == string(want) {
+				return true
+			}
+		}
+	}
+	return false
 }
 func (r *dramaMemory) DeleteProject(_ context.Context, _, _ uint64) error {
 	r.project.DeletedAt.Valid = true
@@ -465,11 +510,53 @@ func TestDramaEpisodeLockedAndRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Title != text || view.Revision != 2 || !view.Locked {
+	if view.ID != idcodec.ID(r.episodes[0].ID) || view.ID == 0 || view.Title != text || view.Revision != 2 || !view.Locked {
 		t.Fatalf("view=%+v", view)
+	}
+	rawNonZero, err := json.Marshal(view.DramaEpisodeSummary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decodedNonZero map[string]any
+	if err := json.Unmarshal(rawNonZero, &decodedNonZero); err != nil {
+		t.Fatal(err)
+	}
+	if decodedNonZero["id"] != idcodec.Encode(r.episodes[0].ID) {
+		t.Fatalf("DramaEpisodeSummary 应输出编码 id: %s", rawNonZero)
+	}
+	rawZero, err := json.Marshal(model.DramaEpisodeSummary{No: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(rawZero), `"id"`) {
+		t.Fatalf("零值 ID 应 omitempty 省略: %s", rawZero)
 	}
 	_, err = s.UpdateEpisode(context.Background(), 8, 1, 1, &model.UpdateDramaEpisodeReq{Revision: 2, Title: &text})
 	dramaCheckCode(t, err, 67001)
+	// 删集顶替场景：集1被删后原集2补位到no=1且巧合revision=2，携带旧id必须被409/30002拦截；正确id与空指针兼容放行。
+	wrongID := idcodec.ID(r.episodes[0].ID + 1)
+	zeroID := idcodec.ID(0)
+	for _, mismatch := range []*idcodec.ID{&wrongID, &zeroID} {
+		if _, err = s.UpdateEpisode(context.Background(), 7, 1, 1, &model.UpdateDramaEpisodeReq{
+			Revision:          2,
+			ExpectedEpisodeID: mismatch,
+			Title:             &text,
+		}); err == nil {
+			t.Fatalf("expected_episode_id=%v 不匹配应冲突", *mismatch)
+		} else {
+			dramaCheckCode(t, err, 30002)
+		}
+	}
+	rightID := idcodec.ID(r.episodes[0].ID)
+	nextTitle := "已核对实体"
+	view, err = s.UpdateEpisode(context.Background(), 7, 1, 1, &model.UpdateDramaEpisodeReq{
+		Revision:          2,
+		ExpectedEpisodeID: &rightID,
+		Title:             &nextTitle,
+	})
+	if err != nil || view.Title != nextTitle || view.Revision != 3 {
+		t.Fatalf("匹配 expected_episode_id 应成功更新: err=%v view=%+v", err, view)
+	}
 }
 func TestDramaScriptsSerialContinuationAndPartialSuccess(t *testing.T) {
 	r := newDramaMemory()

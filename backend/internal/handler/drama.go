@@ -176,3 +176,22 @@ func dramaEpisodePath(c *gin.Context) (uint64, int, bool) {
 	}
 	return id, req.No, true
 }
+
+// Manifest 返回仅当前用户可读的规范清单、内容指纹与片段版本；存在冷素材探针缺失时返回 202 并在后台预热。
+func (h *DramaHandler) Manifest(c *gin.Context) {
+	id, no, ok := dramaEpisodePath(c)
+	if !ok {
+		return
+	}
+	view, prep, err := h.svc.PrepareOrResolveEpisodeManifest(c.Request.Context(), currentUserID(c), id, no)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	if prep != nil {
+		c.Header("Cache-Control", "no-store")
+		response.Accepted(c, prep)
+		return
+	}
+	response.OK(c, view)
+}

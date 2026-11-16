@@ -173,6 +173,15 @@ func (f *fakeGenTaskRepo) InsertTask(ctx context.Context, t *model.GenerationTas
 	f.tasks[t.ID] = &cp
 	return true, nil
 }
+func (f *fakeGenTaskRepo) TxEnsureCredit(ctx context.Context, userID uint64, initial int) error {
+	return f.EnsureCredit(ctx, userID, initial)
+}
+func (f *fakeGenTaskRepo) TxInsertTask(ctx context.Context, t *model.GenerationTask) (bool, error) {
+	return f.InsertTask(ctx, t)
+}
+func (f *fakeGenTaskRepo) ExecSavepoint(context.Context, int) error     { return nil }
+func (f *fakeGenTaskRepo) RollbackSavepoint(context.Context, int) error { return nil }
+func (f *fakeGenTaskRepo) ReleaseSavepoint(context.Context, int) error  { return nil }
 func (f *fakeGenTaskRepo) UpdateIf(ctx context.Context, id uint64, from []string, fields map[string]any, bump bool) (*model.GenerationTask, error) {
 	t, ok := f.tasks[id]
 	if !ok {

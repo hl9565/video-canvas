@@ -75,6 +75,7 @@ type MarketingRound struct {
 	ReverseOriginal datatypes.JSON `gorm:"type:jsonb"`
 	ReverseRevision int            `gorm:"not null;default:0"`
 	FollowBasis     datatypes.JSON `gorm:"type:jsonb"`
+	ExecutionGen    int64          `gorm:"not null;default:1"`
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
@@ -84,20 +85,24 @@ func (MarketingRound) TableName() string { return "marketing_rounds" }
 
 // MarketingStepRun 是一个环节的一次运行；重试新建一条，视图只取每个环节最新的一条。
 type MarketingStepRun struct {
-	ID          uint64         `gorm:"primaryKey"`
-	UserID      uint64         `gorm:"not null"`
-	RoundID     uint64         `gorm:"not null;index:idx_mkt_run_round_step,priority:1"`
-	StepKey     string         `gorm:"type:text;not null;index:idx_mkt_run_round_step,priority:2;index:idx_mkt_run_step_created,priority:1"` // 如 marketing.reverse
-	Method      datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`                                                                     // 方法快照 stepkit.MethodSnapshot
-	TextModelID string         `gorm:"type:text;not null;default:''"`                                                                        // 实际用的模型（含能力回退）
-	Status      string         `gorm:"size:16;not null;default:queued"`
-	Error       string         `gorm:"type:text;not null;default:''"`
-	Attempts    int            `gorm:"not null;default:0"`
-	Frozen      int            `gorm:"not null;default:0"`
-	Charged     int            `gorm:"not null;default:0"`
-	StartedAt   *time.Time
-	FinishedAt  *time.Time
-	CreatedAt   time.Time `gorm:"index:idx_mkt_run_round_step,priority:3;index:idx_mkt_run_step_created,priority:2"`
+	ID              uint64         `gorm:"primaryKey"`
+	UserID          uint64         `gorm:"not null"`
+	RoundID         uint64         `gorm:"not null;index:idx_mkt_run_round_step,priority:1"`
+	StepKey         string         `gorm:"type:text;not null;index:idx_mkt_run_round_step,priority:2;index:idx_mkt_run_step_created,priority:1"` // 如 marketing.reverse
+	Method          datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`                                                                     // 方法快照 stepkit.MethodSnapshot
+	TextModelID     string         `gorm:"type:text;not null;default:''"`                                                                        // 实际用的模型（含能力回退）
+	Status          string         `gorm:"size:16;not null;default:queued"`
+	Error           string         `gorm:"type:text;not null;default:''"`
+	Attempts        int            `gorm:"not null;default:0"`
+	Frozen          int            `gorm:"not null;default:0"`
+	Charged         int            `gorm:"not null;default:0"`
+	RoundGen        int64          `gorm:"not null;default:1"`
+	CancelRequested bool           `gorm:"not null;default:false"`
+	ExecToken       string         `gorm:"size:64;not null;default:''"`
+	LeaseUntil      *time.Time     `gorm:"column:lease_until"`
+	StartedAt       *time.Time
+	FinishedAt      *time.Time
+	CreatedAt       time.Time `gorm:"index:idx_mkt_run_round_step,priority:3;index:idx_mkt_run_step_created,priority:2"`
 }
 
 // TableName 返回表名。

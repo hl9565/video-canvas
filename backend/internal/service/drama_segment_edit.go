@@ -36,42 +36,48 @@ func (s *DramaSegmentService) Create(ctx context.Context, userID, dramaID uint64
 	return s.changedView(ctx, userID, row.ID)
 }
 
-// Update 按revision更新片段，只允许采用同画布本片段已成功的视频任务。
+// Update 按版本更新片段，事务外探测源帧数，锁内校验采用与编辑并单次递增集版本。
 func (s *DramaSegmentService) Update(ctx context.Context, userID, sid uint64, req *model.UpdateDramaSegmentReq) (*model.DramaSegmentView, error) {
-	// 1. service也校验核心约束，非HTTP调用不能绕过revision和时长要求。
-	if req.Revision < 1 || (req.Seconds != nil && *req.Seconds < 1) {
+	// 1. 先解析媒体缓存；探测不得占用项目、集或片段的数据库锁。
+	if req == nil || req.Revision < 1 || (req.Seconds != nil && *req.Seconds < 1) {
 		return nil, errcode.ErrInvalidParams
 	}
-	// 2. 按项目→片段加锁；先比较版本，防止旧请求覆盖自动采用。
-	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
-		p, _, row, err := lockSegment(ctx, tx, userID, sid)
+	frames, err := s.resolveUpdateFrames(ctx, userID, sid, req)
+	if err != nil {
+		return nil, err
+	}
+	// 2. 按项目→集→段加锁，CAS 后应用采用与编辑，版本由 SaveSegment 统一递增。
+	err = s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
+		p, ep, row, err := lockSegment(ctx, tx, userID, sid)
 		if err != nil {
 			return err
 		}
-		if row.Revision != req.Revision {
+		if row.Revision != req.Revision || !matchesExpectedTask(row, req) {
 			return errcode.ErrCanvasConflict
 		}
-		if req.ChosenTaskID != nil {
-			tasks, err := tx.SegmentTasks(ctx, userID, p.CanvasID, segmentNode(sid))
+		if err := updateSegmentTake(ctx, tx, p, row, req); err != nil {
+			return err
+		}
+		if err := applySegmentUpdate(row, req, frames); err != nil {
+			return err
+		}
+		flippedSchema := req.Edit != nil && ep.EditSchema == 0
+		if flippedSchema {
+			rev := ep.Revision
+			ep.EditSchema = 1
+			if err := tx.SaveEpisode(ctx, ep, rev); err != nil {
+				return err
+			}
+		}
+		if bt, ok := tx.(segmentBatchVersionTx); ok {
+			changed, err := bt.SaveSegmentNoBump(ctx, row, req.Revision)
 			if err != nil {
 				return err
 			}
-			if !validSegmentTake(tasks, uint64(*req.ChosenTaskID)) {
-				return errcode.ErrDramaTakeInvalid
+			if changed || flippedSchema {
+				return bt.BumpSegmentVersion(ctx, row.UserID, row.EpisodeID)
 			}
-			id := uint64(*req.ChosenTaskID)
-			row.ChosenTaskID = &id
-		}
-		if req.Prompt != nil {
-			row.Prompt = *req.Prompt
-		}
-		if req.Adaptation != nil {
-			if err := editAdaptation(row, req.Adaptation); err != nil {
-				return err
-			}
-		}
-		if req.Seconds != nil {
-			row.Seconds = *req.Seconds
+			return nil
 		}
 		return tx.SaveSegment(ctx, row, req.Revision)
 	})
@@ -92,7 +98,12 @@ func (s *DramaSegmentService) Delete(ctx context.Context, userID, sid uint64) er
 			return err
 		}
 		project, episode = p, ep
-		if err := tx.DeleteSegment(ctx, userID, sid); err != nil {
+		bt, hasBatch := tx.(segmentBatchVersionTx)
+		if hasBatch {
+			if _, err := bt.DeleteSegmentNoBump(ctx, userID, sid); err != nil {
+				return err
+			}
+		} else if err := tx.DeleteSegment(ctx, userID, sid); err != nil {
 			return err
 		}
 		rows, err := tx.Segments(ctx, userID, row.EpisodeID)
@@ -100,12 +111,16 @@ func (s *DramaSegmentService) Delete(ctx context.Context, userID, sid uint64) er
 			return err
 		}
 		for i := range rows {
-			if rows[i].Seq != i {
-				rows[i].Seq = i
-				if err := tx.SaveSegment(ctx, &rows[i], rows[i].Revision); err != nil {
-					return err
-				}
+			if rows[i].Seq == i {
+				continue
 			}
+			rows[i].Seq = i
+			if err := saveBatchSegment(ctx, tx, bt, hasBatch, &rows[i], rows[i].Revision); err != nil {
+				return err
+			}
+		}
+		if hasBatch {
+			return bt.BumpSegmentVersion(ctx, userID, row.EpisodeID)
 		}
 		return nil
 	})
@@ -168,6 +183,22 @@ func validSegmentTake(tasks []model.GenerationTask, id uint64) bool {
 	return false
 }
 
+// segmentBatchVersionTx 允许事务内多片段操作只在提交前递增一次 episode.segment_version。
+type segmentBatchVersionTx interface {
+	SaveSegmentNoBump(context.Context, *model.DramaSegment, int64) (bool, error)
+	DeleteSegmentNoBump(context.Context, uint64, uint64) (uint64, error)
+	BumpSegmentVersion(context.Context, uint64, uint64) error
+}
+
+// saveBatchSegment 在支持批处理版本号的事务中跳过逐行递增，否则退回标准 SaveSegment。
+func saveBatchSegment(ctx context.Context, tx repository.DramaTx, bt segmentBatchVersionTx, hasBatch bool, row *model.DramaSegment, revision int64) error {
+	if hasBatch {
+		_, err := bt.SaveSegmentNoBump(ctx, row, revision)
+		return err
+	}
+	return tx.SaveSegment(ctx, row, revision)
+}
+
 // insertDramaSegment 在已持有项目锁的事务中校验插入位置并顺移后续片段。
 func insertDramaSegment(ctx context.Context, tx repository.DramaTx, row *model.DramaSegment, afterSeq *int) error {
 	rows, err := tx.Segments(ctx, row.UserID, row.EpisodeID)
@@ -181,19 +212,26 @@ func insertDramaSegment(ctx context.Context, tx repository.DramaTx, row *model.D
 		}
 		row.Seq = *afterSeq + 1
 	}
+	bt, hasBatch := tx.(segmentBatchVersionTx)
 	for i := range rows {
 		if rows[i].Seq < row.Seq {
 			continue
 		}
 		rows[i].Seq++
-		if err := tx.SaveSegment(ctx, &rows[i], rows[i].Revision); err != nil {
+		if err := saveBatchSegment(ctx, tx, bt, hasBatch, &rows[i], rows[i].Revision); err != nil {
 			return err
 		}
 	}
-	return tx.SaveSegment(ctx, row, 0)
+	if err := saveBatchSegment(ctx, tx, bt, hasBatch, row, 0); err != nil {
+		return err
+	}
+	if hasBatch {
+		return bt.BumpSegmentVersion(ctx, row.UserID, row.EpisodeID)
+	}
+	return nil
 }
 
-// saveDramaSegmentOrder 拒绝缺失、重复和跨集ID，只更新序号实际变化的片段。
+// saveDramaSegmentOrder 拒绝缺失、重复和跨集ID，只更新序号实际变化的片段并单次递增集版本。
 func saveDramaSegmentOrder(ctx context.Context, tx repository.DramaTx, rows []model.DramaSegment, req *model.OrderDramaSegmentsReq) error {
 	if len(rows) != len(req.IDs) {
 		return errcode.ErrDramaSegmentOrderInvalid
@@ -202,6 +240,8 @@ func saveDramaSegmentOrder(ctx context.Context, tx repository.DramaTx, rows []mo
 	for i := range rows {
 		byID[rows[i].ID] = &rows[i]
 	}
+	bt, hasBatch := tx.(segmentBatchVersionTx)
+	var reordered bool
 	for i, id := range req.IDs {
 		row, ok := byID[uint64(id)]
 		if !ok {
@@ -211,10 +251,14 @@ func saveDramaSegmentOrder(ctx context.Context, tx repository.DramaTx, rows []mo
 		if row.Seq == i {
 			continue
 		}
+		reordered = true
 		row.Seq = i
-		if err := tx.SaveSegment(ctx, row, row.Revision); err != nil {
+		if err := saveBatchSegment(ctx, tx, bt, hasBatch, row, row.Revision); err != nil {
 			return err
 		}
+	}
+	if hasBatch && reordered && len(rows) > 0 {
+		return bt.BumpSegmentVersion(ctx, rows[0].UserID, rows[0].EpisodeID)
 	}
 	return nil
 }

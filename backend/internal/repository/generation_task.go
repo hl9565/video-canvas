@@ -30,6 +30,8 @@ type GenerationTaskTx interface {
 	CountActive(ctx context.Context, userID uint64) (int64, error)
 	// EnsureCredit 账户不存在时以 initial 惰性创建（INSERT … ON CONFLICT DO NOTHING）并在同一事务写一条 initial 流水，已存在则什么都不做。
 	EnsureCredit(ctx context.Context, userID uint64, initial int) error
+	// TxEnsureCredit 在已打开的事务上扁平开户并写 initial 流水，不触发 GORM 嵌套 SAVEPOINT。
+	TxEnsureCredit(ctx context.Context, userID uint64, initial int) error
 	// LockCredit 读取积分账户并加行锁（SELECT … FOR UPDATE），账户不存在返回 ErrNotFound。
 	LockCredit(ctx context.Context, userID uint64) (*model.UserCredit, error)
 	// AddCredit 对账户做增量更新：balance += dBalance，frozen += dFrozen。账户不存在返回 ErrNotFound。
@@ -38,6 +40,14 @@ type GenerationTaskTx interface {
 	InsertLedger(ctx context.Context, entry *model.CreditLedger) (inserted bool, err error)
 	// InsertTask 插入任务（ON CONFLICT DO NOTHING）。inserted=false 表示命中了幂等唯一索引，任务没有被写入。
 	InsertTask(ctx context.Context, t *model.GenerationTask) (inserted bool, err error)
+	// TxInsertTask 在已打开的事务上扁平写入任务及 created 事件，不触发 GORM 嵌套 SAVEPOINT。
+	TxInsertTask(ctx context.Context, t *model.GenerationTask) (inserted bool, err error)
+	// ExecSavepoint 在当前事务建立可控原生保存点 sp_batch_<idx>，并原样透传数据库错误。
+	ExecSavepoint(ctx context.Context, idx int) error
+	// RollbackSavepoint 回滚当前事务到原生保存点 sp_batch_<idx>，并原样透传数据库错误。
+	RollbackSavepoint(ctx context.Context, idx int) error
+	// ReleaseSavepoint 释放当前事务的原生保存点 sp_batch_<idx>，并原样透传数据库错误。
+	ReleaseSavepoint(ctx context.Context, idx int) error
 	// EnqueueTask 在当前事务里把任务放进调度队列，必须在 WithTx 的回调里调用；没有配置队列（单元测试）时什么都不做。
 	// 任务行、积分冻结和队列里的 job 因此在同一个事务里提交或回滚。
 	EnqueueTask(ctx context.Context, t *model.GenerationTask) error
@@ -71,6 +81,31 @@ func NewGenerationTaskRepository(db *gorm.DB) *GenerationTaskRepository {
 
 // DramaTx 将当前生成事务适配到短剧原语，共享项目锁，避免片段并发检查与任务插入分离。
 func (r *GenerationTaskRepository) DramaTx() DramaTx { return &DramaRepository{db: r.db} }
+
+// TxAsset 在当前生成事务连接上按用户读取素材元数据，避免持有信用锁时另取连接。
+func (r *GenerationTaskRepository) TxAsset(ctx context.Context, userID, assetID uint64) (*model.Asset, error) {
+	return (&AssetRepository{db: r.db}).GetByID(ctx, userID, assetID)
+}
+
+// TxPublishedModel 在当前生成事务连接上按 key 读取已发布模型及指针行，避免持锁重载连接池死锁。
+func (r *GenerationTaskRepository) TxPublishedModel(ctx context.Context, key string) (*PublishedModel, error) {
+	return (&AIConfigRepository{db: r.db}).LoadModel(ctx, key)
+}
+
+// TxAIChannel 在当前生成事务连接上按 key 读取渠道配置。
+func (r *GenerationTaskRepository) TxAIChannel(ctx context.Context, key string) (*model.AIChannel, error) {
+	return (&AIChannelRepository{db: r.db}).GetChannel(ctx, key)
+}
+
+// TxAIPlugin 在当前生成事务连接上按 key 读取插件开关。
+func (r *GenerationTaskRepository) TxAIPlugin(ctx context.Context, key string) (*model.AIPlugin, error) {
+	return (&AIPluginRepository{db: r.db}).GetPlugin(ctx, key)
+}
+
+// TxAIPluginVersions 在当前生成事务连接上读取插件版本头列表。
+func (r *GenerationTaskRepository) TxAIPluginVersions(ctx context.Context, pluginKey string) ([]model.AIPluginVersion, error) {
+	return (&AIPluginRepository{db: r.db}).ListVersions(ctx, pluginKey)
+}
 
 // SetEnqueuer 设置事务内入队的实现。在组装依赖时调用一次，之后只读。
 func (r *GenerationTaskRepository) SetEnqueuer(e TaskEnqueuer) { r.enq = e }
@@ -206,6 +241,11 @@ func (r *GenerationTaskRepository) EnsureCredit(ctx context.Context, userID uint
 	return insertInitialCredit(ctx, r.db, userID, initial)
 }
 
+// TxEnsureCredit 在已打开的外部事务上扁平创建账户与 initial 流水，禁止触发 GORM 嵌套 SAVEPOINT。
+func (r *GenerationTaskRepository) TxEnsureCredit(ctx context.Context, userID uint64, initial int) error {
+	return ensureInitialCredit(ctx, r.db, userID, initial)
+}
+
 // GetCredit 读取积分账户（不加锁），不存在返回 ErrNotFound。
 func (r *GenerationTaskRepository) GetCredit(ctx context.Context, userID uint64) (*model.UserCredit, error) {
 	var c model.UserCredit
@@ -253,37 +293,84 @@ func (r *GenerationTaskRepository) InsertLedger(ctx context.Context, entry *mode
 	return res.RowsAffected > 0, nil
 }
 
-// InsertTask 插入任务。命中 (user_id, idempotency_key) 唯一索引时 DO NOTHING，inserted=false，事务不会被污染。
-// 任务编号 task_ref 由主键编码得到，所以先从序列取号定下主键，再和任务一起写入（调用方已指定 id 时沿用）。
-func (r *GenerationTaskRepository) InsertTask(ctx context.Context, t *model.GenerationTask) (bool, error) {
+// insertTaskFlat 在指定 db/tx 上分配序列主键、写入 generation_tasks（ON CONFLICT DO NOTHING）与 created 事件，不开任何子事务。
+func insertTaskFlat(ctx context.Context, db *gorm.DB, t *model.GenerationTask) (bool, error) {
 	if t.ID == 0 {
 		var id uint64
-		if err := r.db.WithContext(ctx).
+		if err := db.WithContext(ctx).
 			Raw("SELECT nextval(pg_get_serial_sequence(?, 'id'))", t.TableName()).Scan(&id).Error; err != nil {
 			return false, err
 		}
 		t.ID = id
 	}
 	t.TaskRef = idcodec.Encode(t.ID)
-	// 任务与 created 事件同事务写入：命中幂等唯一索引（没写入任务）时不产生事件
+	res := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(t)
+	if res.Error != nil || res.RowsAffected == 0 {
+		return false, res.Error
+	}
+	if err := insertTaskEvent(db.WithContext(ctx), &model.GenerationTaskEvent{
+		TaskID: t.ID, Event: model.TaskEventCreated, ToStatus: t.Status,
+	}); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// InsertTask 插入任务。命中 (user_id, idempotency_key) 唯一索引时 DO NOTHING，inserted=false，事务不会被污染。
+// 任务编号 task_ref 由主键编码得到，所以先从序列取号定下主键，再和任务一起写入（调用方已指定 id 时沿用）。
+func (r *GenerationTaskRepository) InsertTask(ctx context.Context, t *model.GenerationTask) (bool, error) {
 	var inserted bool
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(t)
-		if res.Error != nil {
-			return res.Error
+		ok, err := insertTaskFlat(ctx, tx, t)
+		if err != nil {
+			return err
 		}
-		inserted = res.RowsAffected > 0
-		if !inserted {
-			return nil
-		}
-		return insertTaskEvent(tx, &model.GenerationTaskEvent{
-			TaskID: t.ID, Event: model.TaskEventCreated, ToStatus: t.Status,
-		})
+		inserted = ok
+		return nil
 	})
 	if err != nil {
 		return false, err
 	}
 	return inserted, nil
+}
+
+// TxInsertTask 在已打开的外部事务/保存点内扁平插入任务和 created 事件，禁止 GORM 嵌套 SAVEPOINT。
+func (r *GenerationTaskRepository) TxInsertTask(ctx context.Context, t *model.GenerationTask) (bool, error) {
+	return insertTaskFlat(ctx, r.db, t)
+}
+
+func savepointName(idx int) (string, error) {
+	if idx < 0 {
+		return "", fmt.Errorf("无效保存点下标：%d", idx)
+	}
+	return fmt.Sprintf("sp_batch_%d", idx), nil
+}
+
+// ExecSavepoint 在当前事务上执行原生 SAVEPOINT sp_batch_<idx>，不调用会吞错的 Dialector.SavePoint。
+func (r *GenerationTaskRepository) ExecSavepoint(ctx context.Context, idx int) error {
+	name, err := savepointName(idx)
+	if err != nil {
+		return err
+	}
+	return r.db.WithContext(ctx).Exec("SAVEPOINT " + name).Error
+}
+
+// RollbackSavepoint 将当前事务回滚至原生保存点 sp_batch_<idx>，并直接向上返回数据库错误。
+func (r *GenerationTaskRepository) RollbackSavepoint(ctx context.Context, idx int) error {
+	name, err := savepointName(idx)
+	if err != nil {
+		return err
+	}
+	return r.db.WithContext(ctx).Exec("ROLLBACK TO SAVEPOINT " + name).Error
+}
+
+// ReleaseSavepoint 释放当前事务的原生保存点 sp_batch_<idx>，并直接向上返回数据库错误。
+func (r *GenerationTaskRepository) ReleaseSavepoint(ctx context.Context, idx int) error {
+	name, err := savepointName(idx)
+	if err != nil {
+		return err
+	}
+	return r.db.WithContext(ctx).Exec("RELEASE SAVEPOINT " + name).Error
 }
 
 // EventDetailKey 是 UpdateIf 的 fields 里的保留键：值是 map[string]any，会被取出来写进本次状态迁移产生的事件的 detail_json，

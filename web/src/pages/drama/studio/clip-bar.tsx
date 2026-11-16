@@ -1,11 +1,20 @@
 import { useState } from "react";
 import { Reorder } from "motion/react";
-import { CircleX, Film, Layers, Loader2, Pause, Play, Plus } from "lucide-react";
+import { CircleX, Film, Layers, Loader2, Pause, Play, Plus, Scissors } from "lucide-react";
 
+import {
+  DRAMA_ERR,
+  dramaErrorMessage,
+  isDramaError,
+  isEditInvalidError,
+  isRevisionConflict,
+} from "@/api/drama/errors";
+import type { Segment, UpdateSegmentInput } from "@/api/drama/type";
 import { VideoPoster } from "@/components/canvas/media-preview";
+import { SegmentTrimDrawer } from "@/components/drama/segment-trim-drawer";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { Segment } from "@/api/drama/type";
+import { hasNonDefaultSegmentEdit, segmentEditOf } from "@/utils/drama/segment-trim";
 import { applyOrder, clipWidth, orderIds, playableTake, sameOrder } from "@/utils/drama/segments";
 
 import { usePlaybackContext } from "./use-playback";
@@ -27,6 +36,7 @@ function Clip({
   const { submitting } = useStudio();
   const take = playableTake(segment);
   const running = segment.status === "running" || submitting.has(segment.id);
+  const trimmed = hasNonDefaultSegmentEdit(segmentEditOf(segment));
   return (
     <Reorder.Item
       value={segment}
@@ -66,6 +76,14 @@ function Clip({
           )}
         </div>
       )}
+      {trimmed && (
+        <span
+          title="该片段已有精裁或原声调整"
+          className="bg-primary/90 text-primary-foreground pointer-events-none absolute top-1 right-1 inline-flex items-center rounded px-1 py-0.5 text-[10px]"
+        >
+          <Scissors className="size-2.5" />
+        </span>
+      )}
       <div
         className={cn(
           "absolute inset-x-0 bottom-0 flex justify-between px-1.5 py-0.5 text-[11px] tabular-nums",
@@ -85,12 +103,46 @@ function Clip({
  * 连播：按 seq 依次播采用的视频，播放头随时间移动，点片段跳到该段开头。
  */
 export function ClipBar() {
-  const { segments, selected, select, actions } = useStudio();
+  const { segments, selected, select, actions, trimDrawer } = useStudio();
   const playback = usePlaybackContext();
   const { bindPlayhead } = playback;
   // 拖动过程中只改本地顺序，松手再提交；store 里的片段一变（推送、服务端确认）就回到 store 的版本
   const [local, setLocal] = useState<{ base: Segment[]; list: Segment[] } | null>(null);
+  const [localTrimId, setLocalTrimId] = useState<string | null>(null);
+  const [localTrimConflict, setLocalTrimConflict] = useState<string | null>(null);
   const shown = local && local.base === segments ? local.list : segments;
+  const canTrim = !!selected && !!playableTake(selected);
+
+  const openSelectedTrim = () => {
+    if (!selected || !playableTake(selected)) return;
+    if (trimDrawer) {
+      trimDrawer.open(selected.id);
+    } else {
+      setLocalTrimConflict(null);
+      setLocalTrimId(selected.id);
+    }
+  };
+
+  const localTrimSegment =
+    !trimDrawer && localTrimId ? (segments.find((item) => item.id === localTrimId) ?? null) : null;
+
+  const handleLocalSave = async (input: Omit<UpdateSegmentInput, "revision">) => {
+    if (!localTrimSegment) return;
+    setLocalTrimConflict(null);
+    try {
+      await actions.patch(localTrimSegment.id, input);
+    } catch (err) {
+      if (isRevisionConflict(err) || isDramaError(err, DRAMA_ERR.jobBusy)) {
+        const msg = dramaErrorMessage(err, "片段状态已在别处变更，请确认后重试");
+        setLocalTrimConflict(msg);
+        throw new Error(msg);
+      }
+      if (isEditInvalidError(err)) {
+        throw new Error(dramaErrorMessage(err, "分镜剪辑参数不合法"));
+      }
+      throw err;
+    }
+  };
 
   const commit = () => {
     if (!local || local.base !== segments) return;
@@ -135,6 +187,16 @@ export function ClipBar() {
           </span>
         )}
         <span className="flex-1" />
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={!canTrim}
+          title={canTrim ? "精裁当前选中片段与原声" : "先生成或采用视频后才能修剪"}
+          onClick={openSelectedTrim}
+        >
+          <Scissors />
+          修剪
+        </Button>
         <Button variant="ghost" size="sm" onClick={() => void actions.batch()}>
           <Layers />
           批量生成
@@ -182,6 +244,20 @@ export function ClipBar() {
           <Plus />
         </Button>
       </div>
+      {!trimDrawer && (
+        <SegmentTrimDrawer
+          open={!!localTrimSegment}
+          onOpenChange={(open) => {
+            if (!open) {
+              setLocalTrimId(null);
+              setLocalTrimConflict(null);
+            }
+          }}
+          segment={localTrimSegment}
+          conflictMessage={localTrimConflict}
+          onSave={handleLocalSave}
+        />
+      )}
     </div>
   );
 }

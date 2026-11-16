@@ -1,10 +1,12 @@
 import { useState } from "react";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
+import type { Segment } from "@/api/drama/type";
 import type { ModelInfo } from "@/api/model/type";
 import { StudioBar } from "@/pages/drama/studio/studio-bar";
 import { StudioContext, type Studio } from "@/pages/drama/studio/use-studio";
 import { DramaWorkspaceContext, type DramaWorkspace } from "@/pages/drama/workspace/context";
+import { overridesForModel, useStudioPrefs, useStudioPrefsStore } from "@/store/drama-studio";
 
 import { installDom, type DomEnv } from "../../helpers/dom";
 
@@ -190,6 +192,197 @@ describe("StudioBar：seed 胶囊、不合档位警示与窄屏收纳", () => {
       expect(withRandomSeed.container.textContent).toContain("种子 随机");
     } finally {
       await withRandomSeed.unmount();
+    }
+  });
+});
+
+const modelWithAudioAndCount: ModelInfo = {
+  ...modelWithSeed,
+  key: "seedance-audio",
+  label: "Seedance Audio",
+  capabilities: {
+    ...modelWithSeed.capabilities,
+    params: {
+      ...modelWithSeed.capabilities.params,
+      generate_audio: {
+        type: "boolean",
+        label: "生成音频",
+        open: true,
+        default: false,
+      },
+      count: {
+        type: "enum",
+        label: "生成数量",
+        open: true,
+        options: [1, 2, 4],
+        default: 1,
+        fanout: true,
+      },
+    },
+  },
+};
+
+const makeSegment = (id: string, seq: number): Segment => ({
+  id,
+  episodeNo: 1,
+  seq,
+  seconds: 5,
+  prompt: `镜头 ${seq + 1}`,
+  takes: [],
+  chosenTaskId: "",
+  status: "idle",
+  revision: 1,
+  updatedAt: "",
+  adaptations: {},
+});
+
+function PerSegmentStudioBarHarness({ editSchema = 0 }: { editSchema?: number }) {
+  const seg1 = makeSegment("s1", 0);
+  const seg2 = makeSegment("s2", 1);
+  const segments = [seg1, seg2];
+  const [selectedId, setSelectedId] = useState("s1");
+  const selected = segments.find((item) => item.id === selectedId) ?? seg1;
+  const prefs = useStudioPrefs("d-audio");
+  const overrides = overridesForModel(prefs, modelWithAudioAndCount.key, selected.id);
+  const drama = {
+    id: "d-audio",
+    ratio: "9:16",
+    episodes: [{ no: 1, title: "第一集", editSchema }],
+  };
+  const value = studioValue({
+    drama: drama as unknown as Studio["drama"],
+    selected,
+    select: setSelectedId,
+    segments,
+    overrides,
+    setOverride: (name, next) =>
+      useStudioPrefsStore
+        .getState()
+        .setModelOverride(
+          "d-audio",
+          modelWithAudioAndCount.key,
+          name,
+          next,
+          undefined,
+          selected.id,
+        ),
+    video: {
+      models: [modelWithAudioAndCount],
+      status: "ready",
+      model: modelWithAudioAndCount,
+      setModel: () => {},
+    },
+  });
+  return (
+    <DramaWorkspaceContext.Provider
+      value={{ drama, refresh: async () => {} } as unknown as DramaWorkspace}
+    >
+      <StudioContext.Provider value={value}>
+        <button type="button" data-testid="switch-s1" onClick={() => setSelectedId("s1")}>
+          切到S1
+        </button>
+        <button type="button" data-testid="switch-s2" onClick={() => setSelectedId("s2")}>
+          切到S2
+        </button>
+        <StudioBar />
+      </StudioContext.Provider>
+    </DramaWorkspaceContext.Provider>
+  );
+}
+
+describe("StudioBar：generate_audio 开关、per-sid count 与单镜约束同步", () => {
+  test("桌面与移动端「规格与参数」同步 generate_audio 开关，且 resolution / count 仅按片段生效不跨段粘滞", async () => {
+    localStorage.clear();
+    useStudioPrefsStore.setState({ byDrama: {} });
+    const mounted = await dom.mount(<PerSegmentStudioBarHarness editSchema={0} />);
+
+    try {
+      // 1. 桌面切换 generate_audio -> 开，再打开窄屏浮层核对同步
+      const audioBtn = Array.from(mounted.container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("生成音频"),
+      );
+      expect(audioBtn).toBeDefined();
+      expect(audioBtn?.getAttribute("aria-pressed")).toBe("false");
+      await dom.click(audioBtn);
+      await dom.flush();
+      expect(audioBtn?.getAttribute("aria-pressed")).toBe("true");
+      expect(audioBtn?.textContent).toContain("开");
+
+      // 2. 桌面修改 s1 的 resolution=1080P 与 count=2
+      const resBtn = Array.from(mounted.container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("720P"),
+      );
+      await dom.click(resBtn);
+      await dom.flush();
+      const opt1080 = Array.from(dom.win.document.body.querySelectorAll("button")).find(
+        (b) => b.textContent?.trim() === "1080P",
+      );
+      await dom.click(opt1080);
+      await dom.flush();
+
+      const countBtn = Array.from(mounted.container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("1 条"),
+      );
+      await dom.click(countBtn);
+      await dom.flush();
+      const opt2 = Array.from(dom.win.document.body.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("2 条"),
+      );
+      await dom.click(opt2);
+      await dom.flush();
+      expect(mounted.container.textContent).toContain("1080P");
+      expect(mounted.container.textContent).toContain("2 条");
+
+      // 3. 切到 s2：s2 继承模型级 generate_audio=开，但绝不继承 s1 的 resolution=1080P 和 count=2
+      await dom.click(mounted.container.querySelector('[data-testid="switch-s2"]'));
+      await dom.flush();
+      expect(mounted.container.textContent).toContain("720P");
+      expect(mounted.container.textContent).toContain("1 条");
+      expect(mounted.container.textContent).not.toContain("1080P");
+      expect(mounted.container.textContent).not.toContain("2 条");
+      const s2AudioBtn = Array.from(mounted.container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("生成音频"),
+      );
+      expect(s2AudioBtn?.getAttribute("aria-pressed")).toBe("true");
+
+      // 4. 在 MobileSpecsChip 浮层里切回 generate_audio=关，桌面按钮应同步变为关
+      const mobileTrigger = Array.from(mounted.container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("规格与参数"),
+      );
+      await dom.click(mobileTrigger);
+      await dom.flush();
+      const mobileAudioRow = Array.from(dom.win.document.body.querySelectorAll("button")).find(
+        (b) => b.textContent?.includes("生成音频") && b !== s2AudioBtn,
+      );
+      expect(mobileAudioRow?.getAttribute("aria-pressed")).toBe("true");
+      await dom.click(mobileAudioRow);
+      await dom.flush();
+      expect(s2AudioBtn?.getAttribute("aria-pressed")).toBe("false");
+      expect(dom.win.document.body.textContent).toContain("生成数量（仅本片段）");
+    } finally {
+      await mounted.unmount();
+    }
+  });
+
+  test("editSchema=1（精裁模式）时桌面与移动端均锁定 count=1（禁用 2 条/4 条）", async () => {
+    localStorage.clear();
+    useStudioPrefsStore.setState({ byDrama: {} });
+    const mounted = await dom.mount(<PerSegmentStudioBarHarness editSchema={1} />);
+
+    try {
+      const countBtn = Array.from(mounted.container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("1 条"),
+      );
+      await dom.click(countBtn);
+      await dom.flush();
+      const opt2 = Array.from(dom.win.document.body.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("2 条"),
+      ) as HTMLButtonElement | undefined;
+      expect(opt2).toBeDefined();
+      expect(opt2?.disabled).toBe(true);
+      expect(dom.win.document.body.textContent).toContain("单镜模式锁定");
+    } finally {
+      await mounted.unmount();
     }
   });
 });

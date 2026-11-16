@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { Capabilities } from "@/api/model/type";
+import { overridesForModel, useStudioPrefsStore } from "@/store/drama-studio";
 import type { NodeCharacter } from "@/types";
 import type { RefAsset } from "@/utils/drama/segment-assets";
 import { planSegmentInput } from "@/utils/drama/segment-input";
@@ -267,5 +268,50 @@ describe("planSegmentInput：时长与校验", () => {
     expect(plan.errors.timeline).toContain("4s");
     expect(plan.errors.timeline).toContain("2s");
     expect(plan.notices.join("")).toContain("模型固定为 2s");
+  });
+
+  test("按 (segmentId, modelKey) 隔离 resolution / count，且保留共享 generate_audio 布尔能力参数", () => {
+    const caps = video();
+    caps.params = {
+      ...caps.params,
+      resolution: {
+        type: "enum",
+        label: "分辨率",
+        open: true,
+        options: ["720P", "1080P"],
+        default: "720P",
+      },
+      count: { type: "number", label: "数量", open: true, min: 1, max: 4, default: 1 },
+      generate_audio: { type: "boolean", label: "生成声音", open: true, default: false },
+    };
+    useStudioPrefsStore.setState({ byDrama: {} });
+    const store = useStudioPrefsStore.getState();
+    store.setModelOverride("d-seg", "kling", "generate_audio", true);
+    store.setModelOverride("d-seg", "kling", "resolution", "1080P", undefined, "s2");
+    store.setModelOverride("d-seg", "kling", "count", 2, undefined, "s2");
+
+    const prefs = useStudioPrefsStore.getState().get("d-seg");
+    const planS2 = planSegmentInput({
+      seconds: 6,
+      ratio: "9:16",
+      caps,
+      prompt: "特写",
+      assets: [],
+      overrides: overridesForModel(prefs, "kling", "s2"),
+    });
+    const planS7 = planSegmentInput({
+      seconds: 6,
+      ratio: "9:16",
+      caps,
+      prompt: "远景",
+      assets: [],
+      overrides: overridesForModel(prefs, "kling", "s7"),
+    });
+    expect(planS2.input.resolution).toBe("1080P");
+    expect(planS2.input.count).toBe(2);
+    expect(planS2.input.generate_audio).toBe(true);
+    expect(planS7.input.resolution).toBe("720P");
+    expect(planS7.input.count).toBe(1);
+    expect(planS7.input.generate_audio).toBe(true);
   });
 });

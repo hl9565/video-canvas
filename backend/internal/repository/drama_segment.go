@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"gorm.io/gorm"
@@ -42,54 +43,137 @@ func (r *DramaRepository) Segment(ctx context.Context, userID, id uint64, lock b
 	return &row, translate(err)
 }
 
+// ResetSegmentEdit 切换片段采用的视频结果时将 6 个剪辑与原声控制字段原子清零，并将 source_out_f 置空恢复到片尾 EOF。
+func ResetSegmentEdit(row *model.DramaSegment) {
+	if row == nil {
+		return
+	}
+	row.SourceInF = 0
+	row.SourceOutF = nil
+	row.MuteOriginal = false
+	row.AudioGainDB = 0
+	row.NativeIsDialogue = false
+	row.AvPtsOffsetMs = 0
+}
+
+func sameNullableInt32(a, b *int32) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func segmentMaterialChanged(prev, cur *model.DramaSegment) bool {
+	if prev.Seq != cur.Seq || !sameChosenTask(prev.ChosenTaskID, cur.ChosenTaskID) {
+		return true
+	}
+	return prev.SourceInF != cur.SourceInF ||
+		!sameNullableInt32(prev.SourceOutF, cur.SourceOutF) ||
+		prev.MuteOriginal != cur.MuteOriginal ||
+		math.Round(prev.AudioGainDB*100) != math.Round(cur.AudioGainDB*100) ||
+		prev.NativeIsDialogue != cur.NativeIsDialogue ||
+		prev.AvPtsOffsetMs != cur.AvPtsOffsetMs
+}
+
 // SaveSegment 按用户、集与revision更新；旧版本返回ErrStateConflict，父资源不存在返回ErrNotFound。
 func (r *DramaRepository) SaveSegment(ctx context.Context, row *model.DramaSegment, revision int64) error {
-	if _, err := r.SegmentEpisode(ctx, row.UserID, row.EpisodeID); err != nil {
+	changed, err := r.SaveSegmentNoBump(ctx, row, revision)
+	if err != nil || !changed {
 		return err
+	}
+	return r.BumpSegmentVersion(ctx, row.UserID, row.EpisodeID)
+}
+
+// SaveSegmentNoBump 保存片段但不递增 episode.segment_version，返回本次保存是否发生实质变更。
+func (r *DramaRepository) SaveSegmentNoBump(ctx context.Context, row *model.DramaSegment, revision int64) (bool, error) {
+	if _, err := r.SegmentEpisode(ctx, row.UserID, row.EpisodeID); err != nil {
+		return false, err
 	}
 	if row.ID == 0 {
 		if err := r.db.WithContext(ctx).Create(row).Error; err != nil {
-			return err
+			return false, err
 		}
-		return r.bumpSegmentVersion(ctx, row.UserID, row.EpisodeID)
+		return true, nil
 	}
 	previous, err := r.Segment(ctx, row.UserID, row.ID, false)
 	if err != nil {
-		return err
+		return false, err
 	}
 	now := time.Now()
+	var sourceOutF any
+	if row.SourceOutF != nil {
+		sourceOutF = *row.SourceOutF
+	}
 	res := r.db.WithContext(ctx).Model(&model.DramaSegment{}).Where("user_id = ? AND episode_id = ? AND id = ? AND revision = ?", row.UserID, row.EpisodeID, row.ID, revision).Updates(map[string]any{
 		"seq": row.Seq, "seconds": row.Seconds, "prompt": row.Prompt,
 		"chosen_task_id": row.ChosenTaskID, "adaptations": segmentAdaptations(row.Adaptations),
+		"source_in_f": row.SourceInF, "source_out_f": sourceOutF,
+		"mute_original": row.MuteOriginal, "audio_gain_db": row.AudioGainDB,
+		"native_is_dialogue": row.NativeIsDialogue, "av_pts_offset_ms": row.AvPtsOffsetMs,
 		"revision": gorm.Expr("revision + 1"), "updated_at": now,
 	})
 	if res.Error != nil {
-		return res.Error
+		return false, res.Error
 	}
 	if res.RowsAffected == 0 {
-		return ErrStateConflict
+		return false, ErrStateConflict
 	}
 	row.Revision, row.UpdatedAt = revision+1, now
-	if previous.Seq != row.Seq || !sameChosenTask(previous.ChosenTaskID, row.ChosenTaskID) {
-		return r.bumpSegmentVersion(ctx, row.UserID, row.EpisodeID)
-	}
-	return nil
+	return segmentMaterialChanged(previous, row), nil
 }
 
 // DeleteSegment 只软删当前用户存活项目下的片段，缺失返回ErrNotFound；任务和素材不受影响。
 func (r *DramaRepository) DeleteSegment(ctx context.Context, userID, id uint64) error {
-	row, err := r.Segment(ctx, userID, id, false)
+	episodeID, err := r.DeleteSegmentNoBump(ctx, userID, id)
 	if err != nil {
 		return err
 	}
+	return r.BumpSegmentVersion(ctx, userID, episodeID)
+}
+
+// DeleteSegmentNoBump 只软删当前用户存活项目下的片段，返回所属 episodeID 且不递增 segment_version。
+func (r *DramaRepository) DeleteSegmentNoBump(ctx context.Context, userID, id uint64) (uint64, error) {
+	row, err := r.Segment(ctx, userID, id, false)
+	if err != nil {
+		return 0, err
+	}
 	res := r.db.WithContext(ctx).Where("user_id = ? AND id = ? AND episode_id IN (?)", userID, id, r.liveSegmentEpisodes(ctx, userID)).Delete(&model.DramaSegment{})
 	if res.Error != nil {
-		return res.Error
+		return 0, res.Error
 	}
 	if res.RowsAffected == 0 {
-		return ErrNotFound
+		return 0, ErrNotFound
 	}
-	return r.bumpSegmentVersion(ctx, userID, row.EpisodeID)
+	return row.EpisodeID, nil
+}
+
+// BumpSegmentVersion 显式递增单集片段版本号（供多片段事务结束时统一递增一次）。
+func (r *DramaRepository) BumpSegmentVersion(ctx context.Context, userID, episodeID uint64) error {
+	return r.bumpSegmentVersion(ctx, userID, episodeID)
+}
+
+// BumpProjectNewSchemaEpisodeVersions 在项目锁保护的事务内递增受画幅影响的新版分集版本。
+// 覆盖 edit_schema = 1 的分集，以及虽为 edit_schema = 0 但存在在途冻结清单合成任务（queued/running/paused）
+// 或当前已定版任务（final_compose_job_id）本身为冻结清单（input_json.manifest 对象）的分集；
+// 历史失败、取消或已被旧整段覆盖淘汰的冻结任务及仅走旧整段路径的分集不受影响。
+func (r *DramaRepository) BumpProjectNewSchemaEpisodeVersions(ctx context.Context, userID, dramaID uint64) error {
+	return r.db.WithContext(ctx).Model(&model.DramaEpisode{}).
+		Where(
+			"user_id = ? AND drama_id = ? AND ("+
+				"edit_schema = 1 OR EXISTS ("+
+				"SELECT 1 FROM drama_jobs j "+
+				"WHERE j.user_id = drama_episodes.user_id "+
+				"AND j.drama_id = drama_episodes.drama_id "+
+				"AND j.deleted_at IS NULL "+
+				"AND j.step = 'compose' "+
+				"AND jsonb_typeof(j.input_json->'manifest') = 'object' "+
+				"AND (j.input_json->>'episode_id') = drama_episodes.id::text "+
+				"AND (j.id = drama_episodes.final_compose_job_id OR j.status IN ('queued', 'running', 'paused'))"+
+				")"+
+				")",
+			userID, dramaID,
+		).
+		Updates(map[string]any{"segment_version": gorm.Expr("segment_version + 1"), "updated_at": time.Now()}).Error
 }
 
 // ReplaceSegments 在调用方项目锁保护的事务内替换全集片段，不删除历史任务和素材。

@@ -17,6 +17,9 @@ import (
 
 // Estimate 使用现有模型定价及相同请求范围估价，不冻结积分。
 func (s *DramaService) Estimate(ctx context.Context, userID, id uint64, req *model.DramaJobReq) (int, error) {
+	if err := validateDramaJobRequest(req); err != nil {
+		return 0, err
+	}
 	if req.Step == "compose" {
 		return s.estimateCompose(ctx, userID, id, req)
 	}
@@ -63,18 +66,22 @@ func (s *DramaService) CreateJob(ctx context.Context, userID, id uint64, req *mo
 
 // createDramaJob 统一普通提交和审批提交，审批ID与任务在同一事务登记。
 func (s *DramaService) createDramaJob(ctx context.Context, userID, id uint64, approvalID *uint64, req *model.DramaJobReq) (*model.DramaJobView, error) {
+	intent, err := newDramaJobIntent(id, approvalID, req)
+	if err != nil {
+		return nil, err
+	}
 	if req.Step == "analyze" || req.Step == "outline" || req.Step == "plan" {
 		return nil, errcode.ErrInvalidParams.WithMsg("研读与规划由系统自动发起")
 	}
 	if err := checkStoryboardRequest(req); err != nil {
 		return nil, err
 	}
-	// 1. 审批重试先恢复原任务，即使模型配置后来失效也不能创建第二个任务。
-	if approvalID != nil {
-		previous, err := s.approvedDramaJob(ctx, userID, id, *approvalID)
-		if err != nil || previous != nil {
-			return previous, err
-		}
+	previous, err := s.approvedDramaJob(ctx, userID, id, intent)
+	if err != nil || previous != nil {
+		return previous, err
+	}
+	if req.Step == "compose" {
+		return s.createComposeJob(ctx, userID, id, intent)
 	}
 	p, err := s.repo.Project(ctx, userID, id, false)
 	if err != nil {
@@ -94,15 +101,21 @@ func (s *DramaService) createDramaJob(ctx context.Context, userID, id uint64, ap
 		return nil, err
 	}
 	var job *model.DramaJob
+	created := false
 	err = s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
 		var e error
-		job, e = s.insertDramaJob(ctx, tx, userID, id, approvalID, req, snap, initial)
+		job, created, e = s.insertDramaJob(ctx, tx, userID, id, approvalID, req, snap, initial, intent)
 		return e
 	})
 	if err != nil {
+		if errors.Is(err, repository.ErrDuplicate) {
+			return s.recoverDramaJob(ctx, userID, id, intent)
+		}
 		return nil, dramaError(err)
 	}
-	s.publish(ctx, job)
+	if created {
+		s.publish(ctx, job)
+	}
 	v := jobView(*job)
 	return &v, nil
 }
@@ -121,31 +134,24 @@ func (s *DramaService) jobFreeze(ctx context.Context, p *model.DramaProject, req
 }
 
 // insertDramaJob 在项目锁内恢复审批已建任务，否则校验并入队。
-func (s *DramaService) insertDramaJob(ctx context.Context, tx repository.DramaTx, userID, id uint64, approvalID *uint64, req *model.DramaJobReq, snap *provider.Snapshot, initial int) (*model.DramaJob, error) {
+func (s *DramaService) insertDramaJob(ctx context.Context, tx repository.DramaTx, userID, id uint64, approvalID *uint64, req *model.DramaJobReq, snap *provider.Snapshot, initial int, intent *dramaJobIntent) (*model.DramaJob, bool, error) {
 	current, err := tx.Project(ctx, userID, id, true)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	if approvalID != nil {
-		job, err := tx.JobByApproval(ctx, userID, *approvalID)
-		if err == nil {
-			if job.DramaID != id {
-				return nil, errcode.ErrDramaNotFound
-			}
-			return job, nil
-		}
-		if !errors.Is(err, repository.ErrNotFound) {
-			return nil, err
-		}
+	hit, err := resolveDramaJobIntent(ctx, tx, userID, id, intent)
+	if err != nil || hit != nil {
+		return hit, false, err
 	}
 	selected, err := s.prepareDramaJob(ctx, tx, current, req)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if req.Step == "compose" {
-		return enqueueCompose(ctx, tx, current, req, selected, approvalID)
+		return nil, false, errcode.ErrInvalidParams
 	}
-	return s.enqueue(ctx, tx, current, req, snap, selected, initial, approvalID)
+	job, err := s.enqueue(ctx, tx, current, req, snap, selected, initial, approvalID, intent.signature)
+	return job, err == nil, err
 }
 
 // prepareDramaJob 在项目锁内校验并发、前置条件与比例。
@@ -266,13 +272,22 @@ func (s *DramaService) resolveModel(ctx context.Context, key string) (*provider.
 }
 
 // enqueue 冻结费用并同事务创建业务任务与River job。
-func (s *DramaService) enqueue(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, req *model.DramaJobReq, snap *provider.Snapshot, eps []model.DramaEpisode, initial int, approvalID *uint64) (*model.DramaJob, error) {
+func (s *DramaService) enqueue(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, req *model.DramaJobReq, snap *provider.Snapshot, eps []model.DramaEpisode, initial int, approvalID *uint64, signatures ...string) (*model.DramaJob, error) {
 	scope := []int{}
 	for _, ep := range eps {
 		scope = append(scope, ep.No)
 	}
 	j := &model.DramaJob{UserID: p.UserID, DramaID: p.ID, Step: req.Step, Episodes: scope, Status: "queued", FrozenCredits: dramaQuote(p, req.Step, eps, snap), Lane: "user", InputJSON: []byte(`{}`), Output: []byte(`{}`), ModelID: snap.ModelRevisionID}
 	j.ApprovalID = approvalID
+	if len(signatures) > 0 {
+		j.RequestIntentSig = signatures[0]
+	} else {
+		intent, err := newDramaJobIntent(p.ID, approvalID, req)
+		if err != nil {
+			return nil, err
+		}
+		j.RequestIntentSig = intent.signature
+	}
 	if req.Step == "analyze" || req.Step == "plan" || req.Step == "outline" {
 		j.Lane = "pipeline"
 	}

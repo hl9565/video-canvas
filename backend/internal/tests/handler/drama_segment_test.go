@@ -28,6 +28,7 @@ func segmentHTTP() (*gin.Engine, *dramasegmentfake.Repo) {
 	r.PATCH("/drama-segments/:sid", h.Update)
 	r.DELETE("/drama-segments/:sid", h.Delete)
 	r.POST("/drama-segments/:sid/generate", h.Generate)
+	r.POST("/drama-segments/:sid/quote", h.Quote)
 	r.POST("/drama-segments/:sid/adapt", h.Adapt)
 	return r, repo
 }
@@ -120,5 +121,25 @@ func TestDramaSegmentHandler_Adapt(t *testing.T) {
 	h3, ok := responseData(t, body)["adaptations"].(map[string]any)["h3"].(map[string]any)
 	if !ok || h3["prompt"] != "再改" || h3["edited"] != true || h3["source_hash"] == "" {
 		t.Fatalf("转写稿视图：%+v", body)
+	}
+}
+
+func TestDramaSegmentHandler_Quote(t *testing.T) {
+	r, _ := segmentHTTP()
+	_, body := characterCall(t, r, "POST", "/dramas/"+idcodec.Encode(7)+"/episodes/1/segments", `{}`)
+	base := "/drama-segments/" + responseData(t, body)["id"].(string) + "/quote"
+	for _, tc := range []struct {
+		path, body   string
+		status, code int
+	}{
+		{base, `{"model_id":"video","input":{"prompt":"镜头"}}`, 200, 0},
+		{base, `{"input":{}}`, 400, 10001},
+		{"/drama-segments/invalid/quote", `{"model_id":"video","input":{}}`, 400, 10001},
+		{"/drama-segments/" + idcodec.Encode(255) + "/quote", `{"model_id":"video","input":{}}`, 404, 67009},
+	} {
+		status, got := characterCall(t, r, "POST", tc.path, tc.body)
+		if status != tc.status || responseCode(t, got) != tc.code {
+			t.Fatalf("status=%d body=%+v", status, got)
+		}
 	}
 }

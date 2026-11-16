@@ -69,6 +69,15 @@ func (s *uaCreditStore) CountActive(context.Context, uint64) (int64, error) { re
 func (s *uaCreditStore) InsertTask(context.Context, *model.GenerationTask) (bool, error) {
 	return true, nil
 }
+func (s *uaCreditStore) TxEnsureCredit(ctx context.Context, userID uint64, initial int) error {
+	return s.EnsureCredit(ctx, userID, initial)
+}
+func (s *uaCreditStore) TxInsertTask(ctx context.Context, t *model.GenerationTask) (bool, error) {
+	return s.InsertTask(ctx, t)
+}
+func (s *uaCreditStore) ExecSavepoint(context.Context, int) error     { return nil }
+func (s *uaCreditStore) RollbackSavepoint(context.Context, int) error { return nil }
+func (s *uaCreditStore) ReleaseSavepoint(context.Context, int) error  { return nil }
 
 func (s *uaCreditStore) UpdateIf(context.Context, uint64, []string, map[string]any, bool) (*model.GenerationTask, error) {
 	return nil, repository.ErrStateConflict

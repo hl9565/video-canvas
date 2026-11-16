@@ -1,8 +1,10 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import type { EpisodeSummary } from "@/api/drama/type";
+import type { DramaWorkspaceContext as DramaWorkspaceContextType } from "@/pages/drama/workspace/context";
 import type { StudioArea as StudioAreaType } from "@/pages/drama/workspace/studio-area";
 import type { DramaWorkspace } from "@/pages/drama/workspace/use-workspace";
+import { useModelsStore } from "@/store/models";
 import { installDom, type DomEnv } from "@/tests/helpers/dom";
 
 /**
@@ -10,26 +12,29 @@ import { installDom, type DomEnv } from "@/tests/helpers/dom";
  * 不是跳到剧本页；剧本还没写好时才去剧本页。
  */
 
-mock.module("@/hooks/use-drama-video-model", () => ({
-  useDramaVideoModel: () => ({
-    models: [],
-    status: "ready",
-    model: undefined,
-    setModel: () => {},
-    maxSeconds: 15,
-  }),
-}));
-
 let dom: DomEnv;
 let StudioArea: typeof StudioAreaType;
-let Context: typeof import("@/pages/drama/workspace/context").DramaWorkspaceContext;
+let Context: typeof DramaWorkspaceContextType;
+let prevByKind: ReturnType<typeof useModelsStore.getState>["byKind"] | undefined;
 beforeAll(async () => {
   dom = await installDom();
+  prevByKind = useModelsStore.getState().byKind;
+  useModelsStore.setState({
+    byKind: {
+      ...prevByKind,
+      video: { status: "ready", models: [], loadedAt: Date.now() },
+    },
+  });
   StudioArea = (await import("@/pages/drama/workspace/studio-area")).StudioArea;
   Context = (await import("@/pages/drama/workspace/context")).DramaWorkspaceContext;
   // 片场模块连带 Tiptap 编辑器等，首次导入较慢
 }, 60_000);
-afterAll(() => dom?.restore());
+afterAll(() => {
+  if (prevByKind) {
+    useModelsStore.setState({ byKind: prevByKind });
+  }
+  dom?.restore();
+});
 
 const episode = (patch: Partial<EpisodeSummary>) =>
   ({

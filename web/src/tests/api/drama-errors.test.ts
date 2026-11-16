@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import {
   DRAMA_ERR,
+  IDEMPOTENCY_CONFLICT_CODE,
+  REVISION_CONFLICT_CODE,
   dramaErrorMessage,
   jobFailureMessage,
   isDramaError,
@@ -44,11 +46,15 @@ describe("短剧错误码映射（契约 §8）", () => {
     expect(isDramaError(new Error("x"), DRAMA_ERR.notFound)).toBe(false);
   });
 
-  test("revision 冲突：409 但不是 67004 / 67005", () => {
-    expect(isRevisionConflict(err(40900, 409))).toBe(true);
+  test("revision 冲突：仅显式匹配 30002 + HTTP 409，排除 40015 与业务 409", () => {
+    expect(isRevisionConflict(err(REVISION_CONFLICT_CODE, 409))).toBe(true);
+    expect(isRevisionConflict(err(IDEMPOTENCY_CONFLICT_CODE, 409))).toBe(false);
     expect(isRevisionConflict(err(DRAMA_ERR.jobBusy, 409))).toBe(false);
     expect(isRevisionConflict(err(DRAMA_ERR.episodeLocked, 409))).toBe(false);
+    expect(isRevisionConflict(err(40900, 409))).toBe(false);
+    expect(isRevisionConflict(err(REVISION_CONFLICT_CODE, 400))).toBe(false);
     expect(isRevisionConflict(err(500, 500))).toBe(false);
+    expect(isRevisionConflict(new Error("network"))).toBe(false);
   });
 });
 
@@ -73,7 +79,14 @@ describe("二期错误码（契约 §12）", () => {
 
   test("67013 是业务 409，不当作 revision 冲突", () => {
     expect(isRevisionConflict(err(DRAMA_ERR.storyboardHasTakes, 409))).toBe(false);
-    expect(isRevisionConflict(err(40900, 409))).toBe(true);
+    expect(isRevisionConflict(err(REVISION_CONFLICT_CODE, 409))).toBe(true);
+    expect(isRevisionConflict(err(IDEMPOTENCY_CONFLICT_CODE, 409))).toBe(false);
+    expect(dramaErrorMessage(new ApiError("", REVISION_CONFLICT_CODE, 409), "fallback")).toBe(
+      "数据版本已变更，请刷新后重试",
+    );
+    expect(dramaErrorMessage(err(IDEMPOTENCY_CONFLICT_CODE, 409), "fallback")).toBe(
+      "幂等请求参数不一致，请刷新后重试",
+    );
   });
 });
 

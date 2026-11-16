@@ -3,11 +3,21 @@ import { describe, expect, test } from "bun:test";
 import type { DramaJob, EpisodeSummary, Segment } from "@/api/drama/type";
 import {
   activeComposeJob,
+  buildComposeJobInput,
+  canUseManifestCompose,
+  COMPOSE_ASPECT_BASE,
+  COMPOSE_SIZES,
+  COMPOSE_VARIANTS,
   composeCheck,
   composeCheckEpisode,
+  composeDimensions,
+  composeExportsOf,
   composeNotice,
+  createComposeRequestKey,
   finalState,
+  latestComposeExports,
   missingVideoSeqs,
+  normalizeComposeVariants,
   skippedText,
 } from "@/utils/drama/compose";
 import { jobTitle } from "@/utils/drama/jobs";
@@ -172,5 +182,167 @@ describe("合成任务", () => {
     expect(
       composeNotice(job({ step: "storyboard", status: "succeeded", result: null })),
     ).toBeNull();
+  });
+
+  test("PR1 导出档位、变体归一化、compose 请求构建与 exports 提取", () => {
+    expect(COMPOSE_SIZES).toEqual(["720p", "1080p"]);
+    expect(COMPOSE_VARIANTS).toEqual(["clean", "packaged"]);
+    expect(normalizeComposeVariants([])).toEqual(["clean"]);
+    expect(normalizeComposeVariants(["packaged", "clean", "packaged"])).toEqual([
+      "packaged",
+      "clean",
+    ]);
+
+    const key = createComposeRequestKey();
+    expect(key.startsWith("approval:")).toBe(false);
+    expect(key.length).toBeLessThanOrEqual(96);
+
+    const input = buildComposeJobInput({
+      episodeNo: 2,
+      manifest: { segmentVersion: 5, manifestHash: "e".repeat(64) },
+      size: "1080p",
+      variants: ["clean", "packaged"],
+      composeRequestKey: key,
+    });
+    expect(input).toEqual({
+      step: "compose",
+      episodes: [2],
+      compose: {
+        segmentVersion: 5,
+        manifestHash: "e".repeat(64),
+        size: "1080p",
+        variants: ["clean", "packaged"],
+      },
+      composeRequestKey: key,
+    });
+
+    const older = job({
+      id: "j-old",
+      episodes: [2],
+      status: "succeeded",
+      finishedAt: "2026-10-28T10:00:00Z",
+      result: {
+        asset: asset("old"),
+        skippedSeqs: [],
+        exports: [
+          {
+            sha256: "1".repeat(64),
+            variant: "clean",
+            size: "720p",
+            width: 1280,
+            height: 720,
+            manifestHash: "1".repeat(64),
+            asset: asset("old"),
+          },
+        ],
+      },
+    });
+    const newer = job({
+      id: "j-new",
+      episodes: [2],
+      status: "succeeded",
+      finishedAt: "2026-10-28T12:00:00Z",
+      result: {
+        asset: asset("new"),
+        skippedSeqs: [],
+        exports: [
+          {
+            sha256: "2".repeat(64),
+            variant: "packaged",
+            size: "1080p",
+            width: 1920,
+            height: 1080,
+            manifestHash: "e".repeat(64),
+            asset: asset("new"),
+          },
+        ],
+      },
+    });
+    expect(composeExportsOf(newer)).toHaveLength(1);
+    expect(latestComposeExports([older, newer], 2)[0]?.variant).toBe("packaged");
+    expect(latestComposeExports([older, newer], 2, null)).toEqual([]);
+    expect(latestComposeExports([older, newer], 2, "")).toEqual([]);
+    expect(latestComposeExports([older, newer], 2, "j-old")[0]?.variant).toBe("clean");
+    expect(latestComposeExports([older, newer], 2, "j-missing")).toEqual([]);
+    expect(latestComposeExports([older, newer], 2, "j-failed")).toEqual([]);
+    expect(latestComposeExports([older, newer], 3)).toEqual([]);
+  });
+
+  test("canUseManifestCompose 与 composeDimensions 覆盖全部 6 种受支持比例", () => {
+    const ratios = ["16:9", "9:16", "4:3", "3:4", "1:1", "21:9"] as const;
+    for (const ratio of ratios) {
+      expect(canUseManifestCompose(ratio, { editSchema: 1 })).toBe(true);
+      expect(canUseManifestCompose(ratio, { editSchema: 0 })).toBe(false);
+      expect(canUseManifestCompose(ratio, null)).toBe(false);
+    }
+    expect(canUseManifestCompose("", { editSchema: 1 })).toBe(false);
+    expect(canUseManifestCompose("3:2", { editSchema: 1 })).toBe(false);
+
+    expect(COMPOSE_ASPECT_BASE["9:16"]).toEqual([720, 1280]);
+    expect(composeDimensions("16:9", "720p")).toEqual([1280, 720]);
+    expect(composeDimensions("16:9", "1080p")).toEqual([1920, 1080]);
+    expect(composeDimensions("9:16", "720p")).toEqual([720, 1280]);
+    expect(composeDimensions("9:16", "1080p")).toEqual([1080, 1920]);
+    expect(composeDimensions("4:3", "720p")).toEqual([960, 720]);
+    expect(composeDimensions("4:3", "1080p")).toEqual([1440, 1080]);
+    expect(composeDimensions("3:4", "720p")).toEqual([720, 960]);
+    expect(composeDimensions("3:4", "1080p")).toEqual([1080, 1440]);
+    expect(composeDimensions("1:1", "720p")).toEqual([720, 720]);
+    expect(composeDimensions("1:1", "1080p")).toEqual([1080, 1080]);
+    expect(composeDimensions("21:9", "720p")).toEqual([1680, 720]);
+    expect(composeDimensions("21:9", "1080p")).toEqual([2520, 1080]);
+    expect(composeDimensions("unknown", "720p")).toEqual([1280, 720]);
+  });
+
+  test("latestComposeExports 在 finalComposeJobId 指向未成功/跨集任务时不回退", () => {
+    const wrongEpisode = job({
+      id: "j-other-ep",
+      episodes: [1],
+      status: "succeeded",
+      result: {
+        asset: asset("other"),
+        skippedSeqs: [],
+        exports: [
+          {
+            sha256: "3".repeat(64),
+            variant: "clean",
+            size: "720p",
+            width: 720,
+            height: 1280,
+            manifestHash: "3".repeat(64),
+            asset: asset("other"),
+          },
+        ],
+      },
+    });
+    const failedTarget = job({
+      id: "j-failed",
+      episodes: [2],
+      status: "failed",
+    });
+    const fallbackSucceeded = job({
+      id: "j-fallback",
+      episodes: [2],
+      status: "succeeded",
+      result: {
+        asset: asset("fb"),
+        skippedSeqs: [],
+        exports: [
+          {
+            sha256: "4".repeat(64),
+            variant: "packaged",
+            size: "720p",
+            width: 720,
+            height: 1280,
+            manifestHash: "4".repeat(64),
+            asset: asset("fb"),
+          },
+        ],
+      },
+    });
+
+    expect(latestComposeExports([wrongEpisode, fallbackSucceeded], 2, "j-other-ep")).toEqual([]);
+    expect(latestComposeExports([failedTarget, fallbackSucceeded], 2, "j-failed")).toEqual([]);
+    expect(latestComposeExports([failedTarget, fallbackSucceeded], 2)).toHaveLength(1);
   });
 });

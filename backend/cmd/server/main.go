@@ -29,15 +29,22 @@ func main() {
 
 func run() error {
 	configPath := flag.String("c", "configs/config.yaml", "配置文件路径")
+	legacyDrainFlag := flag.Bool("marketing-legacy-drain-completed", false, "仅在确认旧营销消费者已停领、排空并全部退出后开启，以回收0035旧NULL租约孤儿")
 	flag.Parse()
 	// migrate 子命令：镜像的 ENTRYPOINT 已经带了 -c，所以子命令出现在 -c 之后（server -c x migrate status）
 	if flag.Arg(0) == "migrate" {
 		return runMigrate(flag.Args()[1:], *configPath, os.Stdout)
 	}
+	if flag.Arg(0) == "marketing-drain-legacy-orphans" {
+		return runDrainLegacyMarketing(flag.Args()[1:], *configPath, os.Stdout)
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
+	}
+	if *legacyDrainFlag {
+		cfg.Marketing.LegacyDrainCompleted = true
 	}
 
 	if err := logger.Init(cfg.Log); err != nil {

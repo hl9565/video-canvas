@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Loader2, Lock } from "lucide-react";
 import { toast } from "sonner";
 
 import { getEpisode, updateEpisode } from "@/api/drama";
 import { dramaErrorMessage, isRevisionConflict } from "@/api/drama/errors";
-import type { Episode } from "@/api/drama/type";
+import type { Episode, EpisodeSummary } from "@/api/drama/type";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { DURATION, EASE_OUT } from "@/lib/motion";
@@ -54,21 +54,61 @@ function TocItem({
   );
 }
 
+function episodeIdMatches(expectedId: string | undefined, actualId: string | undefined): boolean {
+  return expectedId ? actualId === expectedId : !actualId;
+}
+
+function matchesEpisodeIdentity(
+  episodes: readonly EpisodeSummary[],
+  no: number,
+  expectedId: string | undefined,
+): boolean {
+  const target = episodes.find((item) => item.no === no);
+  if (!target) return false;
+  return episodeIdMatches(expectedId, target.id);
+}
+
 /**
  * 一集的剧本：读单集（含正文）、锁定只读、自动保存。
  * 还没有剧本（规划只出目录）时显示空状态：「这一集还没有剧本」+「生成剧本」，以及梗概、钩子、悬念。
  */
-function EpisodeDoc({ no, onGenerate }: { no: number; onGenerate: (no: number) => void }) {
-  const { drama, applyEpisode, reportSave } = useWorkspace();
+function EpisodeDoc({
+  no,
+  liveEpisodesRef,
+  onGenerate,
+}: {
+  no: number;
+  liveEpisodesRef?: RefObject<readonly EpisodeSummary[]>;
+  onGenerate: (no: number) => void;
+}) {
+  const { drama, applyEpisode, refresh, reportSave } = useWorkspace();
   const summary = drama.episodes.find((ep) => ep.no === no);
+  const summaryId = summary?.id;
   const [episode, setEpisode] = useState<Episode | null>(null);
   const [failed, setFailed] = useState(false);
   const revision = summary?.revision;
   const scriptStatus = summary?.scriptStatus;
-  /** 已经读到（或自己刚存下）的 revision + 状态：目录里的值和它一致就不用再读，免得每次自动保存都多一次请求 */
+  /** 已经读到（或自己刚存下）的实体 ID + revision + 状态：目录里的值和它一致就不用再读，免得每次自动保存都多一次请求 */
   const known = useRef<string | null>(null);
   const paper = useRef<HTMLDivElement>(null);
-  const scriptMd = episode?.scriptMd ?? "";
+  const fallbackEpisodesRef = useRef(drama.episodes);
+  useLayoutEffect(() => {
+    fallbackEpisodesRef.current = drama.episodes;
+  }, [drama.episodes]);
+  const episodesRef = liveEpisodesRef ?? fallbackEpisodesRef;
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // 如果同一实例内 summary 实体身份变化，绝不复用旧集正文
+  const activeEpisode = episode && !episodeIdMatches(summaryId, episode.id) ? null : episode;
+  const episodeId = activeEpisode?.id ?? summaryId;
+  const docKey = episodeId ?? `ep${no}`;
+  const scriptMd = activeEpisode?.scriptMd ?? "";
   const scenes = useMemo(() => extractScenes(scriptMd), [scriptMd]);
 
   /** 点场次目录：按标题在稿纸里找到对应节点，滚过去（减弱动态时直接跳） */
@@ -86,69 +126,135 @@ function EpisodeDoc({ no, onGenerate }: { no: number; onGenerate: (no: number) =
     });
   };
 
-  // 目录里这一集的 revision / 状态变了（生成完、任务改了）：重新读正文
+  // 目录里这一集的实体 ID / revision / 状态变了（切集、生成完、任务改了）：重新读正文
   useEffect(() => {
-    const key = `${revision}:${scriptStatus}`;
+    if (revision === undefined || scriptStatus === undefined) return;
+    const expectedId = summaryId;
+    const key = `${expectedId ?? ""}:${revision}:${scriptStatus}`;
     if (known.current === key) return;
     let active = true;
     getEpisode(drama.id, no)
       .then((value) => {
-        if (!active) return;
-        known.current = `${value.revision}:${value.scriptStatus}`;
+        if (!active || !mountedRef.current) return;
+        if (
+          !episodeIdMatches(expectedId, value.id) ||
+          !matchesEpisodeIdentity(episodesRef.current, no, expectedId)
+        ) {
+          setFailed(true);
+          void refresh?.();
+          return;
+        }
+        known.current = `${expectedId ?? ""}:${value.revision}:${value.scriptStatus}`;
         setEpisode(value);
         setFailed(false);
       })
-      .catch(() => active && setFailed(true));
+      .catch(() => {
+        if (active && mountedRef.current) setFailed(true);
+      });
     return () => {
       active = false;
     };
-  }, [drama.id, no, revision, scriptStatus]);
+  }, [drama.id, episodesRef, no, refresh, revision, scriptStatus, summaryId]);
 
   if (!summary) return null;
   const edit = episodeEditState(summary);
-  const empty = showEmptyScript(summary, episode?.scriptMd ?? "");
+  const empty = showEmptyScript(summary, activeEpisode?.scriptMd ?? "");
+  const canSaveEpisode = () => matchesEpisodeIdentity(episodesRef.current, no, episodeId);
+
+  const commitSavedEpisode = (
+    saved: Episode,
+    expectedId: string | undefined,
+    patchFields: Partial<EpisodeSummary>,
+  ): boolean => {
+    if (
+      !episodeIdMatches(expectedId, saved.id) ||
+      !matchesEpisodeIdentity(episodesRef.current, no, expectedId)
+    ) {
+      void refresh?.();
+      return false;
+    }
+    if (mountedRef.current) {
+      known.current = `${expectedId ?? ""}:${saved.revision}:${saved.scriptStatus}`;
+      setEpisode(saved);
+    }
+    applyEpisode(no, {
+      ...(expectedId ? { id: expectedId } : {}),
+      ...patchFields,
+    });
+    return true;
+  };
+
+  const handleSaveError = async (
+    e: unknown,
+    expectedId: string | undefined,
+    toPatch: (latest: Episode) => Partial<EpisodeSummary>,
+  ) => {
+    if (!isRevisionConflict(e)) {
+      toast.error(dramaErrorMessage(e, "保存失败，请稍后重试"));
+      return;
+    }
+    const latest = await getEpisode(drama.id, no).catch(() => null);
+    if (
+      latest &&
+      episodeIdMatches(expectedId, latest.id) &&
+      matchesEpisodeIdentity(episodesRef.current, no, expectedId)
+    ) {
+      toast.warning(`第 ${no} 集在别处被修改过，已加载最新内容，你的改动没有保存`);
+      if (mountedRef.current) {
+        known.current = `${expectedId ?? ""}:${latest.revision}:${latest.scriptStatus}`;
+        setEpisode(latest);
+      }
+      applyEpisode(no, {
+        ...(expectedId ? { id: expectedId } : {}),
+        ...toPatch(latest),
+      });
+    } else {
+      toast.warning(`第 ${no} 集已被删除或重新编号，正在刷新分集列表`);
+      void refresh?.();
+    }
+  };
+
   /** 改开场钩子 / 结尾悬念：带 revision 乐观锁；冲突时载入最新内容并提示，失败让输入框留在编辑态 */
   const saveMeta = async (field: MetaField, value: string) => {
-    if (!episode) return;
+    if (!activeEpisode) return;
+    const targetId = activeEpisode.id ?? summaryId;
+    if (!matchesEpisodeIdentity(episodesRef.current, no, targetId)) {
+      void refresh?.();
+      throw new Error("分集已变更，请刷新后重试");
+    }
     try {
       const saved = await updateEpisode(drama.id, no, {
-        revision: episode.revision,
+        revision: activeEpisode.revision,
+        ...(targetId ? { expectedEpisodeId: targetId } : {}),
         [field]: value,
       });
-      known.current = `${saved.revision}:${saved.scriptStatus}`;
-      setEpisode(saved);
-      applyEpisode(no, {
+      commitSavedEpisode(saved, targetId, {
         revision: saved.revision,
         hook: saved.hook,
         cliffhanger: saved.cliffhanger,
         updatedAt: saved.updatedAt,
       });
     } catch (e) {
-      if (isRevisionConflict(e)) {
-        toast.warning(`第 ${no} 集在别处被修改过，已加载最新内容，你的改动没有保存`);
-        const latest = await getEpisode(drama.id, no).catch(() => null);
-        if (latest) {
-          setEpisode(latest);
-          applyEpisode(no, {
-            revision: latest.revision,
-            hook: latest.hook,
-            cliffhanger: latest.cliffhanger,
-          });
-        }
-      } else {
-        toast.error(dramaErrorMessage(e, "保存失败，请稍后重试"));
+      if (!matchesEpisodeIdentity(episodesRef.current, no, targetId)) {
+        void refresh?.();
+        throw e;
       }
+      await handleSaveError(e, targetId, (latest) => ({
+        revision: latest.revision,
+        hook: latest.hook,
+        cliffhanger: latest.cliffhanger,
+      }));
       throw e;
     }
   };
-  if (failed && !episode) {
+  if (failed && !activeEpisode) {
     return (
       <div className="text-muted-foreground p-10 text-center text-sm">
         这一集读取失败，请稍后重试
       </div>
     );
   }
-  if (!episode) {
+  if (!activeEpisode) {
     return (
       <div className="mx-auto grid w-full max-w-3xl gap-2.5 px-6 py-10">
         {[90, 70, 80].map((width) => (
@@ -193,7 +299,12 @@ function EpisodeDoc({ no, onGenerate }: { no: number; onGenerate: (no: number) =
             正在生成这一集的剧本…
           </div>
         ) : empty ? (
-          <EmptyScript episode={summary} onGenerate={() => onGenerate(no)} onSaveMeta={saveMeta} />
+          <EmptyScript
+            key={docKey}
+            episode={summary}
+            onGenerate={() => onGenerate(no)}
+            onSaveMeta={saveMeta}
+          />
         ) : (
           <div
             ref={paper}
@@ -205,37 +316,44 @@ function EpisodeDoc({ no, onGenerate }: { no: number; onGenerate: (no: number) =
             )}
           >
             <DocEditor
-              key={`ep${no}`}
-              value={episode.scriptMd}
-              revision={episode.revision}
+              key={docKey}
+              value={activeEpisode.scriptMd}
+              revision={activeEpisode.revision}
               editable={edit.editable}
+              canSave={canSaveEpisode}
               isConflict={isRevisionConflict}
-              onStatus={(status) => reportSave(`ep${no}`, status)}
-              onSave={async (markdown) => {
+              onStatus={(status) => reportSave(docKey, status)}
+              onSave={async (markdown, currentRevision) => {
+                const targetId = activeEpisode.id ?? summaryId;
+                const baseRevision = currentRevision ?? activeEpisode.revision;
+                if (!matchesEpisodeIdentity(episodesRef.current, no, targetId)) {
+                  return baseRevision;
+                }
                 try {
                   const saved = await updateEpisode(drama.id, no, {
-                    revision: episode.revision,
+                    revision: baseRevision,
+                    ...(targetId ? { expectedEpisodeId: targetId } : {}),
                     scriptMd: markdown,
                   });
-                  known.current = `${saved.revision}:${saved.scriptStatus}`;
-                  setEpisode(saved);
-                  applyEpisode(no, {
-                    revision: saved.revision,
-                    scriptStatus: saved.scriptStatus,
-                    updatedAt: saved.updatedAt,
-                  });
+                  if (
+                    !commitSavedEpisode(saved, targetId, {
+                      revision: saved.revision,
+                      scriptStatus: saved.scriptStatus,
+                      updatedAt: saved.updatedAt,
+                    })
+                  ) {
+                    return baseRevision;
+                  }
                   return saved.revision;
                 } catch (e) {
-                  if (isRevisionConflict(e)) {
-                    toast.warning(`第 ${no} 集在别处被修改过，已加载最新内容，你的改动没有保存`);
-                    const latest = await getEpisode(drama.id, no).catch(() => null);
-                    if (latest) {
-                      setEpisode(latest);
-                      applyEpisode(no, { revision: latest.revision });
-                    }
-                  } else {
-                    toast.error(dramaErrorMessage(e, "保存失败，请稍后重试"));
+                  if (!matchesEpisodeIdentity(episodesRef.current, no, targetId)) {
+                    return baseRevision;
                   }
+                  await handleSaveError(e, targetId, (latest) => ({
+                    revision: latest.revision,
+                    scriptStatus: latest.scriptStatus,
+                    updatedAt: latest.updatedAt,
+                  }));
                   throw e;
                 }
               }}
@@ -272,6 +390,7 @@ function EpisodeDoc({ no, onGenerate }: { no: number; onGenerate: (no: number) =
           </>
         )}
         <EpisodeMeta
+          key={docKey}
           episode={summary}
           unitKind={drama.unitKind}
           inEmptyState={empty}
@@ -371,6 +490,12 @@ export function ScriptArea({
   const { analyzing, showAnalyzing } = useAnalyzing();
   /** 写剧本弹窗：从浮条打开用默认选择，从某一集的空状态打开预选这一集 */
   const [scripts, setScripts] = useState<{ open: boolean; initial?: number[] }>({ open: false });
+  const currentSummary = drama.episodes.find((item) => item.no === ep);
+  const episodeKey = currentSummary?.id ?? ep;
+  const liveEpisodesRef = useRef(drama.episodes);
+  useLayoutEffect(() => {
+    liveEpisodesRef.current = drama.episodes;
+  }, [drama.episodes]);
 
   return (
     <div className="flex h-full min-h-0">
@@ -398,7 +523,11 @@ export function ScriptArea({
               人物
             </TocItem>
             {drama.episodes.map((item) => (
-              <TocItem key={item.no} active={!doc && ep === item.no} onClick={() => onEp(item.no)}>
+              <TocItem
+                key={item.id ?? item.no}
+                active={!doc && ep === item.no}
+                onClick={() => onEp(item.no)}
+              >
                 第{item.no}集
               </TocItem>
             ))}
@@ -407,8 +536,9 @@ export function ScriptArea({
             <ProjectDoc key={doc} doc={doc} />
           ) : (
             <EpisodeDoc
-              key={ep}
+              key={episodeKey}
               no={ep}
+              liveEpisodesRef={liveEpisodesRef}
               onGenerate={(no) => setScripts({ open: true, initial: [no] })}
             />
           )}

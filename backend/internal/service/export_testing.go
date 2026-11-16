@@ -47,3 +47,5 @@ func (s *AssetService) SetRepo(r AssetRepo) { s.repo = r }
 func (s *AssetService) SetNow(fn func() time.Time) { s.now = fn }
 
 func (s *StorageConfigService) SetNow(fn func() time.Time) { s.now = fn }
+
+func (s *DramaService) WaitManifestWarmupsForTest() { s.preview.wg.Wait() }

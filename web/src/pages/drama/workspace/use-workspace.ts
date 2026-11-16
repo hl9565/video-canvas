@@ -23,6 +23,43 @@ export function summarizeSave(states: Record<string, AutosaveStatus>): SaveSumma
 
 const NO_JOBS: DramaJob[] = [];
 
+const monotonicSegmentVersion = (
+  prevVersion: number | undefined,
+  nextVersion: number | undefined,
+): number | undefined => {
+  if (typeof prevVersion === "number" && typeof nextVersion === "number") {
+    return Math.max(prevVersion, nextVersion);
+  }
+  return nextVersion ?? prevVersion;
+};
+
+/** 仅在同一剧集内按稳定分集 ID（无 ID 时回退集号）保留单调递增的 segmentVersion，防止删集重排或过期响应错位覆盖 */
+export function mergeEpisodeListWithMonotonicVersions(
+  prevDetail: Drama | null,
+  nextDetail: Drama,
+): Drama["episodes"] {
+  if (!prevDetail || prevDetail.id !== nextDetail.id) {
+    return nextDetail.episodes;
+  }
+  const hasEpisodeIds =
+    prevDetail.episodes.some((ep) => Boolean(ep.id)) ||
+    nextDetail.episodes.some((ep) => Boolean(ep.id));
+  const prevById = hasEpisodeIds
+    ? new Map(prevDetail.episodes.filter((ep) => Boolean(ep.id)).map((ep) => [ep.id!, ep]))
+    : null;
+  const prevByNo = hasEpisodeIds ? null : new Map(prevDetail.episodes.map((ep) => [ep.no, ep]));
+  return nextDetail.episodes.map((nextEp) => {
+    const prevEp = prevById
+      ? nextEp.id
+        ? prevById.get(nextEp.id)
+        : undefined
+      : prevByNo?.get(nextEp.no);
+    if (!prevEp) return nextEp;
+    const segmentVersion = monotonicSegmentVersion(prevEp.segmentVersion, nextEp.segmentVersion);
+    return segmentVersion !== undefined ? { ...nextEp, segmentVersion } : nextEp;
+  });
+}
+
 /** 工作台对子组件开放的状态与动作 */
 export type DramaWorkspace = {
   drama: Drama;
@@ -63,7 +100,10 @@ export function useDramaWorkspace(id: string) {
       const next = await getDrama(id, true);
       if (seq !== fetchSeq.current) return;
       revisionRef.current = next.revision;
-      setDrama(next);
+      setDrama((prev) => ({
+        ...next,
+        episodes: mergeEpisodeListWithMonotonicVersions(prev, next),
+      }));
       setError(null);
     } catch (e) {
       if (seq !== fetchSeq.current) return;
@@ -112,7 +152,13 @@ export function useDramaWorkspace(id: string) {
         try {
           const next = await updateDrama(id, { ...fields, revision: revisionRef.current });
           revisionRef.current = next.revision;
-          setDrama((prev) => (prev ? { ...next, activeJobs: prev.activeJobs } : next));
+          setDrama((prev) => {
+            const episodes = mergeEpisodeListWithMonotonicVersions(prev, next);
+            if (prev && prev.id === next.id) {
+              return { ...next, episodes, activeJobs: prev.activeJobs };
+            }
+            return { ...next, episodes };
+          });
           return next.revision;
         } catch (e) {
           if (isRevisionConflict(e)) {
@@ -132,14 +178,29 @@ export function useDramaWorkspace(id: string) {
   );
 
   const applyEpisode = useCallback<DramaWorkspace["applyEpisode"]>((no, change) => {
-    setDrama((prev) =>
-      prev
-        ? {
-            ...prev,
-            episodes: prev.episodes.map((ep) => (ep.no === no ? { ...ep, ...change } : ep)),
-          }
-        : prev,
-    );
+    setDrama((prev) => {
+      if (!prev) return prev;
+      const hasEpisodeIds = prev.episodes.some((ep) => Boolean(ep.id));
+      if (hasEpisodeIds && !change.id) {
+        return prev;
+      }
+      let changed = false;
+      const episodes = prev.episodes.map((ep) => {
+        const matched = change.id ? ep.id === change.id : !ep.id && ep.no === no;
+        if (!matched) return ep;
+        changed = true;
+        const nextSegmentVersion = monotonicSegmentVersion(
+          ep.segmentVersion,
+          change.segmentVersion,
+        );
+        return {
+          ...ep,
+          ...change,
+          ...(nextSegmentVersion !== undefined ? { segmentVersion: nextSegmentVersion } : {}),
+        };
+      });
+      return changed ? { ...prev, episodes } : prev;
+    });
   }, []);
 
   const reportSave = useCallback((key: string, status: AutosaveStatus) => {

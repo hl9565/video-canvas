@@ -118,7 +118,10 @@ describe("AgentComposer：画布能力开关", () => {
     useAgentAttachments = (await import("@/hooks/use-agent-attachments")).useAgentAttachments;
   });
 
-  afterAll(() => {
+  afterAll(async () => {
+    // @tiptap/react's useEditor schedules editor.destroy() in setTimeout(..., 1) on unmount;
+    // wait for it to finish before restoring global document/window so later non-DOM tests don't throw.
+    await new Promise((resolve) => setTimeout(resolve, 20));
     const g = globalThis as unknown as Record<string, unknown>;
     for (const key of GLOBALS) {
       Object.defineProperty(g, key, { value: saved[key], configurable: true, writable: true });

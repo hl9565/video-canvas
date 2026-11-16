@@ -110,14 +110,14 @@ func (s *MarketingService) insertRound(ctx context.Context, tx repository.Market
 		plan++
 	}
 	round := &model.MarketingRound{UserID: p.UserID, ProjectID: p.ID, Status: model.MarketingRoundScripting, Warnings: []byte("[]"),
-		Settings: settingsJSON, RefVideoAssetID: sp.refID, ModelAssetID: sp.modelID, PlanCount: plan, Frozen: sp.costs.total()}
+		ExecutionGen: 1, Settings: settingsJSON, RefVideoAssetID: sp.refID, ModelAssetID: sp.modelID, PlanCount: plan, Frozen: sp.costs.total()}
 	if err := tx.InsertRound(ctx, round); err != nil {
 		return nil, err
 	}
 	var runs []*model.MarketingStepRun
 	add := func(key string, frozen int, status string) {
 		runs = append(runs, &model.MarketingStepRun{UserID: p.UserID, RoundID: round.ID, StepKey: key, Method: []byte("{}"),
-			TextModelID: sp.textModels[key], Status: status, Frozen: frozen})
+			TextModelID: sp.textModels[key], Status: status, RoundGen: round.ExecutionGen, Frozen: frozen})
 	}
 	if sp.hasFacts {
 		add(marketing.StepFacts, 0, model.MarketingRunReused)
@@ -255,11 +255,12 @@ func (s *MarketingService) NewRound(ctx context.Context, userID, projectID uint6
 
 // CancelRound 取消写脚本：排队中的环节关闭并解冻，进行中的环节会被中断（用量照实结算）；轮次已结束时原样返回。
 func (s *MarketingService) CancelRound(ctx context.Context, userID, roundID uint64) (*model.MarketingRoundView, error) {
-	err := s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		r, err := tx.Round(ctx, userID, roundID, true)
-		if mktNotFound(err) {
-			return errcode.ErrMarketingNotFound
-		}
+	probe, err := s.activeMarketingRound(ctx, userID, roundID)
+	if err != nil {
+		return nil, err
+	}
+	err = s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
+		r, err := lockMarketingRound(ctx, tx, userID, probe)
 		if err != nil || r.Status != model.MarketingRoundScripting {
 			return err
 		}
@@ -267,19 +268,25 @@ func (s *MarketingService) CancelRound(ctx context.Context, userID, roundID uint
 		if err != nil {
 			return err
 		}
-		for _, run := range latestRuns(runs) {
-			stale := run.Status == model.MarketingRunRunning && run.StartedAt != nil && s.now().Sub(*run.StartedAt) > marketingStepTimeout+marketingCancelPoll*5
-			if run.Status != model.MarketingRunQueued && !stale {
-				continue
-			}
-			if err := s.closeRun(ctx, tx, &run, model.MarketingRunCanceled, ""); err != nil {
-				return err
-			}
+		// 1. 标记在途调用；仅排队运行立即全退，存活worker保留真实用量结算权。
+		if err := tx.MarkRoundRunsCancelRequested(ctx, r.ID); err != nil {
+			return err
 		}
 		if err := s.releaseRewriting(ctx, tx, r.ID); err != nil {
 			return err
 		}
-		return tx.UpdateRound(ctx, r.ID, map[string]any{"status": model.MarketingRoundCanceled, "error": ""})
+		if err := tx.UpdateRound(ctx, r.ID, map[string]any{"execution_gen": r.ExecutionGen + 1, "status": model.MarketingRoundCanceled, "error": ""}); err != nil {
+			return err
+		}
+		// 2. 所有脚本锁已取得；积分锁始终最后取得。
+		for i := range runs {
+			if runs[i].Status == model.MarketingRunQueued {
+				if err := s.closeRun(ctx, tx, &runs[i], model.MarketingRunCanceled, ""); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -341,7 +348,12 @@ func (s *MarketingService) releaseRewriting(ctx context.Context, tx repository.M
 	}
 	for i := range scripts {
 		if scripts[i].Status == model.MarketingScriptRewriting {
-			if err := tx.UpdateScript(ctx, scripts[i].ID, map[string]any{"status": model.MarketingScriptDraft}); err != nil {
+			tasks, err := tx.ScriptTasks(ctx, scripts[i].UserID, []string{marketingNode(scripts[i].ID)})
+			if err != nil {
+				return err
+			}
+			status, msg := deriveScriptStatus(model.MarketingScriptDraft, tasks)
+			if err := tx.UpdateScript(ctx, scripts[i].ID, map[string]any{"status": status, "error": msg}); err != nil {
 				return err
 			}
 		}
@@ -349,7 +361,7 @@ func (s *MarketingService) releaseRewriting(ctx context.Context, tx repository.M
 	return nil
 }
 
-// latestRuns 取每个环节最新的一条运行记录（输入按创建顺序）。
+// latestRuns 按执行代、主键取每个环节最新运行，不受输入顺序或创建时间影响。
 func latestRuns(runs []model.MarketingStepRun) []model.MarketingStepRun {
 	byKey := map[string]model.MarketingStepRun{}
 	var order []string
@@ -357,7 +369,10 @@ func latestRuns(runs []model.MarketingStepRun) []model.MarketingStepRun {
 		if _, ok := byKey[r.StepKey]; !ok {
 			order = append(order, r.StepKey)
 		}
-		byKey[r.StepKey] = r
+		cur, exists := byKey[r.StepKey]
+		if !exists || r.RoundGen > cur.RoundGen || (r.RoundGen == cur.RoundGen && r.ID > cur.ID) {
+			byKey[r.StepKey] = r
+		}
 	}
 	out := make([]model.MarketingStepRun, 0, len(order))
 	for _, k := range order {

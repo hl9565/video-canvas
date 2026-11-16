@@ -1,6 +1,9 @@
 package model
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"time"
 
 	"gorm.io/datatypes"
@@ -18,8 +21,14 @@ type DramaSegment struct {
 	Prompt       string `gorm:"type:text;not null;default:''"`
 	ChosenTaskID *uint64
 	// Adaptations 按格式（h3 / generic）存原稿的转写稿，值为 DramaSegmentAdaptation；原稿就是 Seedance，不存 seedance 键
-	Adaptations datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`
-	Revision    int64          `gorm:"not null;default:1"`
+	Adaptations      datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`
+	SourceInF        int32          `gorm:"type:integer;not null;default:0;check:ck_ds_range,source_in_f >= 0 AND (source_out_f IS NULL OR source_out_f > source_in_f)"`
+	SourceOutF       *int32         `gorm:"type:integer"`
+	MuteOriginal     bool           `gorm:"not null;default:false"`
+	AudioGainDB      float64        `gorm:"type:numeric(5,2);not null;default:0;check:ck_ds_gain,audio_gain_db BETWEEN -60 AND 12"`
+	NativeIsDialogue bool           `gorm:"not null;default:false"`
+	AvPtsOffsetMs    int32          `gorm:"type:integer;not null;default:0;check:ck_ds_pts,av_pts_offset_ms BETWEEN -10000 AND 10000"`
+	Revision         int64          `gorm:"not null;default:1"`
 }
 
 // DramaSegmentAdaptation 是一份转写稿；SourceHash 是转写时原稿的 SHA-256，与当前原稿不同即已过期。
@@ -44,19 +53,96 @@ type DramaSegmentTakeView struct {
 	CreatedAt    time.Time  `json:"created_at"`
 }
 
+// NullableInt32 区分 PATCH 请求里的“字段缺失”、“显式传 null”和“传入整数”。
+type NullableInt32 struct {
+	Set   bool
+	Value *int32
+}
+
+// UnmarshalJSON 仅接受 null 或精确整数，拒绝字符串、浮点数、布尔值与对象。
+func (n *NullableInt32) UnmarshalJSON(data []byte) error {
+	if n == nil {
+		return errors.New("NullableInt32: UnmarshalJSON on nil pointer")
+	}
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return errors.New("NullableInt32: empty json")
+	}
+	if bytes.Equal(trimmed, []byte("null")) {
+		n.Set = true
+		n.Value = nil
+		return nil
+	}
+	var v int32
+	if err := json.Unmarshal(trimmed, &v); err != nil {
+		return err
+	}
+	n.Set = true
+	n.Value = &v
+	return nil
+}
+
+// MarshalJSON 将未设置或空指针序列化为 null，有值则序列化为整数。
+func (n NullableInt32) MarshalJSON() ([]byte, error) {
+	if n.Value == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(*n.Value)
+}
+
+// DramaSegmentEditView 返回片段当前的逐镜精裁和原生音轨设置。
+type DramaSegmentEditView struct {
+	SourceInF        int32   `json:"source_in_f"`
+	SourceOutF       *int32  `json:"source_out_f"`
+	MuteOriginal     bool    `json:"mute_original"`
+	AudioGainDB      float64 `json:"audio_gain_db"`
+	NativeIsDialogue bool    `json:"native_is_dialogue"`
+	AvPtsOffsetMs    int32   `json:"av_pts_offset_ms"`
+}
+
+// DramaSegmentEditPatch 部分更新片段的逐镜精裁设置，source_out_f 显式 null 表示恢复到片尾 EOF。
+type DramaSegmentEditPatch struct {
+	SourceInF        *int32        `json:"source_in_f"`
+	SourceOutF       NullableInt32 `json:"source_out_f"`
+	MuteOriginal     *bool         `json:"mute_original"`
+	AudioGainDB      *float64      `json:"audio_gain_db"`
+	NativeIsDialogue *bool         `json:"native_is_dialogue"`
+	AvPtsOffsetMs    *int32        `json:"av_pts_offset_ms"`
+}
+
+// DramaProgramAudio 表示整集音频条目（PR1 默认为空切片，PR3 展开详细结构）。
+type DramaProgramAudio struct {
+	ID string `json:"id"`
+}
+
+// DramaProgramOverlay 表示整集文字/角标叠层条目（PR1 默认为空切片，PR3 展开详细结构）。
+type DramaProgramOverlay struct {
+	ID string `json:"id"`
+}
+
+// DramaEpisodeProgram 描述集级扩展音画包；PR1 在 edit_schema=0/1 上固定返回默认 Version=1 空包。
+type DramaEpisodeProgram struct {
+	Version  int                   `json:"v"`
+	Audio    []DramaProgramAudio   `json:"audio"`
+	Overlays []DramaProgramOverlay `json:"overlays"`
+}
+
 // DramaSegmentView 是片段工作区和 WebSocket 共用视图。
 type DramaSegmentView struct {
-	ID           idcodec.ID                        `json:"id"`
-	EpisodeNo    int                               `json:"episode_no"`
-	Seq          int                               `json:"seq"`
-	Seconds      int                               `json:"seconds"`
-	Prompt       string                            `json:"prompt"`
-	Adaptations  map[string]DramaSegmentAdaptation `json:"adaptations"`
-	Takes        []DramaSegmentTakeView            `json:"takes"`
-	ChosenTaskID string                            `json:"chosen_task_id"`
-	Status       string                            `json:"status"`
-	Revision     int64                             `json:"revision"`
-	UpdatedAt    time.Time                         `json:"updated_at"`
+	ID               idcodec.ID                        `json:"id"`
+	EpisodeNo        int                               `json:"episode_no"`
+	Seq              int                               `json:"seq"`
+	Seconds          int                               `json:"seconds"`
+	Prompt           string                            `json:"prompt"`
+	Adaptations      map[string]DramaSegmentAdaptation `json:"adaptations"`
+	Takes            []DramaSegmentTakeView            `json:"takes"`
+	ChosenTaskID     string                            `json:"chosen_task_id"`
+	SourceFrameCount *int32                            `json:"source_frame_count"`
+	Edit             DramaSegmentEditView              `json:"edit"`
+	Status           string                            `json:"status"`
+	Revision         int64                             `json:"revision"`
+	SegmentVersion   int64                             `json:"segment_version"`
+	UpdatedAt        time.Time                         `json:"updated_at"`
 }
 
 // CreateDramaSegmentReq 新增片段，after_seq 未传则追加到末尾。
@@ -68,10 +154,14 @@ type CreateDramaSegmentReq struct {
 
 // UpdateDramaSegmentReq 带版本部分更新，采用结果必须属于本段且已成功。
 type UpdateDramaSegmentReq struct {
-	Revision     int64       `json:"revision" binding:"required,min=1" label:"版本"`
-	Prompt       *string     `json:"prompt"`
-	Seconds      *int        `json:"seconds" binding:"omitempty,min=1" label:"片段时长"`
-	ChosenTaskID *idcodec.ID `json:"chosen_task_id"`
+	Revision              int64       `json:"revision" binding:"required,min=1" label:"版本"`
+	Prompt                *string     `json:"prompt"`
+	Seconds               *int        `json:"seconds" binding:"omitempty,min=1" label:"片段时长"`
+	ChosenTaskID          *idcodec.ID `json:"chosen_task_id"`
+	ExpectedTaskID        *idcodec.ID `json:"expected_task_id"`
+	ResetEditOnTaskChange *bool       `json:"reset_edit_on_task_change"`
+	// Edit 更新逐镜裁剪和原声设置
+	Edit *DramaSegmentEditPatch `json:"edit"`
 	// Adaptation 手改某个格式的转写稿；该格式必须已经转写过
 	Adaptation *DramaSegmentAdaptationEdit `json:"adaptation"`
 }
@@ -95,6 +185,7 @@ type OrderDramaSegmentsReq struct {
 
 // GenerateDramaSegmentReq 复用生成任务的输入结构，种类、画布与节点由服务指定。
 type GenerateDramaSegmentReq struct {
-	ModelID string         `json:"model_id" binding:"required,max=128" label:"模型"`
-	Input   map[string]any `json:"input" binding:"required" label:"生成参数"`
+	ModelID    string         `json:"model_id" binding:"required,max=128" label:"模型"`
+	Input      map[string]any `json:"input" binding:"required" label:"生成参数"`
+	QuoteToken string         `json:"quote_token" binding:"max=4096" label:"报价令牌"`
 }

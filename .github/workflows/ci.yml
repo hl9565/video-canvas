@@ -136,6 +136,9 @@ jobs:
       - name: Install
         run: bun install --frozen-lockfile
 
+      - name: 安装 nginx
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nginx
+
       - name: Format check
         run: bun run format:check
 
@@ -146,6 +149,8 @@ jobs:
         run: bun run lint
 
       - name: Test
+        env:
+          REQUIRE_NGINX: "1"
         run: bun run test
 
       - name: Build

@@ -49,6 +49,13 @@ func (s *MarketingService) HandleMarketingRound(ctx context.Context, roundID uin
 		if err != nil {
 			return err
 		}
+		if err := s.recoverMarketingRound(ctx, round); err != nil {
+			return err
+		}
+		round, err = s.repo.RoundByID(ctx, roundID, false)
+		if err != nil {
+			return err
+		}
 		if round.Status != model.MarketingRoundScripting {
 			return nil
 		}
@@ -56,21 +63,28 @@ func (s *MarketingService) HandleMarketingRound(ctx context.Context, roundID uin
 		if err != nil {
 			return err
 		}
-		layer := pendingLayer(latestRuns(runs))
+		layer := pendingLayer(currentMarketingRuns(runs, round.ExecutionGen))
+		if len(layer) > 0 && !hasQueuedMarketingRun(layer) {
+			return nil
+		}
 		if len(layer) == 0 {
 			// 定终态后再回头看一眼：job 收尾期间若有新的重试入队被去重跳过，这里接着跑。
-			if _, err := s.finalizeRound(ctx, roundID); err != nil {
+			if final, err := s.finalizeRound(ctx, roundID); err != nil {
 				return err
+			} else if final {
+				return nil
 			}
-			continue
+			return nil
 		}
-		s.runLayer(ctx, round, layer)
+		if err := s.runLayer(ctx, round, layer); err != nil {
+			return err
+		}
 		s.pushRound(ctx, round.UserID, roundID)
 	}
 }
 
 // pendingLayer 返回下一层要执行的运行：先第一层（facts、reverse）的排队 / 进行中运行，没有再取第二层（follow、create）。
-// 进行中（running）也算：job 被救回重试时接着跑。
+// 进行中仅阻塞依赖层推进，不授予重新调用上游的执行权。
 func pendingLayer(latest []model.MarketingStepRun) []model.MarketingStepRun {
 	var first, second []model.MarketingStepRun
 	for _, r := range latest {
@@ -90,9 +104,14 @@ func pendingLayer(latest []model.MarketingStepRun) []model.MarketingStepRun {
 }
 
 // runLayer 并发执行一层运行，等全部结束。
-func (s *MarketingService) runLayer(ctx context.Context, round *model.MarketingRound, layer []model.MarketingStepRun) {
+func (s *MarketingService) runLayer(ctx context.Context, round *model.MarketingRound, layer []model.MarketingStepRun) error {
+	var errs []error
+	var mu sync.Mutex
 	var wg sync.WaitGroup
 	for i := range layer {
+		if layer[i].Status != model.MarketingRunQueued {
+			continue
+		}
 		wg.Add(1)
 		go func(run model.MarketingStepRun) {
 			defer wg.Done()
@@ -102,37 +121,47 @@ func (s *MarketingService) runLayer(ctx context.Context, round *model.MarketingR
 					s.failAfterPanic(ctx, round, &run)
 				}
 			}()
-			s.execStep(ctx, round, &run)
+			if err := s.execStep(ctx, round, &run); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
 		}(layer[i])
 	}
 	wg.Wait()
+	return errors.Join(errs...)
 }
 
 // failAfterPanic 环节运行出现未预期的 panic 时把它落成失败，免得队列无限重试同一个坏输入。
 func (s *MarketingService) failAfterPanic(ctx context.Context, round *model.MarketingRound, run *model.MarketingStepRun) {
 	out := &stepOutcome{status: model.MarketingRunFailed, errMsg: "写脚本时出现内部错误，请重试"}
-	if err := s.finishRun(context.WithoutCancel(ctx), round, run, out); err != nil {
+	if err := s.finishMarketingWithRetry(ctx, round, run, out); err != nil {
 		logger.Error("营销环节运行失败落库失败", zap.Uint64("run_id", run.ID), zap.Error(err))
 	}
 }
 
 // execStep 执行一个环节运行：置为 running → 准备输入并调模型 → 落库、写脚本、结算。
-func (s *MarketingService) execStep(ctx context.Context, round *model.MarketingRound, run *model.MarketingStepRun) {
-	err := s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		return tx.UpdateRunIf(ctx, run.ID, []string{model.MarketingRunQueued, model.MarketingRunRunning},
-			map[string]any{"status": model.MarketingRunRunning, "started_at": s.now()})
-	})
-	if err != nil {
-		if !errorsIsConflict(err) {
-			logger.Warn("营销环节置为进行中失败", zap.Uint64("run_id", run.ID), zap.Error(err))
+func (s *MarketingService) execStep(ctx context.Context, round *model.MarketingRound, run *model.MarketingStepRun) error {
+	// 1. 独占认领queued运行；已经running的投递只退出，绝不重调上游。
+	currentRound := *round
+	claimed, err := s.claimMarketingStep(ctx, &currentRound, run)
+	if err != nil || !claimed {
+		if err != nil && !errorsIsConflict(err) && !mktNotFound(err) {
+			logger.Warn("营销环节认领失败", zap.Uint64("run_id", run.ID), zap.Error(err))
 		}
-		return
+		return err
 	}
-	s.pushRound(ctx, round.UserID, round.ID)
-	out := s.produce(ctx, round, run)
-	if err := s.finishRun(context.WithoutCancel(ctx), round, run, out); err != nil {
-		logger.Error("营销环节运行落库失败", zap.Uint64("run_id", run.ID), zap.Error(err))
-	}
+	s.pushRound(ctx, currentRound.UserID, currentRound.ID)
+	// 2. 心跳维持租约，watchCancel覆盖输入准备与整个上游执行期。
+	produceCtx, cancel := context.WithCancel(ctx)
+	stopWatch := s.watchCancel(produceCtx, cancel, run)
+	// 取消上游后仍维持结算租约，直到真实用量提交，避免恢复器抢退仍活着的worker。
+	stopHeartbeat := s.heartbeatMarketingStep(context.WithoutCancel(ctx), cancel, run)
+	defer cancel()
+	defer stopWatch()
+	defer stopHeartbeat()
+	out := s.produce(produceCtx, &currentRound, run)
+	return s.finishMarketingWithRetry(ctx, &currentRound, run, out)
 }
 
 // produce 跑一个环节，把各种结局归一成 stepOutcome。
@@ -169,9 +198,7 @@ func (s *MarketingService) produce(ctx context.Context, round *model.MarketingRo
 	}
 	runCtx, cancel := context.WithTimeout(ctx, marketingStepTimeout)
 	defer cancel()
-	stopWatch := s.watchCancel(runCtx, cancel, round.ID)
 	res, err := s.runner.Run(runCtx, step, method, snap, prep.input)
-	stopWatch()
 	out := s.classify(ctx, round, project, settings, run.StepKey, snap, res, err)
 	out.model, out.warnings, out.basis, out.runID = snap.Model.Key, prep.warnings, prep.basis, run.ID
 	if out.method.SHA256 == "" {
@@ -212,29 +239,27 @@ func (s *MarketingService) dependencyGap(stepKey string, p *model.MarketingProje
 	return ""
 }
 
-// watchCancel 在环节运行期间每隔几秒查一次轮次是否被取消，取消了就中断这次调用。返回停止函数。
-func (s *MarketingService) watchCancel(ctx context.Context, cancel context.CancelFunc, roundID uint64) func() {
+// watchCancel 按执行代、取消标志、轮次与软删父项目中止produce；停止时等待观察goroutine退出。
+func (s *MarketingService) watchCancel(ctx context.Context, cancel context.CancelFunc, run *model.MarketingStepRun) func() {
+	watchCtx, stop := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		t := time.NewTicker(marketingCancelPoll)
 		defer t.Stop()
 		for {
-			select {
-			case <-done:
+			if s.marketingRunCanceled(watchCtx, run) {
+				cancel()
 				return
-			case <-ctx.Done():
+			}
+			select {
+			case <-watchCtx.Done():
 				return
 			case <-t.C:
-				r, err := s.repo.RoundByID(ctx, roundID, false)
-				if err == nil && r.Status == model.MarketingRoundCanceled {
-					cancel()
-					return
-				}
 			}
 		}
 	}()
-	var once sync.Once
-	return func() { once.Do(func() { close(done) }) }
+	return func() { stop(); <-done }
 }
 
 // classify 把 Runner 的结局转成环节结局：成功时解码输出并准备落库动作。
@@ -289,131 +314,6 @@ func userMessage(err error) string {
 	}
 	logger.Warn("准备环节输入失败", zap.Error(err))
 	return "读取素材失败，请重试"
-}
-
-// finishRun 在一个事务里落下环节结局：更新运行记录、写结果（事实卡 / 拆解 / 脚本）、结算积分。
-// 轮次已被取消时成功的结果不写入，运行记为取消；已被别处结算的运行（状态迁移冲突）什么都不做。
-func (s *MarketingService) finishRun(ctx context.Context, round *model.MarketingRound, run *model.MarketingStepRun, out *stepOutcome) error {
-	charged := 0
-	if out.charge && out.res != nil && out.snap != nil {
-		charged = max(stepkit.Cost(out.snap, out.res), 0)
-	}
-	return s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		cur, err := tx.RoundByID(ctx, round.ID, true)
-		if err != nil {
-			return err
-		}
-		status, msg := out.status, out.errMsg
-		if cur.Status == model.MarketingRoundCanceled && status == model.MarketingRunSucceeded {
-			status, msg = model.MarketingRunCanceled, ""
-		}
-		if err := s.closeOutcome(ctx, tx, run, out, status, msg); err != nil {
-			if errorsIsConflict(err) {
-				return nil
-			}
-			return err
-		}
-		if err := s.applyOutcome(ctx, tx, cur, run, out, status); err != nil {
-			return err
-		}
-		return s.settleRun(ctx, tx, run, charged)
-	})
-}
-
-// closeOutcome 把环节运行的终态写回运行记录；运行已被别处结算时返回 repository.ErrStateConflict。
-func (s *MarketingService) closeOutcome(ctx context.Context, tx repository.MarketingTx, run *model.MarketingStepRun, out *stepOutcome, status, msg string) error {
-	method, err := json.Marshal(out.method)
-	if err != nil {
-		return err
-	}
-	fields := map[string]any{"status": status, "error": msg, "finished_at": s.now(), "method": method}
-	if out.model != "" {
-		fields["text_model_id"] = out.model
-	}
-	if out.res != nil {
-		fields["attempts"] = out.res.Attempts
-	}
-	return tx.UpdateRunIf(ctx, run.ID, []string{model.MarketingRunQueued, model.MarketingRunRunning}, fields)
-}
-
-// applyOutcome 成功时写结果（事实卡 / 拆解 / 脚本）和警告；跟拍没成功时把「重写中」的脚本放回草稿。
-func (s *MarketingService) applyOutcome(ctx context.Context, tx repository.MarketingTx, cur *model.MarketingRound, run *model.MarketingStepRun, out *stepOutcome, status string) error {
-	if status == model.MarketingRunSucceeded && out.apply != nil {
-		if err := out.apply(ctx, tx, cur); err != nil {
-			return err
-		}
-		return s.addWarnings(ctx, tx, cur, out.warnings)
-	}
-	if status != model.MarketingRunSucceeded && run.StepKey == marketing.StepFollow {
-		return s.releaseRewriting(ctx, tx, cur.ID)
-	}
-	return nil
-}
-
-// addWarnings 把警告追加到轮次（去重）。
-func (s *MarketingService) addWarnings(ctx context.Context, tx repository.MarketingTx, round *model.MarketingRound, add []string) error {
-	if len(add) == 0 {
-		return nil
-	}
-	var cur []string
-	_ = json.Unmarshal(round.Warnings, &cur)
-	for _, w := range add {
-		found := false
-		for _, c := range cur {
-			found = found || c == w
-		}
-		if !found {
-			cur = append(cur, w)
-		}
-	}
-	raw, err := json.Marshal(cur)
-	if err != nil {
-		return err
-	}
-	return tx.UpdateRound(ctx, round.ID, map[string]any{"warnings": raw})
-}
-
-// finalizeRound 在所有环节都结束后定轮次终态：有脚本 ready，否则 failed 并带第一个失败环节的原因。
-// 还有排队中或进行中的运行（并发重试新建的）时返回 false，调用方继续执行。
-func (s *MarketingService) finalizeRound(ctx context.Context, roundID uint64) (bool, error) {
-	final := false
-	err := s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		r, err := tx.RoundByID(ctx, roundID, true)
-		if err != nil {
-			return err
-		}
-		if r.Status != model.MarketingRoundScripting {
-			final = true
-			return nil
-		}
-		runs, err := tx.RoundRuns(ctx, roundID)
-		if err != nil {
-			return err
-		}
-		latest := latestRuns(runs)
-		if len(pendingLayer(latest)) > 0 {
-			return nil
-		}
-		scripts, err := tx.RoundScripts(ctx, roundID)
-		if err != nil {
-			return err
-		}
-		final = true
-		fields := map[string]any{"status": model.MarketingRoundReady, "error": ""}
-		if len(scripts) == 0 {
-			fields["status"], fields["error"] = model.MarketingRoundFailed, roundFailure(latest)
-		}
-		return tx.UpdateRound(ctx, roundID, fields)
-	})
-	if err != nil {
-		return false, err
-	}
-	if final {
-		if r, err := s.repo.RoundByID(ctx, roundID, false); err == nil {
-			s.pushRound(ctx, r.UserID, roundID)
-		}
-	}
-	return final, nil
 }
 
 // roundFailure 取轮次失败的原因：事实卡优先，再按环节顺序取第一个失败的；一定带原因。

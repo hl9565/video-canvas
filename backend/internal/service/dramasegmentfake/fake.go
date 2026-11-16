@@ -3,6 +3,7 @@ package dramasegmentfake
 
 import (
 	"context"
+	"math"
 	"slices"
 	"time"
 
@@ -11,20 +12,23 @@ import (
 	"video-canvas/internal/pkg/idcodec"
 	"video-canvas/internal/pkg/ws"
 	"video-canvas/internal/repository"
+	"video-canvas/internal/service"
 )
 
 // Repo 是片段测试的完整依赖，未使用的短剧原语通过嵌入暴露误调用。
 type Repo struct {
 	repository.DramaTx
-	Rows           []model.DramaSegment
-	Tasks          []model.GenerationTask
-	Messages       []ws.Message
-	ProjectDeleted bool
-	Created        *model.CreateGenerationTaskReq
-	IdempotencyKey string
-	CreateError    *model.TaskItemError
-	Err            error
-	SegmentVersion int64
+	Rows            []model.DramaSegment
+	Tasks           []model.GenerationTask
+	Messages        []ws.Message
+	ProjectDeleted  bool
+	Created         *model.CreateGenerationTaskReq
+	IdempotencyKey  string
+	CreateError     *model.TaskItemError
+	Err             error
+	SegmentVersion  int64
+	EditSchema      int16
+	EpisodeRevision int64
 	// Credit 是用户 1 的积分账户（nil 表示没有账户）；Ledger 记录写入的流水
 	Credit *model.UserCredit
 	Ledger []model.CreditLedger
@@ -41,6 +45,7 @@ func (r *Repo) WithTx(_ context.Context, fn func(repository.DramaTx) error) erro
 	}
 	before := slices.Clone(r.Rows)
 	version := r.SegmentVersion
+	schema, revision := r.EditSchema, r.EpisodeRevision
 	ledger := slices.Clone(r.Ledger)
 	var credit *model.UserCredit
 	if r.Credit != nil {
@@ -51,6 +56,7 @@ func (r *Repo) WithTx(_ context.Context, fn func(repository.DramaTx) error) erro
 	if err != nil {
 		r.Rows = before
 		r.SegmentVersion = version
+		r.EditSchema, r.EpisodeRevision = schema, revision
 		r.Ledger, r.Credit = ledger, credit
 	}
 	return err
@@ -72,7 +78,7 @@ func (r *Repo) Episodes(ctx context.Context, userID, id uint64) ([]model.DramaEp
 	if _, err := r.Project(ctx, userID, id, false); err != nil {
 		return nil, err
 	}
-	return []model.DramaEpisode{{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1, LockedAt: func() *time.Time { v := time.Now(); return &v }(), Revision: 1, SegmentVersion: r.SegmentVersion}}, nil
+	return []model.DramaEpisode{{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1, LockedAt: func() *time.Time { v := time.Now(); return &v }(), Revision: max(r.EpisodeRevision, 1), EditSchema: r.EditSchema, SegmentVersion: r.SegmentVersion}}, nil
 }
 
 // SegmentEpisode 校验分集ID与父项目归属。
@@ -125,46 +131,70 @@ func (r *Repo) Segments(ctx context.Context, userID, episodeID uint64) ([]model.
 
 // SaveSegment 插入或CAS更新，原样保留任务与素材。
 func (r *Repo) SaveSegment(ctx context.Context, row *model.DramaSegment, revision int64) error {
-	if _, err := r.SegmentEpisode(ctx, row.UserID, row.EpisodeID); err != nil {
+	changed, err := r.SaveSegmentNoBump(ctx, row, revision)
+	if err != nil || !changed {
 		return err
+	}
+	return r.BumpSegmentVersion(ctx, row.UserID, row.EpisodeID)
+}
+
+// SaveSegmentNoBump 保存片段但不递增 SegmentVersion，返回是否发生实质变更。
+func (r *Repo) SaveSegmentNoBump(ctx context.Context, row *model.DramaSegment, revision int64) (bool, error) {
+	if _, err := r.SegmentEpisode(ctx, row.UserID, row.EpisodeID); err != nil {
+		return false, err
 	}
 	if row.ID == 0 {
 		row.ID, row.CreatedAt, row.UpdatedAt = r.nextID, time.Now(), time.Now()
 		r.nextID++
 		r.Rows = append(r.Rows, *row)
-		r.SegmentVersion++
-		return nil
+		return true, nil
 	}
 	for i := range r.Rows {
 		if r.Rows[i].ID == row.ID && r.Rows[i].UserID == row.UserID && !r.Rows[i].DeletedAt.Valid {
 			if r.Rows[i].Revision != revision {
-				return repository.ErrStateConflict
+				return false, repository.ErrStateConflict
 			}
 			old := r.Rows[i]
-			if old.Seq != row.Seq || !sameChosen(old.ChosenTaskID, row.ChosenTaskID) {
-				r.SegmentVersion++
-			}
+			changed := segmentMaterialChanged(old, *row)
 			row.Revision, row.UpdatedAt = revision+1, time.Now()
 			r.Rows[i] = *row
-			return nil
+			return changed, nil
 		}
 	}
-	return repository.ErrStateConflict
+	return false, repository.ErrStateConflict
 }
 
 // DeleteSegment 软删片段，不动Tasks。
 func (r *Repo) DeleteSegment(ctx context.Context, userID, sid uint64) error {
-	if _, err := r.Segment(ctx, userID, sid, false); err != nil {
+	epID, err := r.DeleteSegmentNoBump(ctx, userID, sid)
+	if err != nil {
 		return err
+	}
+	return r.BumpSegmentVersion(ctx, userID, epID)
+}
+
+// DeleteSegmentNoBump 软删片段但不递增 SegmentVersion，返回所属 episodeID。
+func (r *Repo) DeleteSegmentNoBump(ctx context.Context, userID, sid uint64) (uint64, error) {
+	row, err := r.Segment(ctx, userID, sid, false)
+	if err != nil {
+		return 0, err
 	}
 	for i := range r.Rows {
 		if r.Rows[i].ID == sid {
 			r.Rows[i].DeletedAt.Time, r.Rows[i].DeletedAt.Valid = time.Now(), true
-			r.SegmentVersion++
-			return nil
+			return row.EpisodeID, nil
 		}
 	}
-	return repository.ErrNotFound
+	return 0, repository.ErrNotFound
+}
+
+// BumpSegmentVersion 显式递增假仓储的 SegmentVersion。
+func (r *Repo) BumpSegmentVersion(ctx context.Context, userID, episodeID uint64) error {
+	if _, err := r.SegmentEpisode(ctx, userID, episodeID); err != nil {
+		return err
+	}
+	r.SegmentVersion++
+	return nil
 }
 
 // SegmentTasks 按用户、画布、节点过滤正式任务，并稳定按创建时间和ID排序。
@@ -306,4 +336,59 @@ func (r *Repo) AddCredit(_ context.Context, _ uint64, balance, frozen int) error
 func (r *Repo) InsertLedger(_ context.Context, e *model.CreditLedger) (bool, error) {
 	r.Ledger = append(r.Ledger, *e)
 	return true, nil
+}
+
+// Quote 记录报价参数并返回固定测试报价。
+func (r *Repo) Quote(_ context.Context, _ uint64, req *model.QuoteGenerationTaskReq, _ ...service.QuoteTaskOptions) (*model.TaskQuoteView, error) {
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	return &model.TaskQuoteView{EffectiveInput: req.Input, Credits: 10, QuoteToken: "test-quote", ExpiresAt: time.Now().Add(time.Minute)}, nil
+}
+
+// CheckIdempotentReplay 默认没有幂等重放；真实意图校验由任务服务测试覆盖。
+func (r *Repo) CheckIdempotentReplay(context.Context, uint64, string, *model.CreateGenerationTaskReq) (*model.GenerationTaskView, error) {
+	return nil, nil
+}
+
+// LockEpisodes 返回指定集副本，模拟项目之后的集锁。
+func (r *Repo) LockEpisodes(ctx context.Context, userID uint64, ids []uint64) ([]model.DramaEpisode, error) {
+	rows := []model.DramaEpisode{}
+	for _, id := range ids {
+		ep, err := r.SegmentEpisode(ctx, userID, id)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, *ep)
+	}
+	return rows, nil
+}
+
+// LockSegments 返回指定片段副本，模拟集之后的片段锁。
+func (r *Repo) LockSegments(ctx context.Context, userID uint64, ids []uint64) ([]model.DramaSegment, error) {
+	rows := []model.DramaSegment{}
+	for _, id := range ids {
+		row, err := r.Segment(ctx, userID, id, false)
+		if err != nil {
+			return nil, err
+		}
+		rows = append(rows, *row)
+	}
+	return rows, nil
+}
+
+// SaveEpisode 模拟集级版本校验与精裁标记保存，不额外递增片段版本。
+func (r *Repo) SaveEpisode(_ context.Context, ep *model.DramaEpisode, revision int64) error {
+	if revision != max(r.EpisodeRevision, 1) {
+		return repository.ErrStateConflict
+	}
+	r.EditSchema, r.EpisodeRevision = ep.EditSchema, revision+1
+	ep.Revision = r.EpisodeRevision
+	return nil
+}
+
+// segmentMaterialChanged 判断需要递增集版本的采用、顺序或精裁变更。
+func segmentMaterialChanged(a, b model.DramaSegment) bool {
+	sameOut := a.SourceOutF == nil && b.SourceOutF == nil || a.SourceOutF != nil && b.SourceOutF != nil && *a.SourceOutF == *b.SourceOutF
+	return a.Seq != b.Seq || !sameChosen(a.ChosenTaskID, b.ChosenTaskID) || a.SourceInF != b.SourceInF || !sameOut || a.MuteOriginal != b.MuteOriginal || math.Round(a.AudioGainDB*100) != math.Round(b.AudioGainDB*100) || a.NativeIsDialogue != b.NativeIsDialogue || a.AvPtsOffsetMs != b.AvPtsOffsetMs
 }

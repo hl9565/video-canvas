@@ -59,13 +59,25 @@ export async function submitCanvasTasks(data: CreateTaskRequest): Promise<Create
 /**
  * 提交短剧片段的视频生成任务（node_id = seg:{sid}），任务由后端建在短剧画布下。
  * 幂等键与重试、快照入库、刷新余额和画布节点一样走这里。请求失败会抛错，由调用方就地提示。
+ * 支持在 body 内传 quoteToken / quote_token，或作为第三参数传入 quoteToken。
  * @param sid 片段 id
- * @param body 模型与按 capabilities 组装好的 input
+ * @param body 模型、按 capabilities 组装好的 input 与可选 quoteToken
+ * @param quoteToken 可选服务端报价签名令牌（67029 过期时由调用方刷新后重试）
  * @returns 任务快照
  */
-export async function submitSegmentTask(sid: string, body: SegmentGenerateBody): Promise<TaskView> {
+export async function submitSegmentTask(
+  sid: string,
+  body: SegmentGenerateBody,
+  quoteToken?: string,
+): Promise<TaskView> {
+  const payload: SegmentGenerateBody =
+    quoteToken !== undefined
+      ? "modelId" in body
+        ? { ...body, quoteToken }
+        : { ...body, quote_token: quoteToken }
+      : body;
   const { task } = await submitWithRetry(
-    (key) => generateSegment(sid, body, key),
+    (key) => generateSegment(sid, payload, key),
     crypto.randomUUID(),
   );
   acceptTasks([task]);

@@ -79,6 +79,7 @@ func New(mode, jwtSecret string, h Handlers) *gin.Engine {
 	v1 := r.Group("/api/v1")
 	{
 		// 无需鉴权
+		v1.GET("/dramas/:id/episodes/:no/preview/:ticket/stream", h.Drama.StreamPreview)
 		v1.GET("/auth/config", h.User.Config)
 		v1.POST("/auth/register/code", h.User.SendRegisterCode)
 		v1.POST("/auth/register", h.User.Register)
@@ -238,6 +239,9 @@ func New(mode, jwtSecret string, h Handlers) *gin.Engine {
 		dramas.POST("/:id/episodes", h.Drama.CreateEpisode)
 		dramas.PATCH("/:id/episodes/:no", h.Drama.UpdateEpisode)
 		dramas.DELETE("/:id/episodes/:no", h.Drama.DeleteEpisode)
+		dramas.GET("/:id/episodes/:no/manifest", h.Drama.Manifest)
+		dramas.POST("/:id/episodes/:no/preview", h.Drama.CreatePreview)
+		dramas.GET("/:id/episodes/:no/preview/:ticket", h.Drama.GetPreview)
 		dramas.POST("/:id/estimate", h.Drama.Estimate)
 		dramas.POST("/:id/jobs", h.Drama.CreateJob)
 		dramas.GET("/:id/jobs", h.Drama.ListJobs)
@@ -249,6 +253,7 @@ func New(mode, jwtSecret string, h Handlers) *gin.Engine {
 		segments.PATCH("/:sid", h.DramaSegment.Update)
 		segments.DELETE("/:sid", h.DramaSegment.Delete)
 		segments.POST("/:sid/generate", h.DramaSegment.Generate)
+		segments.POST("/:sid/quote", h.DramaSegment.Quote)
 		segments.POST("/:sid/adapt", h.DramaSegment.Adapt)
 
 		// 管理员后台接口：读与模型相关的写 = admin 或 super_admin；插件与渠道的写 = 仅 super_admin。

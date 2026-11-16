@@ -14,6 +14,8 @@ import (
 
 // DramaTx 短剧业务事务使用的数据库原语。
 type DramaTx interface {
+	// ComposeAsset 按用户读取事务内合成素材元数据，缺失返回 ErrNotFound。
+	ComposeAsset(context.Context, uint64, uint64) (*model.Asset, error)
 	// RecentDramaBatches 读取最近三次成功规划或拆解的范围，不加载原文及快照。
 	RecentDramaBatches(context.Context, uint64, uint64) ([]model.DramaJob, error)
 	// Canvas 在当前事务按用户读取实时资产画布。
@@ -60,6 +62,14 @@ type DramaTx interface {
 	Job(context.Context, uint64, uint64, uint64, bool) (*model.DramaJob, error)
 	// JobByApproval 按用户和审批ID恢复已创建任务，缺失返回ErrNotFound。
 	JobByApproval(context.Context, uint64, uint64) (*model.DramaJob, error)
+	// JobByComposeKey 按用户、短剧与 compose_request_key 查找合成任务，缺失返回 ErrNotFound。
+	JobByComposeKey(context.Context, uint64, uint64, string) (*model.DramaJob, error)
+	// LockProjects 按 id 升序锁定指定短剧项目行（FOR UPDATE）。
+	LockProjects(context.Context, uint64, []uint64) ([]model.DramaProject, error)
+	// LockEpisodes 按 id 升序锁定指定分集行（FOR UPDATE）。
+	LockEpisodes(context.Context, uint64, []uint64) ([]model.DramaEpisode, error)
+	// LockSegments 按 id 升序锁定指定片段行（FOR UPDATE）。
+	LockSegments(context.Context, uint64, []uint64) ([]model.DramaSegment, error)
 	// CreateAsset 在当前事务登记当前用户的合成素材。
 	CreateAsset(context.Context, *model.Asset) error
 	// InsertJob 插入任务并在同一事务入队。
@@ -198,7 +208,7 @@ func (r *DramaRepository) SaveEpisode(ctx context.Context, e *model.DramaEpisode
 	if e.ID == 0 {
 		return r.db.WithContext(ctx).Create(e).Error
 	}
-	res := r.db.WithContext(ctx).Model(&model.DramaEpisode{}).Where("user_id = ? AND drama_id = ? AND id = ? AND revision = ?", e.UserID, e.DramaID, e.ID, revision).Updates(map[string]any{"title": e.Title, "synopsis": e.Synopsis, "hook": e.Hook, "cliffhanger": e.Cliffhanger, "unit_from": e.UnitFrom, "unit_to": e.UnitTo, "script_md": e.ScriptMD, "script_status": e.ScriptStatus, "storyboard_status": e.StoryboardStatus, "locked_at": e.LockedAt, "final_asset_id": e.FinalAssetID, "final_segment_version": e.FinalSegmentVersion, "revision": gorm.Expr("revision + 1"), "updated_at": time.Now()})
+	res := r.db.WithContext(ctx).Model(&model.DramaEpisode{}).Where("user_id = ? AND drama_id = ? AND id = ? AND revision = ?", e.UserID, e.DramaID, e.ID, revision).Updates(map[string]any{"title": e.Title, "synopsis": e.Synopsis, "hook": e.Hook, "cliffhanger": e.Cliffhanger, "unit_from": e.UnitFrom, "unit_to": e.UnitTo, "script_md": e.ScriptMD, "script_status": e.ScriptStatus, "storyboard_status": e.StoryboardStatus, "locked_at": e.LockedAt, "final_asset_id": e.FinalAssetID, "final_segment_version": e.FinalSegmentVersion, "edit_schema": e.EditSchema, "final_compose_job_id": e.FinalComposeJobID, "revision": gorm.Expr("revision + 1"), "updated_at": time.Now()})
 	if res.Error != nil {
 		return res.Error
 	}
@@ -289,7 +299,44 @@ func (r *DramaRepository) JobByApproval(ctx context.Context, userID, approvalID 
 	return &row, translate(err)
 }
 
+// JobByComposeKey 按 (user_id, drama_id, compose_request_key) 精准检索唯一合成任务，缺失返回 ErrNotFound。
+func (r *DramaRepository) JobByComposeKey(ctx context.Context, userID, dramaID uint64, key string) (*model.DramaJob, error) {
+	if key == "" {
+		return nil, ErrNotFound
+	}
+	var row model.DramaJob
+	err := r.db.WithContext(ctx).
+		Where("user_id = ? AND drama_id = ? AND step = 'compose' AND compose_request_key = ?", userID, dramaID, key).
+		First(&row).Error
+	if err != nil {
+		return nil, translate(err)
+	}
+	return &row, nil
+}
+
+// LockProjects 按 id 升序锁定指定短剧项目行（FOR UPDATE）。
+func (r *DramaRepository) LockProjects(ctx context.Context, userID uint64, ids []uint64) ([]model.DramaProject, error) {
+	return lockOwnedByIDs[model.DramaProject](ctx, r.db, userID, ids)
+}
+
+// LockEpisodes 按 id 升序锁定指定分集行（FOR UPDATE）。
+func (r *DramaRepository) LockEpisodes(ctx context.Context, userID uint64, ids []uint64) ([]model.DramaEpisode, error) {
+	return lockOwnedByIDs[model.DramaEpisode](ctx, r.db, userID, ids)
+}
+
+// LockSegments 按 id 升序锁定指定片段行（FOR UPDATE）。
+func (r *DramaRepository) LockSegments(ctx context.Context, userID uint64, ids []uint64) ([]model.DramaSegment, error) {
+	return lockOwnedByIDs[model.DramaSegment](ctx, r.db, userID, ids)
+}
+
 // CreateAsset 在当前事务插入合成素材行，不创建资产库归属。
 func (r *DramaRepository) CreateAsset(ctx context.Context, asset *model.Asset) error {
 	return r.db.WithContext(ctx).Create(asset).Error
+}
+
+// ComposeAsset 按用户读取合成素材元数据，未拥有或已删除返回 ErrNotFound。
+func (r *DramaRepository) ComposeAsset(ctx context.Context, user, id uint64) (*model.Asset, error) {
+	var asset model.Asset
+	err := r.db.WithContext(ctx).Where("user_id = ? AND id = ?", user, id).First(&asset).Error
+	return &asset, translate(err)
 }

@@ -74,7 +74,7 @@ export function StudioArea({
   /** 打开拆解弹窗（和总览、剧本、资产管理共用同一个） */
   onBreakdownOpen: () => void;
 }) {
-  const { drama, jobs, refresh } = useWorkspace();
+  const { drama, jobs, refresh, applyEpisode } = useWorkspace();
   const video = useDramaVideoModel(drama.id, drama.videoModel);
   const starter = useStoryboardStart(video.maxSeconds);
   const episode = drama.episodes.find((item) => item.no === ep) ?? drama.episodes[0];
@@ -101,6 +101,7 @@ export function StudioArea({
         drama={drama}
         no={episode.no}
         refresh={refresh}
+        applyEpisode={applyEpisode}
       />
     );
   }

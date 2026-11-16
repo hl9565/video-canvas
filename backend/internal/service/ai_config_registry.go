@@ -77,6 +77,90 @@ func (s *AIConfigService) Snapshot(ctx context.Context, modelKey string) (*provi
 	return provider.NewSnapshot(m.cfg, m.rt, m.revisionID), nil
 }
 
+// AIConfigTxReader 在持有数据库事务连接时按当前事务查询单模型及其渠道、插件状态。
+type AIConfigTxReader interface {
+	TxPublishedModel(ctx context.Context, key string) (*repository.PublishedModel, error)
+	TxAIChannel(ctx context.Context, key string) (*model.AIChannel, error)
+	TxAIPlugin(ctx context.Context, key string) (*model.AIPlugin, error)
+	TxAIPluginVersions(ctx context.Context, pluginKey string) ([]model.AIPluginVersion, error)
+}
+
+// SnapshotInTx 在持有事务（及信用锁）期间读取模型快照：内存状态未过期直接零 DB I/O 返回；
+// 过期或未加载时若挂载了真实数据库事务读取器，则直接在当前 tx 连接定向查单模型且不获取 regLoadMu，
+// 从根源消除 MaxOpenConns=1 下的连接池自锁以及与外部刷新的 ABBA 死锁。
+func (s *AIConfigService) SnapshotInTx(ctx context.Context, modelKey string, reader AIConfigTxReader) (*provider.Snapshot, error) {
+	s.regMu.RLock()
+	st := s.regState
+	s.regMu.RUnlock()
+	if st != nil && s.now().Sub(st.loadedAt) < s.regTTL {
+		m, ok := st.models[modelKey]
+		if !ok || !m.available() {
+			return nil, provider.ErrModelUnavailable
+		}
+		return provider.NewSnapshot(m.cfg, m.rt, m.revisionID), nil
+	}
+	if _, isDBRepo := s.repo.(*repository.AIConfigRepository); isDBRepo && reader != nil {
+		return snapshotFromTxReader(ctx, modelKey, reader)
+	}
+	return s.Snapshot(ctx, modelKey)
+}
+
+func snapshotFromTxReader(ctx context.Context, modelKey string, reader AIConfigTxReader) (*provider.Snapshot, error) {
+	row, err := reader.TxPublishedModel(ctx, modelKey)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, provider.ErrModelUnavailable
+	}
+	if err != nil {
+		return nil, err
+	}
+	cfg, issues := modelcfg.ParseModel(row.Body)
+	if len(issues) > 0 || cfg == nil || !row.Enabled || len(cfg.Channels) == 0 {
+		return nil, provider.ErrModelUnavailable
+	}
+	ch, err := reader.TxAIChannel(ctx, cfg.Channels[0].Channel)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, provider.ErrModelUnavailable
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !ch.Enabled {
+		return nil, provider.ErrModelUnavailable
+	}
+	deps := &aiRegDeps{
+		channels: map[string]*model.AIChannel{ch.Key: ch},
+		pluginOn: map[string]bool{},
+		versions: map[string]*model.AIPluginVersion{},
+	}
+	if cfg.Kind != modelcfg.KindAgent {
+		proto := cfg.Channels[0].Protocol
+		if proto == nil {
+			return nil, provider.ErrModelUnavailable
+		}
+		p, err := reader.TxAIPlugin(ctx, proto.Plugin)
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, provider.ErrModelUnavailable
+		}
+		if err != nil {
+			return nil, err
+		}
+		deps.pluginOn[proto.Plugin] = p.Enabled
+		vers, err := reader.TxAIPluginVersions(ctx, proto.Plugin)
+		if err != nil {
+			return nil, err
+		}
+		for i := range vers {
+			v := &vers[i]
+			deps.versions[v.PluginKey+"@"+v.Version] = v
+		}
+	}
+	rt := modelRuntime(cfg, deps)
+	if rt == nil {
+		return nil, provider.ErrModelUnavailable
+	}
+	return provider.NewSnapshot(cfg, rt, row.RevisionID), nil
+}
+
 // RefreshRegistry 强制从数据库重新加载已发布模型、渠道与插件版本。发布 / 回滚 / 上下架后本实例立即调用；
 // 插件与渠道的变更由它们的服务调用；多实例时其他实例收到失效广播后也调用它。并发调用是安全的（刷新互斥串行）。
 func (s *AIConfigService) RefreshRegistry(ctx context.Context) error {

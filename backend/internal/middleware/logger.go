@@ -1,6 +1,8 @@
 package middleware
 
 import (
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +23,7 @@ func Logger() gin.HandlerFunc {
 			zap.String("request_id", utils.GetRequestID(c)),
 			zap.String("method", c.Request.Method),
 			zap.String("path", c.Request.URL.Path),
-			zap.String("query", c.Request.URL.RawQuery),
+			zap.String("query", redactQuery(c.Request.URL.RawQuery)),
 			zap.Int("status", status),
 			zap.Duration("latency", time.Since(start)),
 			zap.String("ip", c.ClientIP()),
@@ -43,4 +45,19 @@ func Logger() gin.HandlerFunc {
 			logger.L().Info("http request", fields...)
 		}
 	}
+}
+
+// redactQuery 对异常编码直接隐藏整串，避免解析失败时凭证绕过脱敏。
+func redactQuery(raw string) string {
+	values, err := url.ParseQuery(raw)
+	if err != nil {
+		return "[REDACTED]"
+	}
+	for key := range values {
+		k := strings.ToLower(key)
+		if strings.Contains(k, "token") || strings.Contains(k, "sig") || strings.Contains(k, "secret") || strings.Contains(k, "password") || strings.Contains(k, "credential") || strings.Contains(k, "key") || strings.Contains(k, "auth") {
+			values[key] = []string{"[REDACTED]"}
+		}
+	}
+	return values.Encode()
 }

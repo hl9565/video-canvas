@@ -18,6 +18,7 @@ export function DocEditor({
   value,
   revision,
   editable,
+  canSave,
   onSave,
   isConflict,
   onStatus,
@@ -27,26 +28,38 @@ export function DocEditor({
   /** 服务端当前的 revision */
   revision: number;
   editable: boolean;
+  /** 返回 false 时表示当前实体已失效（如已删集 / 重编号），放弃挂起或卸载时的自动保存 */
+  canSave?: () => boolean;
   /** 保存一版，返回新 revision */
-  onSave: (markdown: string) => Promise<number>;
+  onSave: (markdown: string, revision?: number) => Promise<number>;
   isConflict: (error: unknown) => boolean;
   onStatus: (status: AutosaveStatus) => void;
 }) {
   /** 编辑器重新挂载的版本号：外部内容替换时加一 */
   const [version, setVersion] = useState(0);
   const [initial, setInitial] = useState(value);
-  const latest = useRef({ onSave, isConflict, onStatus });
-  latest.current = { onSave, isConflict, onStatus };
+  const latest = useRef({ onSave, canSave, isConflict, onStatus });
+  latest.current = { onSave, canSave, isConflict, onStatus };
   const lastSaved = useRef(value);
   const [saver] = useState(
     () =>
       new Autosaver({
         revision,
         isConflict: (error) => latest.current.isConflict(error),
-        save: async (markdown) => {
-          const next = await latest.current.onSave(markdown);
-          lastSaved.current = markdown;
-          return next;
+        save: async (markdown, currentRevision) => {
+          if (latest.current.canSave && !latest.current.canSave()) {
+            return currentRevision;
+          }
+          try {
+            const next = await latest.current.onSave(markdown, currentRevision);
+            lastSaved.current = markdown;
+            return next;
+          } catch (error) {
+            if (latest.current.canSave && !latest.current.canSave()) {
+              return currentRevision;
+            }
+            throw error;
+          }
         },
         onStatus: (status) => latest.current.onStatus(status),
       }),
@@ -80,7 +93,20 @@ export function DocEditor({
 
   // 离开时立即保存
   useEffect(() => {
-    const flush = () => void saver.flush();
+    const discardOrFlush = (disposing: boolean) => {
+      if (latest.current.canSave && !latest.current.canSave()) {
+        saver.dispose();
+        if (saver.getStatus() !== "saved") latest.current.onStatus("saved");
+        return;
+      }
+      const flushed = saver.flush();
+      if (disposing) {
+        void flushed.finally(() => saver.dispose());
+      } else {
+        void flushed;
+      }
+    };
+    const flush = () => discardOrFlush(false);
     const onHide = () => {
       if (document.visibilityState === "hidden") flush();
     };
@@ -89,7 +115,7 @@ export function DocEditor({
     return () => {
       document.removeEventListener("visibilitychange", onHide);
       window.removeEventListener("beforeunload", flush);
-      void saver.flush().finally(() => saver.dispose());
+      discardOrFlush(true);
     };
   }, [saver]);
 

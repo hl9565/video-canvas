@@ -233,15 +233,27 @@ func (r *AIConfigRepository) updateModelPointer(ctx context.Context, key string,
 	return nil
 }
 
+func (r *AIConfigRepository) loadModelsQuery(ctx context.Context) *gorm.DB {
+	return r.db.WithContext(ctx).Table("ai_models AS m").
+		Select("m.key AS key, m.kind AS kind, m.enabled AS enabled, m.sort AS sort, " +
+			"r.id AS revision_id, r.revision_no AS revision_no, r.body_json AS body").
+		Joins("JOIN ai_config_revisions AS r ON r.id = m.published_revision_id")
+}
+
 // LoadModels 一次取出所有模型的配置（含未启用的，是否可见由 enabled 决定），按 sort、key 升序。
 func (r *AIConfigRepository) LoadModels(ctx context.Context) ([]PublishedModel, error) {
 	var list []PublishedModel
-	err := r.db.WithContext(ctx).Table("ai_models AS m").
-		Select("m.key AS key, m.kind AS kind, m.enabled AS enabled, m.sort AS sort, " +
-			"r.id AS revision_id, r.revision_no AS revision_no, r.body_json AS body").
-		Joins("JOIN ai_config_revisions AS r ON r.id = m.published_revision_id").
-		Order("m.sort ASC, m.key ASC").Scan(&list).Error
+	err := r.loadModelsQuery(ctx).Order("m.sort ASC, m.key ASC").Scan(&list).Error
 	return list, err
+}
+
+// LoadModel 按 key 取出单个已发布模型的配置，供事务内定向校价使用；不存在或尚未发布返回 ErrNotFound。
+func (r *AIConfigRepository) LoadModel(ctx context.Context, key string) (*PublishedModel, error) {
+	var row PublishedModel
+	if err := r.loadModelsQuery(ctx).Where("m.key = ?", key).Take(&row).Error; err != nil {
+		return nil, translate(err)
+	}
+	return &row, nil
 }
 
 // UpsertSecret 写入或覆盖凭证密文（只写；按 name 冲突更新）。

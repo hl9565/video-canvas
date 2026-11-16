@@ -163,7 +163,12 @@ func (s *MarketingService) UpdateProject(ctx context.Context, userID, id uint64,
 	if len(fields) == 0 {
 		return nil, errcode.ErrInvalidParams.WithMsg("没有要修改的内容")
 	}
-	err := s.repo.WithTx(ctx, func(tx repository.MarketingTx) error { return tx.SaveProject(ctx, userID, id, req.Revision, fields) })
+	err := s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
+		if _, err := tx.Project(ctx, userID, id, true); err != nil {
+			return marketingPublicError(err)
+		}
+		return tx.SaveProject(ctx, userID, id, req.Revision, fields)
+	})
 	switch {
 	case mktNotFound(err):
 		return nil, errcode.ErrMarketingNotFound

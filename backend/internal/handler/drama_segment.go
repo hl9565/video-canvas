@@ -135,6 +135,24 @@ func (h *DramaSegmentHandler) Generate(c *gin.Context) {
 	response.Accepted(c, gin.H{"task": task})
 }
 
+// Quote 返回绑定片段版本的报价，不创建任务或冻结积分。
+func (h *DramaSegmentHandler) Quote(c *gin.Context) {
+	sid, ok := dramaSegmentPath(c)
+	if !ok {
+		return
+	}
+	var req model.GenerateDramaSegmentReq
+	if !BindJSON(c, &req) {
+		return
+	}
+	quote, err := h.svc.Quote(c.Request.Context(), currentUserID(c), sid, &req)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, quote)
+}
+
 // dramaSegmentPath 校验并解码片段路径ID，非法编码统一为参数错误。
 func dramaSegmentPath(c *gin.Context) (uint64, bool) {
 	sid, ok := idcodec.Decode(c.Param("sid"))

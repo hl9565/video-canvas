@@ -22,6 +22,15 @@ const aiRedactMask = "***"
 
 type testRunKey struct{}
 
+type testRunRawInput struct{}
+
+type testRunReplayChecker interface {
+	ReplayTestRun(ctx context.Context, userID uint64, key, modelKey string, rawInput map[string]any) (*model.GenerationTaskView, error)
+}
+
+// TestRunKeyForTest 暴露试跑幂等上下文键，仅用于同仓库服务层单元测试覆盖 SubmitTest。
+func TestRunKeyForTest() any { return testRunKey{} }
+
 // TestRunIdempotent 以审批标识调用原有试跑；崩溃恢复和并发决定只创建一次任务。
 func (s *AIConfigService) TestRunIdempotent(ctx context.Context, adminID uint64, modelKey string, input map[string]any, key string) (*model.GenerationTaskView, error) {
 	// 1. 幂等键只在 Go 服务内传递，不接受模型或前端指定任务归属。
@@ -67,22 +76,35 @@ func (s *AIConfigService) TestRun(ctx context.Context, adminID uint64, modelKey 
 	if s.testTasks == nil {
 		return nil, errcode.ErrInternal.WithMsg("试跑功能未启用")
 	}
-	// 2. 组装试跑快照
+	// 2. 在注入模型默认参数之前深拷贝调用方原始输入意图；带幂等键重放先核对已创建试跑任务，
+	//    不依赖当前实时配置/密钥/枚举是否仍然有效或存在。
+	rawInput := cloneTrialRawInput(input)
+	if key, _ := ctx.Value(testRunKey{}).(string); key != "" {
+		if checker, ok := s.testTasks.(testRunReplayChecker); ok {
+			hit, err := checker.ReplayTestRun(ctx, adminID, key, modelKey, rawInput)
+			if err != nil {
+				return nil, err
+			}
+			if hit != nil {
+				return hit, nil
+			}
+		}
+	}
+	// 3. 仅历史未命中时组装实时试跑快照与校验
 	snap, err := s.buildTrialSnapshot(ctx, modelKey)
 	if err != nil {
 		return nil, err
 	}
-	// 3. 插件需要鉴权时渠道 Key 必须已设置：试跑会真实调用上游，提前拦下比创建一个必然失败的任务更清楚
+	// 4. 插件需要鉴权时渠道 Key 必须已设置：试跑会真实调用上游，提前拦下比创建一个必然失败的任务更清楚
 	if err := s.checkSnapshotSecret(ctx, snap); err != nil {
 		return nil, err
 	}
-	// 4. 校验并规范化输入
 	normalized, err := aiNormalizeTrialInput(snap, input)
 	if err != nil {
 		return nil, err
 	}
 	// 5. 创建试跑任务；任务服务负责 is_test 标记、不扣积分、不推送
-	view, err := s.testTasks.SubmitTest(ctx, adminID, snap, normalized)
+	view, err := s.testTasks.SubmitTest(context.WithValue(ctx, testRunRawInput{}, rawInput), adminID, snap, normalized)
 	if err != nil {
 		return nil, err
 	}
@@ -221,4 +243,19 @@ func aiRedactString(text string, secrets []string) string {
 		}
 	}
 	return text
+}
+
+func cloneTrialRawInput(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return map[string]any{}
+	}
+	b, err := json.Marshal(input)
+	if err != nil {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil || out == nil {
+		return map[string]any{}
+	}
+	return out
 }

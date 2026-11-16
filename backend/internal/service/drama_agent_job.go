@@ -2,7 +2,6 @@ package service
 
 import (
 	"context"
-	"errors"
 
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
@@ -20,25 +19,31 @@ func (s *DramaService) CreateAgentJob(ctx context.Context, userID, dramaID, appr
 }
 
 // approvedDramaJob 在项目锁下恢复原审批任务，跨项目复用审批ID按不存在处理。
-func (s *DramaService) approvedDramaJob(ctx context.Context, userID, dramaID, approvalID uint64) (*model.DramaJobView, error) {
+func (s *DramaService) approvedDramaJob(ctx context.Context, userID, dramaID uint64, intent *dramaJobIntent) (*model.DramaJobView, error) {
+	if intent.approvalID == nil && intent.req.ComposeRequestKey == "" {
+		return nil, nil
+	}
 	var result *model.DramaJobView
 	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
 		if _, err := tx.Project(ctx, userID, dramaID, true); err != nil {
 			return err
 		}
-		job, err := tx.JobByApproval(ctx, userID, approvalID)
-		if errors.Is(err, repository.ErrNotFound) {
-			return nil
-		}
-		if err != nil {
+		job, err := resolveDramaJobIntent(ctx, tx, userID, dramaID, intent)
+		if err != nil || job == nil {
 			return err
-		}
-		if job.DramaID != dramaID {
-			return errcode.ErrDramaNotFound
 		}
 		view := jobView(*job)
 		result = &view
 		return nil
 	})
 	return result, dramaError(err)
+}
+
+// recoverDramaJob 唯一键竞争失败后重新查赢家；不得把不同请求的任务当作成功响应。
+func (s *DramaService) recoverDramaJob(ctx context.Context, user, id uint64, intent *dramaJobIntent) (*model.DramaJobView, error) {
+	view, err := s.approvedDramaJob(ctx, user, id, intent)
+	if err != nil || view != nil {
+		return view, err
+	}
+	return nil, errcode.ErrDramaJobBusy
 }

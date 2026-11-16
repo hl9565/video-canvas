@@ -12,7 +12,6 @@ import (
 	"video-canvas/internal/drama"
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
-	"video-canvas/internal/pkg/idcodec"
 	"video-canvas/internal/provider/modelcfg"
 	"video-canvas/internal/repository"
 )
@@ -40,45 +39,6 @@ func checkDramaMediaTasks(ctx context.Context, tx repository.DramaTx, p *model.D
 		}
 	}
 	return nil
-}
-
-// guardDramaGeneration 在生成任务自身事务里锁短剧项目，防止两个片段同时穿透预检查。
-func guardDramaGeneration(ctx context.Context, tx repository.GenerationTaskTx, task *model.GenerationTask) error {
-	if task.IsTest || !strings.HasPrefix(task.NodeID, "seg:") {
-		return nil
-	}
-	adapter, ok := tx.(interface{ DramaTx() repository.DramaTx })
-	if !ok {
-		return errcode.ErrInternal
-	}
-	dtx := adapter.DramaTx()
-	sid, ok := idcodec.Decode(strings.TrimPrefix(task.NodeID, "seg:"))
-	if !ok {
-		return errcode.ErrInvalidParams
-	}
-	p, ep, row, err := lockSegment(ctx, dtx, task.UserID, sid)
-	if err != nil {
-		return segmentError(err)
-	}
-	if task.CanvasProjectID == nil || *task.CanvasProjectID != p.CanvasID || task.Kind != model.KindVideo {
-		return errcode.ErrInvalidParams
-	}
-	if len(task.InputJSON) > 0 {
-		var in map[string]any
-		if err := json.Unmarshal(task.InputJSON, &in); err == nil {
-			if err := checkSegmentTimeline(in, row.Seconds); err != nil {
-				return err
-			}
-		}
-	}
-	jobs, err := dtx.Jobs(ctx, p.UserID, p.ID, true)
-	if err != nil {
-		return err
-	}
-	if dramaJobsConflict(jobs, &model.DramaJobReq{Step: "segment", Episodes: []int{ep.No}}) {
-		return errcode.ErrDramaJobBusy
-	}
-	return checkDramaMediaTasks(ctx, dtx, p, []model.DramaEpisode{*ep}, task.IdempotencyKey)
 }
 
 func hasSegmentNode(nodes []string) bool {

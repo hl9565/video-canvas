@@ -11,15 +11,23 @@ import (
 )
 
 type Config struct {
-	Server   Server   `mapstructure:"server"`
-	Log      Log      `mapstructure:"log"`
-	Database Database `mapstructure:"database"`
-	Redis    Redis    `mapstructure:"redis"`
-	JWT      JWT      `mapstructure:"jwt"`
-	AI       AI       `mapstructure:"ai"`
-	Storage  Storage  `mapstructure:"storage"`
-	Agent    Agent    `mapstructure:"agent"`
-	Update   Update   `mapstructure:"update"`
+	Server    Server          `mapstructure:"server"`
+	Log       Log             `mapstructure:"log"`
+	Database  Database        `mapstructure:"database"`
+	Redis     Redis           `mapstructure:"redis"`
+	JWT       JWT             `mapstructure:"jwt"`
+	AI        AI              `mapstructure:"ai"`
+	Storage   Storage         `mapstructure:"storage"`
+	Agent     Agent           `mapstructure:"agent"`
+	Update    Update          `mapstructure:"update"`
+	Marketing MarketingConfig `mapstructure:"marketing"`
+}
+
+// MarketingConfig 控制营销运行恢复的运维开关。
+type MarketingConfig struct {
+	// LegacyDrainCompleted 仅在确认 0035 之前旧消费者已停领、在途调用已结算并全部退出后开启，
+	// 才允许回收 exec_token='' 且 lease_until IS NULL 的历史遗留运行并解冻积分（默认 false）。
+	LegacyDrainCompleted bool `mapstructure:"legacy_drain_completed"`
 }
 
 // DefaultUpdateRepo 是检查新版本用的 GitHub 仓库。
@@ -253,6 +261,7 @@ func Load(path string) (*Config, error) {
 	// 否则升级时无法把它们导入为后台存储
 	for _, key := range []string{
 		"server.id_key", "database.allow_newer_schema", "update.updater_token", "ai.secret_key", "ai.allow_fake_ip", "storage.driver",
+		"marketing.legacy_drain_completed",
 		"agent.enabled", "agent.url", "agent.bridge_url", "agent.bridge_addr", "agent.service_token", "agent.web_enabled", "agent.searxng_url", "agent.disabled_tools",
 		"storage.s3.endpoint", "storage.s3.region", "storage.s3.bucket", "storage.s3.access_key", "storage.s3.secret_key",
 		"storage.s3.use_ssl", "storage.s3.public_base_url", "storage.s3.path_prefix",

@@ -23,6 +23,10 @@ type MarketingTx interface {
 	InsertProject(ctx context.Context, p *model.MarketingProject) error
 	// Project 按用户读取存活项目，lock 为真时加行锁（串行化同一项目的写请求）。
 	Project(ctx context.Context, userID, id uint64, lock bool) (*model.MarketingProject, error)
+	// ProjectUnscopedLock 仅限后台定态/恢复路径按可信双键 (user_id, project_id) 锁定可能已软删的项目。
+	ProjectUnscopedLock(ctx context.Context, userID, projectID uint64) (*model.MarketingProject, error)
+	// LockProjects 按 id 升序锁定指定存活营销项目（FOR UPDATE）。
+	LockProjects(ctx context.Context, userID uint64, ids []uint64) ([]model.MarketingProject, error)
 	// ProjectByID 按 id 读取存活项目，不限用户（任务回调、环节运行用），不存在返回 ErrNotFound。
 	ProjectByID(ctx context.Context, id uint64) (*model.MarketingProject, error)
 	// SaveProject 按 revision 乐观锁更新项目的可变列并让 revision+1，冲突返回 ErrRevisionConflict。
@@ -37,6 +41,8 @@ type MarketingTx interface {
 	Round(ctx context.Context, userID, id uint64, lock bool) (*model.MarketingRound, error)
 	// RoundByID 按 id 读取轮次，不限用户（队列 job 入口用）。
 	RoundByID(ctx context.Context, id uint64, lock bool) (*model.MarketingRound, error)
+	// LockRounds 按 id 升序锁定指定轮次行（FOR UPDATE）。
+	LockRounds(ctx context.Context, userID uint64, ids []uint64) ([]model.MarketingRound, error)
 	// ProjectRounds 返回项目的全部轮次，新的在前。
 	ProjectRounds(ctx context.Context, userID, projectID uint64) ([]model.MarketingRound, error)
 	// UpdateRound 更新轮次的列。
@@ -53,6 +59,14 @@ type MarketingTx interface {
 	UpdateRun(ctx context.Context, id uint64, fields map[string]any) error
 	// UpdateRunIf 在运行状态属于 from 时更新，没命中返回 ErrStateConflict。
 	UpdateRunIf(ctx context.Context, id uint64, from []string, fields map[string]any) error
+	// ClaimStepRun 原子从 queued 抢占为 running，并写入 exec_token 与 lease_until。
+	ClaimStepRun(ctx context.Context, runID, roundID uint64, expectedGen int64, execToken string, leaseUntil time.Time) (bool, error)
+	// HeartbeatStepRun 仅凭匹配的 exec_token 续约正在运行环节的租约。
+	HeartbeatStepRun(ctx context.Context, runID uint64, execToken string, leaseUntil time.Time) (bool, error)
+	// ReclaimExpiredStepRun 原子回收匹配令牌且已失活的运行，未命中返回false；NULL旧租约须排空确认。
+	ReclaimExpiredStepRun(ctx context.Context, runID uint64, token string, now time.Time, legacyDrain bool) (bool, error)
+	// MarkRoundRunsCancelRequested 为轮次中正在运行的环节打上 cancel_requested 标记。
+	MarkRoundRunsCancelRequested(ctx context.Context, roundID uint64) error
 	// InsertScripts 批量插入脚本。
 	InsertScripts(ctx context.Context, rows []model.MarketingScript) error
 	// Script 按用户读取脚本，lock 为真时加行锁。
@@ -61,6 +75,8 @@ type MarketingTx interface {
 	ScriptByID(ctx context.Context, id uint64) (*model.MarketingScript, error)
 	// RoundScripts 返回轮次的脚本，按 seq。
 	RoundScripts(ctx context.Context, roundIDs ...uint64) ([]model.MarketingScript, error)
+	// LockScripts 按 id 升序锁定指定脚本行（FOR UPDATE）。
+	LockScripts(ctx context.Context, userID uint64, ids []uint64) ([]model.MarketingScript, error)
 	// SaveScript 按 revision 乐观锁更新脚本的可变列并让 revision+1，冲突返回 ErrRevisionConflict。
 	SaveScript(ctx context.Context, userID, id uint64, revision int64, fields map[string]any) error
 	// UpdateScript 更新脚本的列，不动 revision（状态、任务列表的对账写回）。
@@ -127,6 +143,25 @@ func (r *MarketingRepository) Project(ctx context.Context, userID, id uint64, lo
 		return nil, translate(err)
 	}
 	return &p, nil
+}
+
+// ProjectUnscopedLock 仅限后台定态/恢复路径按可信双键 (user_id, project_id) 锁定可能已软删的项目。
+func (r *MarketingRepository) ProjectUnscopedLock(ctx context.Context, userID, projectID uint64) (*model.MarketingProject, error) {
+	var p model.MarketingProject
+	err := r.db.WithContext(ctx).
+		Unscoped().
+		Clauses(clause.Locking{Strength: "UPDATE"}).
+		Where("user_id = ? AND id = ?", userID, projectID).
+		Take(&p).Error
+	if err != nil {
+		return nil, translate(err)
+	}
+	return &p, nil
+}
+
+// LockProjects 按 id 升序锁定指定存活营销项目（FOR UPDATE）。
+func (r *MarketingRepository) LockProjects(ctx context.Context, userID uint64, ids []uint64) ([]model.MarketingProject, error) {
+	return lockOwnedByIDs[model.MarketingProject](ctx, r.db, userID, ids)
 }
 
 // ProjectByID 见 MarketingTx。
@@ -554,3 +589,13 @@ func jsonFields(fields map[string]any) map[string]any {
 
 // Add 返回「列 + n」的更新表达式，给更新列用（计数类字段原子累加，不读后写）。col 只能是代码里的常量列名。
 func Add(col string, n int) any { return gorm.Expr(col+" + ?", n) }
+
+// LockRounds 按 id 升序锁定指定轮次行（FOR UPDATE）。
+func (r *MarketingRepository) LockRounds(ctx context.Context, userID uint64, ids []uint64) ([]model.MarketingRound, error) {
+	return lockOwnedByIDs[model.MarketingRound](ctx, r.db, userID, ids)
+}
+
+// LockScripts 按 id 升序锁定指定脚本行（FOR UPDATE）。
+func (r *MarketingRepository) LockScripts(ctx context.Context, userID uint64, ids []uint64) ([]model.MarketingScript, error) {
+	return lockOwnedByIDs[model.MarketingScript](ctx, r.db, userID, ids)
+}

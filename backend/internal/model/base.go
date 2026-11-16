@@ -80,5 +80,6 @@ func All() []any {
 		&MarketingRound{},
 		&MarketingStepRun{},
 		&MarketingScript{},
+		&AssetMediaProbe{},
 	}
 }

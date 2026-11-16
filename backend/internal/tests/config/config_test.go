@@ -261,3 +261,21 @@ func TestLoad_RemovedAgentSettingsAreIgnored(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_MarketingLegacyDrainCompletedDefaultsFalse(t *testing.T) {
+	cfg, err := Load("../../../configs/config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Marketing.LegacyDrainCompleted {
+		t.Fatal("默认配置必须关闭 marketing.legacy_drain_completed")
+	}
+	t.Setenv("APP_MARKETING_LEGACY_DRAIN_COMPLETED", "true")
+	cfg, err = Load("../../../configs/config.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Marketing.LegacyDrainCompleted {
+		t.Fatal("环境变量 APP_MARKETING_LEGACY_DRAIN_COMPLETED=true 应能生效")
+	}
+}

@@ -113,14 +113,19 @@ func (r *UserRepository) CreateCredit(ctx context.Context, userID uint64, initia
 
 // insertInitialCredit 在 db（事务或普通连接）上插入积分账户，真正插入了新行才写 initial 流水：
 // 保证“有账户就有且仅有一条 initial 流水”，老用户惰性建账户与注册共用这一处。
+// ensureInitialCredit 在调用方提供的 db/tx 上直接扁平开户并写入 initial 流水，不开嵌套 Transaction/SAVEPOINT。
+func ensureInitialCredit(ctx context.Context, db *gorm.DB, userID uint64, initial int) error {
+	acc := &model.UserCredit{UserID: userID, Balance: initial, UpdatedAt: time.Now()}
+	res := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(acc)
+	if res.Error != nil || res.RowsAffected == 0 {
+		return res.Error
+	}
+	return db.WithContext(ctx).Create(&model.CreditLedger{UserID: userID, Type: model.LedgerInitial, Amount: initial}).Error
+}
+
 func insertInitialCredit(ctx context.Context, db *gorm.DB, userID uint64, initial int) error {
 	return db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		acc := &model.UserCredit{UserID: userID, Balance: initial, UpdatedAt: time.Now()}
-		res := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(acc)
-		if res.Error != nil || res.RowsAffected == 0 {
-			return res.Error
-		}
-		return tx.Create(&model.CreditLedger{UserID: userID, Type: model.LedgerInitial, Amount: initial}).Error
+		return ensureInitialCredit(ctx, tx, userID, initial)
 	})
 }
 

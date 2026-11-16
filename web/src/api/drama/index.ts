@@ -2,27 +2,41 @@ import { mapAsset } from "@/api/asset";
 import service from "@/utils/requests/service";
 
 import type {
-  BackendDramaStyles,
-  BackendDramaSummary,
-  BackendDramaView,
-  BackendEpisodeSummary,
-  BackendEpisodeView,
-  BackendJobView,
-  BackendSegmentView,
   AdaptFormat,
   AdaptSegmentInput,
   AddSegmentInput,
+  BackendComposeExport,
+  BackendDramaManifestClip,
+  BackendDramaManifestView,
+  BackendDramaStyles,
+  BackendDramaSummary,
+  BackendDramaView,
+  BackendEpisodePreviewView,
+  BackendEpisodeSummary,
+  BackendEpisodeView,
+  BackendJobView,
+  BackendSegmentEdit,
+  BackendSegmentGenerateBody,
+  BackendSegmentView,
   BackendSourcePreflight,
+  BackendTaskQuote,
   CreateDramaInput,
+  CreateEpisodePreviewInput,
   Drama,
+  DramaComposeExport,
+  DramaComposeInput,
   DramaJob,
   DramaJobInput,
+  DramaEpisodeManifest,
+  DramaManifestClip,
+  DramaManifestView,
   DramaPage,
   DramaSkill,
   DramaStyles,
   DramaSummary,
   DramaUnit,
   Episode,
+  EpisodePreviewView,
   EpisodeSummary,
   JobEstimate,
   MyPrompt,
@@ -32,11 +46,15 @@ import type {
   PromptStep,
   PromptTemplate,
   Segment,
+  SegmentEdit,
+  SegmentEditPatch,
   SegmentGenerateBody,
   SegmentGenerateResult,
+  SegmentQuoteInput,
   SourceEstimate,
   SourceEstimateInput,
   SourcePreflight,
+  TaskQuote,
   UpdateDramaInput,
   UpdateEpisodeInput,
   UpdateSegmentInput,
@@ -54,6 +72,7 @@ export const mapDramaSummary = (raw: BackendDramaSummary): DramaSummary => ({
 });
 
 export const mapEpisodeSummary = (raw: BackendEpisodeSummary): EpisodeSummary => ({
+  ...(raw.id ? { id: String(raw.id) } : {}),
   no: raw.no,
   title: raw.title,
   synopsis: raw.synopsis ?? "",
@@ -71,11 +90,31 @@ export const mapEpisodeSummary = (raw: BackendEpisodeSummary): EpisodeSummary =>
   cliffhanger: raw.cliffhanger ?? "",
   unitFrom: raw.unit_from ? raw.unit_from : null,
   unitTo: raw.unit_to ? raw.unit_to : null,
+  ...(typeof raw.segment_version === "number" ? { segmentVersion: raw.segment_version } : {}),
+  ...(typeof raw.edit_schema === "number" ? { editSchema: raw.edit_schema } : {}),
+  ...(raw.final_compose_job_id !== undefined
+    ? {
+        finalComposeJobId:
+          raw.final_compose_job_id !== null && raw.final_compose_job_id !== ""
+            ? String(raw.final_compose_job_id)
+            : null,
+      }
+    : {}),
 });
 
 export const mapEpisode = (raw: BackendEpisodeView): Episode => ({
   ...mapEpisodeSummary(raw),
   scriptMd: raw.script_md ?? "",
+});
+
+const mapComposeExport = (raw: BackendComposeExport): DramaComposeExport => ({
+  sha256: raw.sha256,
+  variant: raw.variant,
+  size: raw.size,
+  width: raw.width,
+  height: raw.height,
+  manifestHash: raw.manifest_hash,
+  asset: mapAsset(raw.asset),
 });
 
 export const mapJob = (raw: BackendJobView): DramaJob => ({
@@ -90,7 +129,11 @@ export const mapJob = (raw: BackendJobView): DramaJob => ({
   createdAt: raw.created_at,
   finishedAt: raw.finished_at ?? null,
   result: raw.result
-    ? { asset: mapAsset(raw.result.asset), skippedSeqs: raw.result.skipped_seqs ?? [] }
+    ? {
+        asset: mapAsset(raw.result.asset),
+        skippedSeqs: raw.result.skipped_seqs ?? [],
+        exports: (raw.result.exports ?? []).map(mapComposeExport),
+      }
     : null,
   lane: raw.lane ?? "user",
   batchFrom: raw.batch_from ? raw.batch_from : null,
@@ -150,9 +193,40 @@ export const mapStyles = (raw: BackendDramaStyles): DramaStyles => ({
   styles: raw.styles ?? [],
 });
 
+/** 默认逐镜精裁与原声参数（0 起、EOF、未静音、0dB、非对白、0ms 偏移） */
+export const DEFAULT_SEGMENT_EDIT: SegmentEdit = {
+  sourceInF: 0,
+  sourceOutF: null,
+  muteOriginal: false,
+  audioGainDb: 0,
+  nativeIsDialogue: false,
+  avPtsOffsetMs: 0,
+};
+
+export const mapSegmentEdit = (raw?: Partial<BackendSegmentEdit> | null): SegmentEdit => ({
+  sourceInF:
+    typeof raw?.source_in_f === "number" ? raw.source_in_f : DEFAULT_SEGMENT_EDIT.sourceInF,
+  sourceOutF: typeof raw?.source_out_f === "number" ? raw.source_out_f : null,
+  muteOriginal: raw?.mute_original ?? DEFAULT_SEGMENT_EDIT.muteOriginal,
+  audioGainDb:
+    typeof raw?.audio_gain_db === "number" ? raw.audio_gain_db : DEFAULT_SEGMENT_EDIT.audioGainDb,
+  nativeIsDialogue: raw?.native_is_dialogue ?? DEFAULT_SEGMENT_EDIT.nativeIsDialogue,
+  avPtsOffsetMs:
+    typeof raw?.av_pts_offset_ms === "number"
+      ? raw.av_pts_offset_ms
+      : DEFAULT_SEGMENT_EDIT.avPtsOffsetMs,
+});
+
+/** 读取片段编辑配置，未带 edit 的老片段 / 测试夹具补齐默认值 */
+export const segmentEditOf = (segment?: Pick<Segment, "edit"> | null): SegmentEdit => ({
+  ...DEFAULT_SEGMENT_EDIT,
+  ...(segment?.edit ?? {}),
+});
+
 /** 片段（契约 §9.2）：takes 可能为 null，task_id 兼容数字 */
 export const mapSegment = (raw: BackendSegmentView): Segment => ({
   id: String(raw.id),
+  ...(raw.episode_id ? { episodeId: String(raw.episode_id) } : {}),
   episodeNo: raw.episode_no,
   seq: raw.seq,
   seconds: raw.seconds,
@@ -165,8 +239,12 @@ export const mapSegment = (raw: BackendSegmentView): Segment => ({
     createdAt: take.created_at,
   })),
   chosenTaskId: raw.chosen_task_id ? String(raw.chosen_task_id) : "",
+  sourceFrameCount: typeof raw.source_frame_count === "number" ? raw.source_frame_count : null,
+  ...(typeof raw.has_audio === "boolean" ? { hasAudio: raw.has_audio } : {}),
+  edit: mapSegmentEdit(raw.edit),
   status: raw.status,
   revision: raw.revision,
+  ...(typeof raw.segment_version === "number" ? { segmentVersion: raw.segment_version } : {}),
   updatedAt: raw.updated_at,
   adaptations: mapAdaptations(raw.adaptations),
 });
@@ -248,12 +326,24 @@ export const toUpdateDramaBody = (input: UpdateDramaInput) =>
 export const toUpdateEpisodeBody = (input: UpdateEpisodeInput) =>
   compact({
     revision: input.revision,
+    expected_episode_id: input.expectedEpisodeId,
     title: input.title,
     synopsis: input.synopsis,
     script_md: input.scriptMd,
     hook: input.hook,
     cliffhanger: input.cliffhanger,
   });
+
+const toComposeBody = (compose?: DramaComposeInput) => {
+  if (!compose) return undefined;
+  const body = compact({
+    segment_version: compose.segmentVersion,
+    manifest_hash: compose.manifestHash || undefined,
+    size: compose.size,
+    variants: compose.variants && compose.variants.length > 0 ? compose.variants : undefined,
+  });
+  return Object.keys(body).length > 0 ? body : undefined;
+};
 
 /** 估价 / 提交任务的请求体 */
 export const toJobBody = (input: DramaJobInput) =>
@@ -262,7 +352,24 @@ export const toJobBody = (input: DramaJobInput) =>
     episodes: input.episodes,
     ratio: input.ratio || undefined,
     max_seconds: input.step === "storyboard" ? input.maxSeconds : undefined,
+    compose: input.step === "compose" ? toComposeBody(input.compose) : undefined,
+    compose_request_key:
+      input.step === "compose" ? input.composeRequestKey || undefined : undefined,
   });
+
+const toSegmentEditPatchBody = (edit?: SegmentEditPatch) => {
+  if (!edit) return undefined;
+  const body = compact({
+    source_in_f: edit.sourceInF,
+    // source_out_f: null 是显式“恢复片尾 EOF”语义，不能被剥掉
+    source_out_f: edit.sourceOutF === undefined ? undefined : edit.sourceOutF,
+    mute_original: edit.muteOriginal,
+    audio_gain_db: edit.audioGainDb,
+    native_is_dialogue: edit.nativeIsDialogue,
+    av_pts_offset_ms: edit.avPtsOffsetMs,
+  });
+  return Object.keys(body).length > 0 ? body : undefined;
+};
 
 /** PATCH /drama-segments/:sid 请求体 */
 export const toSegmentUpdateBody = (input: UpdateSegmentInput) =>
@@ -271,6 +378,15 @@ export const toSegmentUpdateBody = (input: UpdateSegmentInput) =>
     prompt: input.prompt,
     seconds: input.seconds,
     chosen_task_id: input.chosenTaskId,
+    // expected_task_id === null 转为 ""，因为后端 *idcodec.ID 只有 "" 会解码成 0
+    expected_task_id:
+      input.expectedTaskId === undefined
+        ? undefined
+        : input.expectedTaskId === null
+          ? ""
+          : input.expectedTaskId,
+    reset_edit_on_task_change: input.resetEditOnTaskChange,
+    edit: toSegmentEditPatchBody(input.edit),
     adaptation: input.adaptation,
   });
 
@@ -461,6 +577,16 @@ export const submitJob = async (id: string, input: DramaJobInput): Promise<Drama
     await service.post<BackendJobView>(`/dramas/${id}/jobs`, toJobBody(input), { silent: true }),
   );
 
+/** 全量合成 / 生产任务列表，用于按 final_compose_job_id 精确还原成片资产 */
+export const listJobs = async (id: string): Promise<DramaJob[]> => {
+  const res = await service.get<{ items: BackendJobView[] | null }>(
+    `/dramas/${id}/jobs`,
+    undefined,
+    { silent: true },
+  );
+  return (res?.items ?? []).map(mapJob);
+};
+
 /** 进行中（queued / running）的任务，挂载与重连时对账用 */
 export const listActiveJobs = async (id: string): Promise<DramaJob[]> => {
   const res = await service.get<{ items: BackendJobView[] | null }>(
@@ -537,15 +663,150 @@ export const reorderSegments = async (
   return (res.items ?? []).map(mapSegment);
 };
 
+export const mapTaskQuote = (raw: BackendTaskQuote): TaskQuote => ({
+  effectiveInput: raw.effective_input ?? {},
+  rawSize: raw.raw_size ?? "",
+  credits: raw.credits,
+  priceFingerprint: raw.price_fingerprint ?? "",
+  quoteToken: raw.quote_token ?? "",
+  expiresAt: raw.expires_at,
+});
+
+/** 生成前报价：返回有效参数、真实请求尺寸、积分与短期签名 quoteToken */
+export const quoteSegment = async (sid: string, input: SegmentQuoteInput): Promise<TaskQuote> =>
+  mapTaskQuote(
+    await service.post<BackendTaskQuote>(
+      `/drama-segments/${sid}/quote`,
+      { model_id: input.modelId, input: input.input },
+      { silent: true },
+    ),
+  );
+
+export const toSegmentGenerateBody = (body: SegmentGenerateBody): BackendSegmentGenerateBody =>
+  compact({
+    model_id: "modelId" in body ? body.modelId : body.model_id,
+    input: body.input,
+    quote_token:
+      ("quoteToken" in body
+        ? body.quoteToken
+        : "quote_token" in body
+          ? body.quote_token
+          : undefined) || undefined,
+  }) as BackendSegmentGenerateBody;
+
 /** 提交片段的视频生成（202）；统一经 utils/tasks/gateway.ts 调用，那里管幂等键与重试 */
 export const generateSegment = (
   sid: string,
   body: SegmentGenerateBody,
   idempotencyKey: string,
 ): Promise<SegmentGenerateResult> =>
-  service.post<SegmentGenerateResult>(`/drama-segments/${sid}/generate`, body, {
-    headers: { "Idempotency-Key": idempotencyKey },
-  });
+  service.post<SegmentGenerateResult>(
+    `/drama-segments/${sid}/generate`,
+    toSegmentGenerateBody(body),
+    {
+      headers: { "Idempotency-Key": idempotencyKey },
+    },
+  );
+
+const mapManifestClip = (raw: BackendDramaManifestClip): DramaManifestClip => ({
+  segmentId: String(raw.segment_id),
+  taskId: String(raw.task_id),
+  assetId: String(raw.asset_id),
+  sha256: raw.sha256 ?? "",
+  seq: raw.seq,
+  sourceInF: raw.source_in_f,
+  sourceOutF: raw.source_out_f,
+  masterInF: raw.master_in_f,
+  masterOutF: raw.master_out_f,
+  normalizedFrames24: raw.normalized_frames_24,
+  hasAudio: !!raw.has_audio,
+  decodedAudioSamples: raw.decoded_audio_samples,
+  vStartUs: raw.v_start_us,
+  aStartUs: raw.a_start_us,
+  muteOriginal: !!raw.mute_original,
+  audioGainDb: raw.audio_gain_db,
+  nativeIsDialogue: !!raw.native_is_dialogue,
+  avPtsOffsetMs: raw.av_pts_offset_ms,
+});
+
+const mapBackendManifestOrDefault = (
+  rawManifest: BackendDramaManifestView["manifest"],
+): DramaEpisodeManifest => ({
+  v: rawManifest?.v ?? 1,
+  fps: rawManifest?.fps ?? 24,
+  totalFrames: rawManifest?.total_frames ?? 0,
+  clips: (rawManifest?.clips ?? []).map(mapManifestClip),
+  program: rawManifest?.program ?? { v: 1, audio: [], overlays: [] },
+});
+
+export const mapEpisodeManifest = (raw: BackendDramaManifestView): DramaManifestView => {
+  const status = raw.status === "preparing" ? "preparing" : "ready";
+  return {
+    status,
+    manifest: mapBackendManifestOrDefault(raw.manifest),
+    manifestHash: raw.manifest_hash ?? "",
+    segmentVersion: raw.segment_version,
+    skippedSeqs: raw.skipped_seqs ?? [],
+    diagnostics: raw.diagnostics ?? [],
+  };
+};
+
+/** 读取某集规范化的 24fps 冻结清单与版本指纹 */
+export const getEpisodeManifest = async (
+  dramaId: string,
+  episodeNo: number,
+  options?: { signal?: AbortSignal },
+): Promise<DramaManifestView> =>
+  mapEpisodeManifest(
+    await service.get<BackendDramaManifestView>(
+      `/dramas/${dramaId}/episodes/${episodeNo}/manifest`,
+      undefined,
+      {
+        silent: true,
+        ...(options?.signal ? { signal: options.signal } : {}),
+      },
+    ),
+  );
+
+export const mapEpisodePreview = (raw: BackendEpisodePreviewView): EpisodePreviewView => ({
+  ticket: raw.ticket,
+  status: raw.status,
+  streamUrl: raw.stream_url ? raw.stream_url : null,
+  expiresAt: raw.expires_at,
+});
+
+/** 请求 CPU 预览票据（返回并种植 HttpOnly Cookie vc_preview_sess，须带 withCredentials） */
+export const createEpisodePreview = async (
+  dramaId: string,
+  episodeNo: number,
+  input: CreateEpisodePreviewInput,
+): Promise<EpisodePreviewView> =>
+  mapEpisodePreview(
+    await service.post<BackendEpisodePreviewView>(
+      `/dramas/${dramaId}/episodes/${episodeNo}/preview`,
+      compact({
+        segment_version: input.segmentVersion,
+        manifest_hash: input.manifestHash,
+        variant: input.variant,
+        range_f: input.rangeF ? { in_f: input.rangeF.inF, out_f: input.rangeF.outF } : undefined,
+      }),
+      { withCredentials: true, silent: true, timeout: 630_000 },
+    ),
+  );
+
+/** 查询私有 CPU 预览票据状态及短期签名流地址（须带 withCredentials） */
+export const getEpisodePreview = async (
+  dramaId: string,
+  episodeNo: number,
+  ticket: string,
+): Promise<EpisodePreviewView> =>
+  mapEpisodePreview(
+    await service.get<BackendEpisodePreviewView>(
+      `/dramas/${dramaId}/episodes/${episodeNo}/preview/${ticket}`,
+      undefined,
+      { withCredentials: true, silent: true },
+    ),
+  );
 
 /** 后端的「我的提示词」项 */
 type BackendMyPrompt = Omit<MyPrompt, "updatedAt"> & { updated_at: string };

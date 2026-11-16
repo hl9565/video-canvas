@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -201,41 +202,86 @@ func sampleTimes(dur float64, n int) []float64 {
 	return ts
 }
 
-// run 在并发上限和超时内执行一个外部命令，返回标准输出。
+// run 在并发上限和超时内执行一个外部命令，返回标准输出（标准错误受 maxStderr 截断上限约束）。
 func (e *Extractor) run(ctx context.Context, bin string, args ...string) ([]byte, error) {
-	stdout, _, err := e.runBoth(ctx, bin, args...)
-	return stdout, err
+	var stdout bytes.Buffer
+	if err := e.runStreamStdout(ctx, &stdout, bin, args...); err != nil {
+		return nil, err
+	}
+	return stdout.Bytes(), nil
 }
 
 // runBoth 同 run，同时返回标准错误输出（场景检测的切点时间在 ffmpeg 的 stderr 里）。
 func (e *Extractor) runBoth(ctx context.Context, bin string, args ...string) ([]byte, []byte, error) {
+	var stdout, stderr bytes.Buffer
+	err := e.runCmd(ctx, &stdout, &stderr, func() error {
+		msg := strings.TrimSpace(stderr.String())
+		if len(msg) > maxStderr {
+			msg = msg[:maxStderr]
+		}
+		return fmt.Errorf("%w: %s", ErrDecode, msg)
+	}, bin, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return stdout.Bytes(), stderr.Bytes(), nil
+}
+
+func (e *Extractor) runCmd(ctx context.Context, stdout, stderr io.Writer, decodeErr func() error, bin string, args ...string) error {
 	if _, err := exec.LookPath(bin); err != nil {
-		return nil, nil, ErrUnavailable
+		return ErrUnavailable
 	}
 	select {
 	case e.sem <- struct{}{}:
 		defer func() { <-e.sem }()
 	default:
-		return nil, nil, ErrBusy
+		return ErrBusy
 	}
 	cctx, cancel := context.WithTimeout(ctx, e.timeout)
 	defer cancel()
 	// 二进制路径来自配置，参数全部由本包拼接，不经 shell；输入协议已用白名单限制。
 	cmd := exec.CommandContext(cctx, bin, args...) //nolint:gosec // 见上
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	if err := cmd.Run(); err != nil {
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) {
-			return nil, nil, ErrTimeout
+			return ErrTimeout
 		}
 		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+			return ctx.Err()
 		}
-		msg := strings.TrimSpace(stderr.String())
-		if len(msg) > maxStderr {
-			msg = msg[:maxStderr]
-		}
-		return nil, nil, fmt.Errorf("%w: %s", ErrDecode, msg)
+		return decodeErr()
 	}
-	return stdout.Bytes(), stderr.Bytes(), nil
+	return nil
+}
+
+type boundedStderr struct {
+	cap int
+	buf bytes.Buffer
+}
+
+func newBoundedStderr() *boundedStderr {
+	return &boundedStderr{cap: maxStderr}
+}
+
+func (b *boundedStderr) Write(p []byte) (int, error) {
+	if remain := b.cap - b.buf.Len(); remain > 0 {
+		if len(p) <= remain {
+			b.buf.Write(p)
+		} else {
+			b.buf.Write(p[:remain])
+		}
+	}
+	return len(p), nil
+}
+
+func (b *boundedStderr) String() string {
+	return b.buf.String()
+}
+
+func (b *boundedStderr) decodeErr() error {
+	msg := strings.TrimSpace(b.String())
+	if len(msg) > maxStderr {
+		msg = msg[:maxStderr]
+	}
+	return fmt.Errorf("%w: %s", ErrDecode, msg)
 }

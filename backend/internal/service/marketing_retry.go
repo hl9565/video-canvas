@@ -23,7 +23,7 @@ var marketingDependents = map[string][]string{
 }
 
 // RetryStep 重试一个失败的环节：新建一条运行记录，连同依赖它、没有成功的后续环节一起重跑（重试事实卡等于整轮重试）。
-// 方法用当前绑定，设置用该轮快照。轮次必须已结束（写脚本中返回 68007）；积分不足 40001。
+// 方法用当前绑定、设置用持锁轮次快照；其他轮正在写脚本返回68007，陈旧ID返回状态冲突，积分不足40001。
 func (s *MarketingService) RetryStep(ctx context.Context, userID, runID uint64) (*model.MarketingRoundView, error) {
 	run, err := s.repo.Run(ctx, userID, runID, false)
 	if mktNotFound(err) {
@@ -39,20 +39,39 @@ func (s *MarketingService) RetryStep(ctx context.Context, userID, runID uint64) 
 	if err != nil {
 		return nil, err
 	}
-	st, err := settingsOf(round)
-	if err != nil {
-		return nil, err
-	}
-	if run.Status != model.MarketingRunFailed && run.Status != model.MarketingRunSkipped && run.Status != model.MarketingRunCanceled {
-		return nil, errcode.ErrInvalidParams.WithMsg("只有失败的环节可以重试")
-	}
 	err = s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		if _, err := tx.Project(ctx, userID, round.ProjectID, true); mktNotFound(err) {
-			return errcode.ErrMarketingNotFound
-		} else if err != nil {
+		cur, err := lockMarketingRound(ctx, tx, userID, round)
+		if err != nil {
 			return err
 		}
-		return s.requeue(ctx, tx, userID, round.ID, run.StepKey, st)
+		// 1. 父项目有效后才保留旧接口对成功运行的参数错误；锁内变化或旧ID统一状态冲突。
+		if !retryableMarketingStatus(run.Status) {
+			return errcode.ErrInvalidParams.WithMsg("只有失败的环节可以重试")
+		}
+		st, err := settingsOf(cur)
+		if err != nil {
+			return err
+		}
+		all, err := tx.RoundRuns(ctx, cur.ID)
+		if err != nil {
+			return err
+		}
+		latest := latestRuns(all)
+		if !retryableMarketingRun(latest, run) {
+			return repository.ErrStateConflict
+		}
+		if err := marketingRoundAvailable(ctx, tx, cur); err != nil {
+			return err
+		}
+		keys := []string{run.StepKey}
+		for _, dep := range marketingDependents[run.StepKey] {
+			for _, candidate := range latest {
+				if candidate.StepKey == dep && retryableMarketingStatus(candidate.Status) {
+					keys = append(keys, dep)
+				}
+			}
+		}
+		return s.requeue(ctx, tx, cur, run.StepKey, st, keys)
 	})
 	if err != nil {
 		return nil, err
@@ -60,43 +79,53 @@ func (s *MarketingService) RetryStep(ctx context.Context, userID, runID uint64) 
 	return s.viewAndPush(ctx, userID, round.ID)
 }
 
-// requeue 在已锁项目的事务里为一个环节及其未成功的下游新建运行记录、冻结积分、把轮次放回写脚本并入队。
-func (s *MarketingService) requeue(ctx context.Context, tx repository.MarketingTx, userID, roundID uint64, stepKey string, st model.MarketingSettings) error {
-	round, err := tx.Round(ctx, userID, roundID, true)
-	if err != nil {
-		return err
-	}
-	if round.Status == model.MarketingRoundScripting {
-		return errcode.ErrMarketingRoundBusy
-	}
-	all, err := tx.RoundRuns(ctx, roundID)
-	if err != nil {
-		return err
-	}
-	latest := map[string]model.MarketingStepRun{}
-	for _, r := range latestRuns(all) {
-		latest[r.StepKey] = r
-	}
-	keys := []string{stepKey}
-	for _, dep := range marketingDependents[stepKey] {
-		if r, ok := latest[dep]; ok && slices.Contains([]string{model.MarketingRunFailed, model.MarketingRunSkipped, model.MarketingRunCanceled}, r.Status) {
-			keys = append(keys, dep)
+// retryableMarketingStatus 只允许对失败、跳过或取消的运行发起重试。
+func retryableMarketingStatus(status string) bool {
+	return slices.Contains([]string{model.MarketingRunFailed, model.MarketingRunSkipped, model.MarketingRunCanceled}, status)
+}
+
+// retryableMarketingRun 锁内要求目标仍是该步骤最新且可重试的运行，拒绝陈旧ID重放。
+func retryableMarketingRun(latest []model.MarketingStepRun, run *model.MarketingStepRun) bool {
+	for _, cur := range latest {
+		if cur.StepKey == run.StepKey {
+			return cur.ID == run.ID && retryableMarketingStatus(cur.Status)
 		}
 	}
+	return false
+}
+
+// marketingRoundAvailable 在轮次重返scripting之前检查同项目没有其他活动轮次。
+func marketingRoundAvailable(ctx context.Context, tx repository.MarketingTx, round *model.MarketingRound) error {
+	if round.Status == model.MarketingRoundScripting {
+		return nil
+	}
+	n, err := tx.ScriptingRounds(ctx, round.ProjectID)
+	if err != nil {
+		return err
+	}
+	if n != 0 {
+		return errcode.ErrMarketingRoundBusy
+	}
+	return nil
+}
+
+// requeue 在项目、轮次与全部脚本锁内推进执行代，先改脚本，再锁积分冻结并入队。
+func (s *MarketingService) requeue(ctx context.Context, tx repository.MarketingTx, round *model.MarketingRound, stepKey string, st model.MarketingSettings, keys []string) error {
 	if err := s.checkRequeueInputs(ctx, tx, round, stepKey); err != nil {
 		return err
 	}
-	runs, total, err := s.newRuns(ctx, userID, round, st, keys)
+	round.ExecutionGen++
+	runs, total, err := s.newRuns(ctx, round.UserID, round, st, keys)
 	if err != nil {
 		return err
 	}
-	if err := s.insertRuns(ctx, tx, userID, runs); err != nil {
-		return err
-	}
-	if err := tx.UpdateRound(ctx, round.ID, map[string]any{"status": model.MarketingRoundScripting, "error": "", "frozen": repository.Add("frozen", total)}); err != nil {
-		return err
-	}
 	if err := s.markRewriting(ctx, tx, round.ID, keys); err != nil {
+		return err
+	}
+	if err := tx.UpdateRound(ctx, round.ID, map[string]any{"execution_gen": round.ExecutionGen, "status": model.MarketingRoundScripting, "error": "", "frozen": repository.Add("frozen", total)}); err != nil {
+		return err
+	}
+	if err := s.insertRuns(ctx, tx, round.UserID, runs); err != nil {
 		return err
 	}
 	return tx.EnqueueRound(ctx, round.ID)
@@ -143,7 +172,7 @@ func (s *MarketingService) newRuns(ctx context.Context, userID uint64, round *mo
 			return nil, 0, err
 		}
 		runs = append(runs, &model.MarketingStepRun{UserID: userID, RoundID: round.ID, StepKey: k, Method: []byte("{}"),
-			TextModelID: snap.Model.Key, Status: model.MarketingRunQueued, Frozen: frozen[k]})
+			TextModelID: snap.Model.Key, Status: model.MarketingRunQueued, RoundGen: round.ExecutionGen, Frozen: frozen[k]})
 		total += frozen[k]
 	}
 	return runs, total, nil
@@ -176,23 +205,25 @@ func (s *MarketingService) Refollow(ctx context.Context, userID, roundID uint64)
 	if err != nil {
 		return nil, err
 	}
-	if len(round.Reverse) == 0 {
-		return nil, errcode.ErrMarketingNoReverse
-	}
-	st, err := settingsOf(round)
-	if err != nil {
-		return nil, err
-	}
 	err = s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		if _, err := tx.Project(ctx, userID, round.ProjectID, true); mktNotFound(err) {
-			return errcode.ErrMarketingNotFound
-		} else if err != nil {
+		cur, err := lockMarketingRound(ctx, tx, userID, round)
+		if err != nil {
 			return err
 		}
-		if err := s.followIdle(ctx, tx, userID, round.ID); err != nil {
+		if len(cur.Reverse) == 0 {
+			return errcode.ErrMarketingNoReverse
+		}
+		if err := marketingRoundAvailable(ctx, tx, cur); err != nil {
 			return err
 		}
-		return s.requeue(ctx, tx, userID, round.ID, marketing.StepFollow, st)
+		if err := s.refollowIdle(ctx, tx, cur); err != nil {
+			return err
+		}
+		st, err := settingsOf(cur)
+		if err != nil {
+			return err
+		}
+		return s.requeue(ctx, tx, cur, marketing.StepFollow, st, []string{marketing.StepFollow})
 	})
 	if err != nil {
 		return nil, err
@@ -201,20 +232,40 @@ func (s *MarketingService) Refollow(ctx context.Context, userID, roundID uint64)
 }
 
 // followIdle 确认轮次的跟拍脚本没有在出片或重写；没有跟拍脚本也算空闲。
-func (s *MarketingService) followIdle(ctx context.Context, tx repository.MarketingTx, userID, roundID uint64) error {
+func (s *MarketingService) followIdle(ctx context.Context, tx repository.MarketingTx, _ uint64, roundID uint64) error {
 	scripts, err := tx.RoundScripts(ctx, roundID)
 	if err != nil {
 		return err
 	}
 	for i := range scripts {
-		if scripts[i].Kind != marketing.KindFollow {
-			continue
+		if scripts[i].Kind == marketing.KindFollow {
+			if err := s.scriptIdle(ctx, tx, &scripts[i]); err != nil {
+				return err
+			}
 		}
-		locked, err := tx.Script(ctx, userID, scripts[i].ID, true)
-		if err != nil {
+	}
+	return nil
+}
+
+// refollowIdle 在父锁内禁止在途Follow/Create或任意相关脚本重写，成功运行可以再次重写。
+func (s *MarketingService) refollowIdle(ctx context.Context, tx repository.MarketingTx, round *model.MarketingRound) error {
+	runs, err := tx.RoundRuns(ctx, round.ID)
+	if err != nil {
+		return err
+	}
+	for _, run := range runs {
+		if (run.StepKey == marketing.StepFollow || run.StepKey == marketing.StepCreate) && !run.CancelRequested && run.RoundGen == round.ExecutionGen && (run.Status == model.MarketingRunQueued || run.Status == model.MarketingRunRunning) {
+			return errcode.ErrMarketingScriptBusy
+		}
+	}
+	scripts, err := tx.RoundScripts(ctx, round.ID)
+	if err != nil {
+		return err
+	}
+	for i := range scripts {
+		if err := s.scriptIdle(ctx, tx, &scripts[i]); err != nil {
 			return err
 		}
-		return s.scriptIdle(ctx, tx, locked)
 	}
 	return nil
 }
@@ -248,8 +299,12 @@ func reverseOf(raw []byte) (marketing.Reverse, error) {
 // UpdateReverse 保存用户对拆解的修改：只认镜头的 action / dialogue / product_role / key_colors，其余字段以服务端为准。
 // reverse_revision 不一致 68009；合并后不过校验 68015；跟拍脚本正在出片或重写 68006。
 func (s *MarketingService) UpdateReverse(ctx context.Context, userID, roundID uint64, req *model.UpdateMarketingReverseReq) (*model.MarketingRoundView, error) {
-	err := s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		r, err := tx.Round(ctx, userID, roundID, true)
+	probe, err := s.activeMarketingRound(ctx, userID, roundID)
+	if err != nil {
+		return nil, err
+	}
+	err = s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
+		r, err := lockMarketingRound(ctx, tx, userID, probe)
 		if mktNotFound(err) {
 			return errcode.ErrMarketingNotFound
 		}
@@ -314,8 +369,12 @@ func mergeReverseEdit(base marketing.Reverse, edit model.MarketingReverse) (mark
 
 // RestoreReverse 把拆解恢复成模型原稿。没有拆解 68016；跟拍脚本正在出片或重写 68006。
 func (s *MarketingService) RestoreReverse(ctx context.Context, userID, roundID uint64) (*model.MarketingRoundView, error) {
-	err := s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		r, err := tx.Round(ctx, userID, roundID, true)
+	probe, err := s.activeMarketingRound(ctx, userID, roundID)
+	if err != nil {
+		return nil, err
+	}
+	err = s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
+		r, err := lockMarketingRound(ctx, tx, userID, probe)
 		if mktNotFound(err) {
 			return errcode.ErrMarketingNotFound
 		}

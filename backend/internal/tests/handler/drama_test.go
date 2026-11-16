@@ -105,13 +105,18 @@ func TestDramaHandler_ReadAndIsolation(t *testing.T) {
 		})
 	}
 	status, body := characterCall(t, r, http.MethodGet, "/dramas/"+id+"/episodes/1", "")
-	if status != 200 || responseData(t, body)["script_md"] != "正文" {
-		t.Fatalf("单集正文丢失：%+v", body)
+	epData := responseData(t, body)
+	if status != 200 || epData["script_md"] != "正文" || epData["id"] != idcodec.Encode(10) {
+		t.Fatalf("单集正文或编码 id 丢失：%+v", body)
 	}
 	_, body = characterCall(t, r, http.MethodGet, "/dramas/"+id, "")
 	episodes := responseData(t, body)["episodes"].([]any)
-	if _, hasScript := episodes[0].(map[string]any)["script_md"]; hasScript {
+	epSummary := episodes[0].(map[string]any)
+	if _, hasScript := epSummary["script_md"]; hasScript {
 		t.Fatal("项目详情不应包含分集正文")
+	}
+	if epSummary["id"] != idcodec.Encode(10) {
+		t.Fatalf("剧集概要缺少稳定编码 id：%+v", epSummary)
 	}
 }
 
@@ -125,6 +130,8 @@ func TestDramaHandler_Validation(t *testing.T) {
 		{"GET", "/dramas?page=no", ""},
 		{"PATCH", base, `{"title":"缺版本"}`},
 		{"PATCH", base + "/episodes/1", `{"revision":0}`},
+		{"PATCH", base + "/episodes/1", `{"revision":1,"expected_episode_id":"bad"}`},
+		{"PATCH", base + "/episodes/1", `{"revision":1,"expected_episode_id":10}`},
 		{"POST", base + "/episodes", `{"title":1}`},
 		{"POST", base + "/estimate", `{"step":"compose"}`},
 		{"POST", base + "/jobs", `{"step":"breakdown","episodes":[0]}`},
@@ -183,5 +190,30 @@ func TestDramaHandler_CreateSourceExclusive(t *testing.T) {
 		if w.Code != 400 || got.Code != 10001 {
 			t.Fatalf("二选一原文：status=%d body=%s", w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestDramaHandler_UpdateEpisodeExpectedID(t *testing.T) {
+	r := httpDramaRouter()
+	base := "/dramas/" + idcodec.Encode(7)
+	status, body := characterCall(t, r, "PATCH", base+"/episodes/1", `{"revision":1,"expected_episode_id":"`+idcodec.Encode(999)+`","title":"串集"}`)
+	if status != http.StatusConflict || responseCode(t, body) != 30002 {
+		t.Fatalf("expected_episode_id 不匹配应返回 409/30002: status=%d body=%+v", status, body)
+	}
+	status, body = characterCall(t, r, "PATCH", base+"/episodes/1", `{"revision":1,"expected_episode_id":"","title":"空串拒绝"}`)
+	if status != http.StatusConflict || responseCode(t, body) != 30002 {
+		t.Fatalf("expected_episode_id 空串应返回 409/30002: status=%d body=%+v", status, body)
+	}
+	status, body = characterCall(t, r, "PATCH", base+"/episodes/1", `{"revision":1,"expected_episode_id":"`+idcodec.Encode(10)+`","title":"新标题"}`)
+	if status != http.StatusOK || responseCode(t, body) != 0 {
+		t.Fatalf("expected_episode_id 匹配应返回 200: status=%d body=%+v", status, body)
+	}
+	data := responseData(t, body)
+	if data["title"] != "新标题" || data["id"] != idcodec.Encode(10) {
+		t.Fatalf("返回集视图不正确: %+v", data)
+	}
+	status, body = characterCall(t, r, "PATCH", base+"/episodes/1", `{"revision":2,"expected_episode_id":null,"title":"兼容空值"}`)
+	if status != http.StatusOK || responseCode(t, body) != 0 || responseData(t, body)["title"] != "兼容空值" {
+		t.Fatalf("expected_episode_id null 应兼容放行: status=%d body=%+v", status, body)
 	}
 }

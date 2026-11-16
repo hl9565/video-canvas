@@ -95,6 +95,8 @@ export interface BackendDramaSummary {
 }
 
 export interface BackendEpisodeSummary {
+  /** 分集稳定实体 ID（老后端 / 旧夹具可能缺失） */
+  id?: string;
   no: number;
   title: string;
   synopsis: string;
@@ -118,10 +120,32 @@ export interface BackendEpisodeSummary {
   unit_from?: number;
   /** 对应原文结束单元号，0 = 未关联单元 */
   unit_to?: number;
+  /** 片段编辑版本号，每次改镜头 / 排序 / 增删 / 剪辑递增 */
+  segment_version?: number;
+  /** 剪辑协议版本（0 = 旧整段拼接，1 = PR1 冻结清单） */
+  edit_schema?: number;
+  /** 最近一次写入当前成片的 compose 任务 id */
+  final_compose_job_id?: string | number | null;
 }
 
 export interface BackendEpisodeView extends BackendEpisodeSummary {
   script_md: string;
+}
+
+/** 合成导出档位 */
+export type DramaComposeSize = "720p" | "1080p";
+
+/** 合成导出变体（PR1 仅允许 clean / packaged，sample 只是 UI 显示别名） */
+export type DramaComposeVariant = "clean" | "packaged";
+
+export interface BackendComposeExport {
+  sha256: string;
+  variant: DramaComposeVariant;
+  size: DramaComposeSize;
+  width: number;
+  height: number;
+  manifest_hash: string;
+  asset: BackendAssetDto;
 }
 
 export interface BackendJobView {
@@ -136,8 +160,12 @@ export interface BackendJobView {
   error_message: string;
   created_at: string;
   finished_at: string | null;
-  /** compose 成功时 `{asset, skipped_seqs}`；其他步骤为 null（契约 §14） */
-  result?: { asset: BackendAssetDto; skipped_seqs: number[] | null } | null;
+  /** compose 成功时 `{asset, skipped_seqs, exports?}`；其他步骤为 null（契约 §14） */
+  result?: {
+    asset: BackendAssetDto;
+    skipped_seqs: number[] | null;
+    exports?: BackendComposeExport[] | null;
+  } | null;
   /** 所在的线；老后端没有这个字段 */
   lane?: DramaLane;
   /** plan 任务对应的起始单元号 */
@@ -216,6 +244,8 @@ export interface DramaSummary {
 }
 
 export interface EpisodeSummary {
+  /** 分集稳定实体 ID（后端带回时填充） */
+  id?: string;
   no: number;
   title: string;
   synopsis: string;
@@ -244,6 +274,12 @@ export interface EpisodeSummary {
   unitFrom: number | null;
   /** 对应原文结束单元号，null = 未关联单元 */
   unitTo: number | null;
+  /** 片段编辑版本号（可选，后端带回时填充） */
+  segmentVersion?: number;
+  /** 剪辑协议版本（0 / 1） */
+  editSchema?: number;
+  /** 写入当前成片的 compose 任务 id */
+  finalComposeJobId?: string | null;
 }
 
 export interface Episode extends EpisodeSummary {
@@ -274,10 +310,21 @@ export interface DramaJob {
   batchTo: number | null;
 }
 
-/** compose 任务的结果：成片素材与被跳过（没有采用视频）的片段 seq（从 0 起，界面显示 seq+1） */
+export interface DramaComposeExport {
+  sha256: string;
+  variant: DramaComposeVariant;
+  size: DramaComposeSize;
+  width: number;
+  height: number;
+  manifestHash: string;
+  asset: AssetDto;
+}
+
+/** compose 任务的结果：成片素材、被跳过片段序号，以及按变体导出的资产列表 */
 export interface DramaJobResult {
   asset: AssetDto;
   skippedSeqs: number[];
+  exports?: DramaComposeExport[];
 }
 
 export interface Drama {
@@ -388,6 +435,8 @@ export interface UpdateDramaInput {
 /** PATCH /dramas/:id/episodes/:no 可改字段 */
 export interface UpdateEpisodeInput {
   revision: number;
+  /** 期望当前集号对应的稳定分集 ID；不匹配时后端返回 409 */
+  expectedEpisodeId?: string;
   title?: string;
   synopsis?: string;
   scriptMd?: string;
@@ -395,6 +444,14 @@ export interface UpdateEpisodeInput {
   hook?: string;
   /** 结尾悬念 */
   cliffhanger?: string;
+}
+
+/** compose 请求附加参数 */
+export interface DramaComposeInput {
+  segmentVersion?: number;
+  manifestHash?: string;
+  size?: DramaComposeSize;
+  variants?: DramaComposeVariant[];
 }
 
 /** 提交 / 估价任务的请求 */
@@ -405,6 +462,10 @@ export interface DramaJobInput {
   ratio?: DramaRatio;
   /** storyboard：所选视频模型的单段时长上限（秒），缺省 15，范围 4–60 */
   maxSeconds?: number;
+  /** compose：冻结版本、清单哈希与导出档位 / 变体 */
+  compose?: DramaComposeInput;
+  /** compose：客户端幂等键（最长 96 字符） */
+  composeRequestKey?: string;
 }
 
 /** WebSocket drama.episode 事件载荷：该集剧本状态已保存，需重新读取短剧详情。 */
@@ -432,16 +493,50 @@ export interface BackendSegmentTake {
   created_at: string;
 }
 
+export interface BackendSegmentEdit {
+  source_in_f: number;
+  source_out_f: number | null;
+  mute_original: boolean;
+  audio_gain_db: number;
+  native_is_dialogue: boolean;
+  av_pts_offset_ms: number;
+}
+
+/** 逐镜精裁与原声参数（24fps 整数帧） */
+export interface SegmentEdit {
+  sourceInF: number;
+  /** null 表示裁到源视频片尾 EOF */
+  sourceOutF: number | null;
+  muteOriginal: boolean;
+  /** 原声增益 dB，范围 -60..+12 */
+  audioGainDb: number;
+  nativeIsDialogue: boolean;
+  /** 音画同步偏移 ms，范围 -10000..10000 */
+  avPtsOffsetMs: number;
+}
+
+export type SegmentEditPatch = Partial<SegmentEdit>;
+
 export interface BackendSegmentView {
   id: string;
+  /** 所属分集稳定实体 ID（可选） */
+  episode_id?: string;
   episode_no: number;
   seq: number;
   seconds: number;
   prompt: string;
   takes: BackendSegmentTake[] | null;
   chosen_task_id: string;
+  /** 规范化 24fps 源视频帧数；尚未探测或无视频时为 null */
+  source_frame_count?: number | null;
+  /** 采用视频是否含音轨 */
+  has_audio?: boolean;
+  /** 逐镜精裁与原声参数 */
+  edit?: Partial<BackendSegmentEdit> | null;
   status: SegmentStatus;
   revision: number;
+  /** 后端随段视图回传的集级内容版本号（可选） */
+  segment_version?: number;
   updated_at: string;
   /** 按格式存的转写稿；老后端可能没有 */
   adaptations?: Partial<Record<AdaptFormat, BackendSegmentAdaptation>> | null;
@@ -483,6 +578,8 @@ export interface SegmentTake {
 
 export interface Segment {
   id: string;
+  /** 所属分集稳定实体 ID（可选） */
+  episodeId?: string;
   episodeNo: number;
   /** 从 0 开始，按它排序 */
   seq: number;
@@ -493,8 +590,16 @@ export interface Segment {
   takes: SegmentTake[];
   /** 采用的那一条；空串 = 没有 */
   chosenTaskId: string;
+  /** 规范化 24fps 源视频总帧数（未探测 / 无视频为 null；旧测试夹具可省略） */
+  sourceFrameCount?: number | null;
+  /** 源视频是否含音轨；未知为 undefined，明确 false 时提示无原声 */
+  hasAudio?: boolean;
+  /** 逐镜精裁与原声参数（旧测试夹具可省略，读取请用 segmentEditOf） */
+  edit?: SegmentEdit;
   status: SegmentStatus;
   revision: number;
+  /** 后端回传的集级内容版本号（用于即时同步，避免仅依赖异步详情刷新） */
+  segmentVersion?: number;
   updatedAt: string;
   /** 按格式存的转写稿（原稿始终是 prompt，Seedance 格式） */
   adaptations: Partial<Record<AdaptFormat, SegmentAdaptation>>;
@@ -506,6 +611,12 @@ export interface UpdateSegmentInput {
   prompt?: string;
   seconds?: number;
   chosenTaskId?: string;
+  /** 期望当前采用的任务 id（"" 或 null 表示尚未采用）；不匹配时后端返回 409 */
+  expectedTaskId?: string | null;
+  /** 切换采用任务时是否重置剪辑字段（默认 true，显式传 false 可保留当前剪辑） */
+  resetEditOnTaskChange?: boolean;
+  /** 逐镜精裁与原声局部更新；sourceOutF 显式 null 表示恢复片尾 EOF */
+  edit?: SegmentEditPatch;
   /** 手改某个格式的转写稿 */
   adaptation?: { format: AdaptFormat; prompt: string };
 }
@@ -523,13 +634,155 @@ export interface AddSegmentInput {
   afterSeq?: number;
 }
 
-/** generate 请求体：input 与 POST /generation-tasks 的 input 同构 */
-export interface SegmentGenerateBody {
-  model_id: string;
+/** POST /drama-segments/:sid/quote 请求体 */
+export interface SegmentQuoteInput {
+  modelId: string;
   input: Record<string, unknown>;
 }
 
+/** 后端 TaskQuoteView 原始结构 */
+export interface BackendTaskQuote {
+  effective_input: Record<string, unknown>;
+  raw_size: string;
+  credits: number;
+  price_fingerprint: string;
+  quote_token: string;
+  expires_at: string;
+}
+
+/** 报价结果（提交生成时原样传回 quoteToken） */
+export interface TaskQuote {
+  effectiveInput: Record<string, unknown>;
+  rawSize: string;
+  credits: number;
+  priceFingerprint: string;
+  quoteToken: string;
+  expiresAt: string;
+}
+
+/** generate 后端 JSON 请求体 */
+export interface BackendSegmentGenerateBody {
+  model_id: string;
+  input: Record<string, unknown>;
+  quote_token?: string;
+}
+
+/** generate 请求入参：兼容 snake_case 与 camelCase（quoteToken） */
+export type SegmentGenerateBody =
+  | { model_id: string; input: Record<string, unknown>; quote_token?: string }
+  | { modelId: string; input: Record<string, unknown>; quoteToken?: string };
+
 export type SegmentGenerateResult = { task: TaskView };
+
+export interface BackendDramaManifestClip {
+  segment_id: number | string;
+  task_id: number | string;
+  asset_id: number | string;
+  sha256: string;
+  seq: number;
+  source_in_f: number;
+  source_out_f: number;
+  master_in_f: number;
+  master_out_f: number;
+  normalized_frames_24: number;
+  has_audio: boolean;
+  decoded_audio_samples: number;
+  v_start_us: number;
+  a_start_us: number;
+  mute_original: boolean;
+  audio_gain_db: number;
+  native_is_dialogue: boolean;
+  av_pts_offset_ms: number;
+}
+
+export interface DramaManifestClip {
+  segmentId: string;
+  taskId: string;
+  assetId: string;
+  sha256: string;
+  seq: number;
+  sourceInF: number;
+  sourceOutF: number;
+  masterInF: number;
+  masterOutF: number;
+  normalizedFrames24: number;
+  hasAudio: boolean;
+  decodedAudioSamples: number;
+  vStartUs: number;
+  aStartUs: number;
+  muteOriginal: boolean;
+  audioGainDb: number;
+  nativeIsDialogue: boolean;
+  avPtsOffsetMs: number;
+}
+
+export interface DramaEpisodeProgram {
+  v: number;
+  audio: Array<{ id: string }>;
+  overlays: Array<{ id: string }>;
+}
+
+export type DramaManifestStatus = "ready" | "preparing";
+
+export interface BackendDramaManifestView {
+  status?: DramaManifestStatus;
+  manifest?: {
+    v: number;
+    fps: number;
+    total_frames: number;
+    clips: BackendDramaManifestClip[] | null;
+    program?: DramaEpisodeProgram | null;
+  } | null;
+  manifest_hash?: string;
+  segment_version: number;
+  skipped_seqs: number[] | null;
+  diagnostics: string[] | null;
+}
+
+export interface DramaEpisodeManifest {
+  v: number;
+  fps: number;
+  totalFrames: number;
+  clips: DramaManifestClip[];
+  program: DramaEpisodeProgram;
+}
+
+export interface DramaManifestView {
+  status?: DramaManifestStatus;
+  manifest: DramaEpisodeManifest;
+  manifestHash: string;
+  segmentVersion: number;
+  skippedSeqs: number[];
+  diagnostics: string[];
+}
+
+export interface DramaPreviewRange {
+  inF: number;
+  outF: number;
+}
+
+export interface CreateEpisodePreviewInput {
+  segmentVersion: number;
+  manifestHash: string;
+  variant: DramaComposeVariant;
+  rangeF?: DramaPreviewRange;
+}
+
+export type EpisodePreviewStatus = "pending" | "ready" | "failed";
+
+export interface BackendEpisodePreviewView {
+  ticket: string;
+  status: EpisodePreviewStatus;
+  stream_url?: string;
+  expires_at: number;
+}
+
+export interface EpisodePreviewView {
+  ticket: string;
+  status: EpisodePreviewStatus;
+  streamUrl: string | null;
+  expiresAt: number;
+}
 
 /** WebSocket drama.segment 事件载荷（原样 snake_case） */
 export interface DramaSegmentEvent {

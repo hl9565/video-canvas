@@ -8,6 +8,8 @@ import {
   type MotionValue,
 } from "motion/react";
 
+import { Scissors } from "lucide-react";
+
 import type { SegmentTake } from "@/api/drama/type";
 import { VideoPoster } from "@/components/canvas/media-preview";
 import { VideoPlayer } from "@/components/video-player";
@@ -67,6 +69,7 @@ function TakeCard({
   focused,
   chosen,
   onPick,
+  onTrim,
 }: {
   take: SegmentTake;
   index: number;
@@ -77,6 +80,7 @@ function TakeCard({
   focused: boolean;
   chosen: boolean;
   onPick: () => void;
+  onTrim?: () => void;
 }) {
   const offset = useTransform(x, (value) => index * step + value);
   const distance = useTransform(offset, (value) =>
@@ -126,6 +130,22 @@ function TakeCard({
           采用
         </span>
       )}
+      {focused && playable && take.asset && onTrim && (
+        <button
+          type="button"
+          aria-label="修剪当前版本"
+          title="逐镜精裁与原声参数"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation();
+            onTrim();
+          }}
+          className="nodrag focus-visible:ring-ring/60 absolute top-2 right-2 z-20 inline-flex h-7 items-center gap-1 rounded-md bg-black/70 px-2 text-xs font-medium text-white backdrop-blur-xs transition-colors hover:bg-black/85 focus-visible:ring-2 outline-none"
+        >
+          <Scissors className="size-3" />
+          修剪
+        </button>
+      )}
     </motion.div>
   );
 }
@@ -143,12 +163,14 @@ export function TakeCarousel({
   chosenTaskId,
   aspect,
   onChoose,
+  onTrim,
 }: {
   takes: readonly SegmentTake[];
   chosenTaskId: string;
   /** 宽 / 高 */
   aspect: number;
   onChoose: (taskId: string) => void;
+  onTrim?: (taskId: string) => void;
 }) {
   const box = useBoxSize();
   const [focus, setFocus] = useState(() => initialTakeIndex(takes, chosenTaskId));
@@ -267,6 +289,7 @@ export function TakeCarousel({
             focused={index === focus}
             chosen={take.taskId === chosenTaskId}
             onPick={() => goTo(index, true)}
+            onTrim={onTrim ? () => onTrim(take.taskId) : undefined}
           />
         ))}
       {/* 位置点：当前版本是长条，采用的标主色，失败的标红；点一下滑过去 */}

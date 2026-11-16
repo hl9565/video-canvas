@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"video-canvas/internal/model"
+	"video-canvas/internal/pkg/idcodec"
 )
 
 const storyboardValid = `{"segments":[{"seconds":15,"prompt":"@[村口](n_scene) @[陌生人](unknown)"}]}`
@@ -246,6 +247,10 @@ func TestDramaStoryboardExactDurationAndSummary(t *testing.T) {
 			}
 			task := uint64(77)
 			r.segments[0].ChosenTaskID = &task
+			composeJobID := uint64(888)
+			r.episodes[0].EditSchema = 1
+			r.episodes[0].SegmentVersion = 4
+			r.episodes[0].FinalComposeJobID = &composeJobID
 			view, err := s.Get(context.Background(), 7, 1)
 			if err != nil {
 				t.Fatal(err)
@@ -255,8 +260,20 @@ func TestDramaStoryboardExactDurationAndSummary(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, summary := range []model.DramaEpisodeSummary{view.Episodes[0], ep.DramaEpisodeSummary} {
-				if summary.StoryboardStatus != "ready" || summary.SegmentCount != 1 || summary.SegmentSeconds != seconds || summary.DoneSegmentCount != 1 {
+				if summary.ID != idcodec.ID(r.episodes[0].ID) || summary.StoryboardStatus != "ready" || summary.SegmentCount != 1 || summary.SegmentSeconds != seconds || summary.DoneSegmentCount != 1 ||
+					summary.EditSchema != 1 || summary.SegmentVersion != 4 || summary.FinalComposeJobID == nil || uint64(*summary.FinalComposeJobID) != composeJobID {
 					t.Fatalf("summary=%+v", summary)
+				}
+				rawJSON, mErr := json.Marshal(summary)
+				if mErr != nil {
+					t.Fatal(mErr)
+				}
+				var decoded map[string]any
+				if uErr := json.Unmarshal(rawJSON, &decoded); uErr != nil {
+					t.Fatal(uErr)
+				}
+				if decoded["id"] != idcodec.Encode(r.episodes[0].ID) || decoded["edit_schema"] != float64(1) || decoded["segment_version"] != float64(4) || decoded["final_compose_job_id"] == nil {
+					t.Fatalf("decoded summary json=%s", rawJSON)
 				}
 			}
 		})

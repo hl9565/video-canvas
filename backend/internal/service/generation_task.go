@@ -94,6 +94,7 @@ type GenerationTaskDeps struct {
 	Config      config.AI
 	Limits      TaskLimits        // 初始积分与并发上限的运行时来源（系统设置 + 单用户覆盖）；为 nil 时只用 Config
 	Covers      CanvasCoverSetter // 任务成功时把第一张生成的图写成画布封面；为 nil 时不写
+	QuoteSecret string            // 报价令牌签名密钥；为空时依次回落 Config.SecretKey 与进程随机密钥
 }
 
 // GenerationTaskOption 用于替换可注入的部分（主要给测试用）。
@@ -107,6 +108,11 @@ func WithInputValidator(fn func(kind string, caps modelcfg.Capabilities, input m
 // WithTaskClock 替换时间来源（测试用）。
 func WithTaskClock(now func() time.Time) GenerationTaskOption {
 	return func(s *GenerationTaskService) { s.now = now }
+}
+
+// WithQuoteTTL 替换报价令牌有效期（默认 5 分钟）。
+func WithQuoteTTL(ttl time.Duration) GenerationTaskOption {
+	return func(s *GenerationTaskService) { s.quoteTTL = ttl }
 }
 
 // GenerationTaskService 负责任务的提交、取消、查询、状态迁移与积分事务，并实现 provider.TaskStore。
@@ -124,6 +130,8 @@ type GenerationTaskService struct {
 
 	validateInput func(kind string, caps modelcfg.Capabilities, input map[string]any) (map[string]any, []modelcfg.FieldError)
 	now           func() time.Time
+	quoteSecret   []byte
+	quoteTTL      time.Duration
 }
 
 // 编译期确认：任务服务满足 worker 的存储契约与试跑任务接口，真实仓储满足本服务声明的仓储接口。
@@ -146,6 +154,8 @@ func NewGenerationTaskService(deps GenerationTaskDeps, opts ...GenerationTaskOpt
 		covers:        deps.Covers,
 		validateInput: modelcfg.ValidateInput,
 		now:           time.Now,
+		quoteSecret:   resolveQuoteSecret(deps.QuoteSecret, deps.Config.SecretKey),
+		quoteTTL:      defaultQuoteTTL,
 	}
 	if s.broadcaster == nil {
 		s.broadcaster = ws.NopBroadcaster{}

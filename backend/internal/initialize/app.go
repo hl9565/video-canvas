@@ -44,11 +44,14 @@ import (
 )
 
 type App struct {
+	drama  *service.DramaService
 	fx     *fx.Service
 	cfg    *config.Config
 	db     *gorm.DB
 	rdb    *redis.Client
 	server *http.Server
+
+	marketing *service.MarketingService
 
 	hub        *ws.Hub                  // WebSocket 连接管理，退出时需要显式关闭（Shutdown 不会等已劫持的连接）
 	taskQueue  *queue.Runtime           // 生成任务队列（River）：本实例是否执行任务由 ai.worker.enabled 决定，但入队和后台操作总是可用
@@ -172,6 +175,7 @@ func NewApp(cfg *config.Config) (*App, error) {
 		Assets:      assetSvc,
 		Broadcaster: hub,
 		Config:      cfg.AI,
+		QuoteSecret: cfg.AI.SecretKey,
 		Limits:      service.NewTaskLimitService(settingsSvc, userRepo), // 初始积分 / 并发上限：单用户覆盖 > 系统设置 > config
 		Covers:      canvasProjectRepo,                                  // 任务成功时把第一张图写成画布封面
 	})
@@ -180,12 +184,13 @@ func NewApp(cfg *config.Config) (*App, error) {
 	skillSvc := agentsvc.NewSkillService(repository.NewAgentSkillRepository(db), storeRegistry, auditRepo, agentsvc.SkillOptions{})
 	dramaRepo := repository.NewDramaRepository(db)
 	dramaCanvasSvc := service.NewDramaCanvasService(repository.NewDramaCanvasRepository(db), hub)
-	dramaSegments := service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: dramaRepo, Tasks: taskSvc, Assets: assetSvc, Broadcaster: hub})
+	dramaSegments := service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: dramaRepo, Tasks: taskSvc, Assets: assetSvc, Probes: repository.NewAssetMediaProbeRepository(db), ProbeVideo: newVideoFrames().ProbeNormalized24FPS, Broadcaster: hub})
 	// 短剧和环节协议层共用同一个 LLM 网关实例，渠道限流（RPS / 并发）才是对两者合计生效。
 	textGateway := llmgateway.New(llmgateway.Options{IPAllowed: outboundIPPolicy(cfg)})
 	dramaSvc := service.NewDramaService(service.DramaDeps{
 		Repo: dramaRepo, Settings: dramaRepo, Skills: skillSvc, Registry: aiCfgSvc, Streamer: textGateway, Secrets: aiCfgSvc, Canvas: dramaCanvasSvc, Broadcaster: hub, Credits: settingsSvc,
 		Segments: dramaSegments, CanvasAssets: canvasProjectRepo,
+		Probes: repository.NewAssetMediaProbeRepository(db), PreviewSecret: cfg.JWT.Secret,
 		Compose: videoframe.New(videoframe.Options{Timeout: 10 * time.Minute}), Assets: assetSvc,
 		// 列表封面：资产画布里第一张生成成功的图，和画布列表一样取缩略图
 		Covers: dramaRepo, CoverURL: func(key string) string { return assetSvc.FileURL(key) + "?v=thumb" },
@@ -208,7 +213,7 @@ func NewApp(cfg *config.Config) (*App, error) {
 	marketingSvc := service.NewMarketingService(service.MarketingDeps{
 		Repo: marketingRepo, Steps: stepRegistry, Resolver: stepSvc.Resolver(), Caller: stepCaller, Models: aiCfgSvc,
 		Assets: assetSvc, Tasks: taskSvc, Canvases: canvasProjectSvc, Frames: newVideoFrames(), Credits: settingsSvc, Broadcaster: hub,
-	})
+	}, service.WithMarketingLegacyNullLeaseDrainCompleted(cfg.Marketing.LegacyDrainCompleted))
 	// 生成任务的关联业务观察者：短剧片段和营销脚本各按节点前缀认领自己的任务。
 	taskSvc.SetTaskObserver(service.TaskObservers{dramaSegments, marketingSvc})
 
@@ -405,7 +410,9 @@ func NewApp(cfg *config.Config) (*App, error) {
 	})
 
 	return &App{
+		marketing:  marketingSvc,
 		fx:         fx.New(pricingRepo, outboundIPPolicy(cfg)),
+		drama:      dramaSvc,
 		cfg:        cfg,
 		db:         db,
 		rdb:        rdb,
@@ -537,6 +544,12 @@ func (a *App) Run(ctx context.Context) error {
 		}
 	}()
 	defer func() { fxCancel(); <-fxDone }()
+
+	// 营销租约恢复独立于River重投；关闭时先停止扫描再关库。
+	marketingCtx, marketingCancel := context.WithCancel(ctx)
+	marketingDone := make(chan struct{})
+	go func() { defer close(marketingDone); a.maintainMarketing(marketingCtx) }()
+	defer func() { marketingCancel(); <-marketingDone }()
 
 	// 生成任务队列：状态全在 DB 里，重启后自然接着处理（对账会把没有 job 的任务补上）；退出时先停 HTTP 再等在途任务处理完，最后才关库
 	queueCtx, queueCancel := context.WithCancel(context.Background())
@@ -753,6 +766,9 @@ func (a *App) cleanupObserve(ctx context.Context) {
 }
 
 func (a *App) close() {
+	if a.drama != nil {
+		a.drama.ClosePreviews()
+	}
 	// 画布 Agent 的进程要先于关库停：它们退出后的状态修正（标为中断）还要写库
 	if a.agent != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

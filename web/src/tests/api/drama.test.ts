@@ -103,6 +103,18 @@ describe("api/drama：请求体", () => {
       revision: 2,
       script_md: "正文",
     });
+    expect(
+      toUpdateEpisodeBody({ revision: 5, expectedEpisodeId: "ep-a", scriptMd: "正文" }),
+    ).toEqual({
+      revision: 5,
+      expected_episode_id: "ep-a",
+      script_md: "正文",
+    });
+    expect(toUpdateEpisodeBody({ revision: 5, expectedEpisodeId: "", scriptMd: "正文" })).toEqual({
+      revision: 5,
+      expected_episode_id: "",
+      script_md: "正文",
+    });
   });
 
   test("任务请求体：比例为空串不发", () => {
@@ -195,8 +207,17 @@ describe("api/drama：请求", () => {
       ...rawDrama().episodes![0],
       script_md: "正文",
     });
-    const episode = await updateEpisode("1a2b", 1, { revision: 2, scriptMd: "正文" });
+    const episode = await updateEpisode("1a2b", 1, {
+      revision: 2,
+      expectedEpisodeId: "ep-a",
+      scriptMd: "正文",
+    });
     expect(patch.mock.calls[1][0]).toBe("/dramas/1a2b/episodes/1");
+    expect(patch.mock.calls[1][1]).toEqual({
+      revision: 2,
+      expected_episode_id: "ep-a",
+      script_md: "正文",
+    });
     expect(episode.scriptMd).toBe("正文");
   });
 

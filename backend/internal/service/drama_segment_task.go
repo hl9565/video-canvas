@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/logger"
 	"video-canvas/internal/repository"
 )
 
@@ -39,12 +42,16 @@ func (s *DramaSegmentService) readView(ctx context.Context, userID, sid uint64) 
 		if !changed {
 			return nil
 		}
-		return tx.SaveSegment(ctx, row, row.Revision)
+		if err := tx.SaveSegment(ctx, row, row.Revision); err != nil {
+			return err
+		}
+		ep, err = tx.SegmentEpisode(ctx, userID, row.EpisodeID)
+		return err
 	})
 	if err != nil {
 		return nil, nil, nil, false, segmentError(err)
 	}
-	v, err := s.segmentView(ctx, row, ep.No, takes)
+	v, err := s.segmentView(ctx, row, ep.No, ep.SegmentVersion, takes)
 	return v, p, ep, changed, err
 }
 
@@ -80,13 +87,23 @@ func segmentOutputAsset(task *model.GenerationTask, kind string) (uint64, error)
 	return 0, nil
 }
 
-// segmentView 状态优先反映最新take，已有采用不掩盖新一轮生成或失败。
-func (s *DramaSegmentService) segmentView(ctx context.Context, row *model.DramaSegment, no int, tasks []model.GenerationTask) (*model.DramaSegmentView, error) {
+// segmentView 状态优先反映最新take，已有采用不掩盖新一轮生成或失败；读取探测失败时降级为空帧数。
+func (s *DramaSegmentService) segmentView(ctx context.Context, row *model.DramaSegment, no int, segVersion int64, tasks []model.GenerationTask) (*model.DramaSegmentView, error) {
 	adaptations, err := segmentAdaptations(row)
 	if err != nil {
 		return nil, err
 	}
-	v := &model.DramaSegmentView{ID: idcodec.ID(row.ID), EpisodeNo: no, Seq: row.Seq, Seconds: row.Seconds, Prompt: row.Prompt, Adaptations: adaptations, Takes: []model.DramaSegmentTakeView{}, Status: "idle", Revision: row.Revision, UpdatedAt: row.UpdatedAt}
+	v := &model.DramaSegmentView{ID: idcodec.ID(row.ID), EpisodeNo: no, Seq: row.Seq, Seconds: row.Seconds, Prompt: row.Prompt, Adaptations: adaptations, Takes: []model.DramaSegmentTakeView{}, Status: "idle", Revision: row.Revision, SegmentVersion: segVersion, UpdatedAt: row.UpdatedAt}
+	v.Edit = model.DramaSegmentEditView{SourceInF: row.SourceInF, SourceOutF: row.SourceOutF, MuteOriginal: row.MuteOriginal, AudioGainDB: row.AudioGainDB, NativeIsDialogue: row.NativeIsDialogue, AvPtsOffsetMs: row.AvPtsOffsetMs}
+	frames, probeErr := s.resolveSegmentSourceFrames(ctx, row.UserID, row.ChosenTaskID, tasks)
+	if probeErr != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		logger.Warn("片段读取探测源帧数失败，降级为未知帧数", zap.Uint64("segment_id", row.ID), zap.Error(probeErr))
+	} else {
+		v.SourceFrameCount = frames
+	}
 	if row.ChosenTaskID != nil {
 		v.ChosenTaskID, v.Status = idcodec.Encode(*row.ChosenTaskID), "done"
 	}

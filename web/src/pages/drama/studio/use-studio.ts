@@ -13,11 +13,25 @@ import {
   adaptSegment,
   addSegment,
   deleteSegment,
+  quoteSegment,
   reorderSegments,
   updateSegment,
 } from "@/api/drama";
-import { DRAMA_ERR, dramaErrorMessage, isDramaError, isRevisionConflict } from "@/api/drama/errors";
-import type { Drama, EpisodeSummary, Segment, UpdateSegmentInput } from "@/api/drama/type";
+import {
+  DRAMA_ERR,
+  dramaErrorMessage,
+  isDramaError,
+  isEditInvalidError,
+  isQuoteExpiredError,
+  isRevisionConflict,
+} from "@/api/drama/errors";
+import type {
+  Drama,
+  EpisodeSummary,
+  Segment,
+  TaskQuote,
+  UpdateSegmentInput,
+} from "@/api/drama/type";
 import { confirm } from "@/components/admin-ui/confirm-dialog";
 import { choose as chooseOption } from "@/components/drama/choice-dialog";
 import { useTextHashes } from "@/hooks/use-text-hashes";
@@ -27,6 +41,7 @@ import { useCreditsStore } from "@/store/credits";
 import { useDramaJobsStore } from "@/store/drama";
 import { segmentKey, useDramaSegmentsStore } from "@/store/drama-segments";
 import { overridesForModel, useStudioPrefs, useStudioPrefsStore } from "@/store/drama-studio";
+import { hasNonDefaultSegmentEdit, segmentEditOf } from "@/utils/drama/segment-trim";
 import {
   adaptationDurationMismatch,
   adaptState,
@@ -63,7 +78,8 @@ import { priceSpecOf } from "@/utils/tasks/capabilities";
 import { quote } from "@/utils/pricing/quote";
 import { ApiError } from "@/utils/requests/request";
 
-import { summarizeSave, type SaveSummary } from "../workspace/use-workspace";
+import { DramaWorkspaceContext } from "../workspace/context";
+import { summarizeSave, type DramaWorkspace, type SaveSummary } from "../workspace/use-workspace";
 import type { AutosaveStatus } from "@/utils/drama/autosave";
 
 const NO_SEGMENTS: Segment[] = [];
@@ -71,6 +87,24 @@ const NO_SEGMENTS: Segment[] = [];
 const POLL_MS = 8000;
 /** 新增片段的默认时长（秒），不超过模型上限 */
 const DEFAULT_SECONDS = 10;
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalJson(v)}`).join(",")}}`;
+}
+
+function sameQuoteTerms(a: TaskQuote, b: TaskQuote): boolean {
+  return (
+    a.credits === b.credits &&
+    a.priceFingerprint === b.priceFingerprint &&
+    a.rawSize === b.rawSize &&
+    canonicalJson(a.effectiveInput) === canonicalJson(b.effectiveInput)
+  );
+}
 
 /** 片段工作区的全部状态与动作；各区域组件从 context 取 */
 export type Studio = {
@@ -106,8 +140,22 @@ export type Studio = {
   adaptStateOf: (segment: Segment) => AdaptState | "busy" | null;
   /** 选中片段此刻的组装结果 */
   plan: SegmentPlan | null;
-  /** 选中片段的预估积分；算不出来为 undefined */
+  /** 选中片段的预估 / 报价积分；算不出来为 undefined */
   credits: number | undefined;
+  /** 选中片段最近一次服务端报价状态（含刷新入口与 67029 过期标记） */
+  quoteState?: {
+    quote: TaskQuote | null;
+    loading: boolean;
+    expired: boolean;
+    error: string | null;
+    refresh: () => Promise<TaskQuote | null>;
+  };
+  /** 共享修剪抽屉状态（Preview / ClipBar / TakeCarousel 共用） */
+  trimDrawer?: {
+    target: { segmentId: string; pendingTaskId?: string | null } | null;
+    open: (segmentId: string, pendingTaskId?: string | null) => void;
+    close: () => void;
+  };
   availableCredits: number | null;
   save: SaveSummary;
   reportSave: (key: string, status: AutosaveStatus) => void;
@@ -120,7 +168,11 @@ export type Studio = {
     remove: (segment: Segment) => Promise<void>;
     reorder: (ids: string[]) => Promise<void>;
     setSeconds: (segment: Segment, seconds: number) => Promise<void>;
-    patch: (sid: string, fields: Omit<UpdateSegmentInput, "revision">) => Promise<Segment>;
+    patch: (
+      sid: string,
+      fields: Omit<UpdateSegmentInput, "revision">,
+      options?: { expectedRevision?: number },
+    ) => Promise<Segment>;
     choose: (segment: Segment, taskId: string) => Promise<void>;
     generate: (segment: Segment) => Promise<void>;
     batch: () => Promise<void>;
@@ -157,9 +209,45 @@ export function useStudio(): Studio {
  * 片段工作区的数据层：片段列表（HTTP 读取 + WebSocket 推送 + 生成中兜底轮询）、资产库、模型与偏好、
  * 选中的片段及其参考素材组装、积分预估，以及增删改排序、采用结果、立即生成、批量生成这些动作。
  */
-export function useStudioState(drama: Drama, no: number, refresh: () => Promise<void>): Studio {
+export function useStudioState(
+  drama: Drama,
+  no: number,
+  refresh: () => Promise<void>,
+  applyEpisode?: DramaWorkspace["applyEpisode"],
+): Studio {
   const dramaId = drama.id;
   const episode = drama.episodes.find((ep) => ep.no === no);
+  const episodeId = episode?.id;
+  const workspace = useContext(DramaWorkspaceContext);
+  const syncEpisode = applyEpisode ?? workspace?.applyEpisode;
+  const syncEpisodeVersion = useCallback(
+    (...items: ReadonlyArray<Pick<Segment, "segmentVersion" | "episodeId"> | null | undefined>) => {
+      let maxVersion: number | undefined;
+      let itemEpisodeId: string | undefined;
+      for (const item of items) {
+        if (!itemEpisodeId && item?.episodeId) {
+          itemEpisodeId = item.episodeId;
+        }
+        if (typeof item?.segmentVersion === "number") {
+          maxVersion =
+            maxVersion === undefined
+              ? item.segmentVersion
+              : Math.max(maxVersion, item.segmentVersion);
+        }
+      }
+      if (maxVersion !== undefined) {
+        const targetId = itemEpisodeId ?? episodeId;
+        syncEpisode?.(no, {
+          ...(targetId ? { id: targetId } : {}),
+          segmentVersion: maxVersion,
+        });
+      }
+    },
+    [episodeId, no, syncEpisode],
+  );
+  const triggerRefresh = useCallback(() => {
+    void Promise.resolve(refresh()).catch(() => undefined);
+  }, [refresh]);
   const key = segmentKey(dramaId, no);
   const list = useDramaSegmentsStore((state) => state.byEpisode[key]);
   const segments = list ?? NO_SEGMENTS;
@@ -203,10 +291,6 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
   const video = useDramaVideoModel(dramaId, drama.videoModel);
   const prefs = useStudioPrefs(dramaId);
   const activeModelKey = video.model?.key ?? "";
-  const modelOverrides = useMemo(
-    () => overridesForModel(prefs, activeModelKey || undefined),
-    [activeModelKey, prefs],
-  );
   useEffect(() => {
     if (!activeModelKey || Object.keys(prefs.overrides).length === 0) return;
     useStudioPrefsStore
@@ -218,6 +302,10 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
   const selected = useMemo(
     () => segments.find((item) => item.id === selectedId) ?? segments[0] ?? null,
     [segments, selectedId],
+  );
+  const modelOverrides = useMemo(
+    () => overridesForModel(prefs, activeModelKey || undefined, selected?.id),
+    [activeModelKey, prefs, selected?.id],
   );
   const caps = video.model?.capabilities;
   const format = targetFormat(caps);
@@ -267,32 +355,136 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         : null,
     [assets, caps, drama.ratio, modelOverrides, prompt, selected],
   );
+  const [quoteSnapshot, setQuoteSnapshot] = useState<{
+    key: string;
+    quote: TaskQuote | null;
+    loading: boolean;
+    expired: boolean;
+    error: string | null;
+  } | null>(null);
+  const quoteSeqRef = useRef(0);
+  const quoteSnapshotRef = useRef(quoteSnapshot);
+  useEffect(() => {
+    quoteSnapshotRef.current = quoteSnapshot;
+  }, [quoteSnapshot]);
+
+  const singleShotBlocked =
+    episode?.editSchema === 1 && plan?.input?.count !== undefined && Number(plan.input.count) !== 1;
+  const canLiveQuote =
+    !!selected &&
+    !!video.model &&
+    !!plan &&
+    Object.keys(plan.errors).length === 0 &&
+    Object.keys(plan.input).length > 0 &&
+    !singleShotBlocked;
+  const quoteInputJson = useMemo(() => (plan ? canonicalJson(plan.input) : ""), [plan]);
+  const liveQuoteKey =
+    canLiveQuote && selected && video.model
+      ? `${selected.id}::${video.model.key}::${quoteInputJson}`
+      : "";
+
+  const refreshQuote = useCallback(async (): Promise<TaskQuote | null> => {
+    if (!selected || !video.model || !plan || !liveQuoteKey) return null;
+    const seq = ++quoteSeqRef.current;
+    setQuoteSnapshot((prev) => ({
+      key: liveQuoteKey,
+      quote: prev?.key === liveQuoteKey ? prev.quote : null,
+      loading: true,
+      expired: false,
+      error: null,
+    }));
+    try {
+      const next = await quoteSegment(selected.id, {
+        modelId: video.model.key,
+        input: plan.input,
+      });
+      if (seq !== quoteSeqRef.current) return null;
+      setQuoteSnapshot({
+        key: liveQuoteKey,
+        quote: next,
+        loading: false,
+        expired: false,
+        error: null,
+      });
+      return next;
+    } catch (e) {
+      if (seq !== quoteSeqRef.current) return null;
+      setQuoteSnapshot((prev) => ({
+        key: liveQuoteKey,
+        quote: prev?.key === liveQuoteKey ? prev.quote : null,
+        loading: false,
+        expired: isQuoteExpiredError(e),
+        error: dramaErrorMessage(e, "获取报价失败"),
+      }));
+      return null;
+    }
+  }, [liveQuoteKey, plan, selected, video.model]);
+
+  useEffect(() => {
+    if (!liveQuoteKey) return;
+    const timer = setTimeout(() => {
+      void refreshQuote();
+    }, 60);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [liveQuoteKey, refreshQuote]);
+
+  const activeQuoteState =
+    liveQuoteKey && quoteSnapshot?.key === liveQuoteKey ? quoteSnapshot : null;
+  const activeServerQuote = activeQuoteState?.quote ?? null;
+  const quoteLoading = activeQuoteState?.loading ?? false;
+  const quoteExpired = activeQuoteState?.expired ?? false;
+  const quoteError = activeQuoteState?.error ?? null;
+
   const credits = useMemo(() => {
+    if (activeServerQuote) return activeServerQuote.credits;
     if (!plan || !video.model || Object.keys(plan.input).length === 0) return undefined;
     return quote(video.model.pricing, caps, priceSpecOf(caps, plan.input));
-  }, [caps, plan, video.model]);
+  }, [activeServerQuote, caps, plan, video.model]);
 
   const reportSave = useCallback((name: string, status: AutosaveStatus) => {
     setSaveStates((prev) => (prev[name] === status ? prev : { ...prev, [name]: status }));
   }, []);
   const save = useMemo(() => summarizeSave(saveStates), [saveStates]);
 
-  /** 改片段：同一个片段的修改串行，永远用 store 里最新的 revision；冲突 / 不存在时提示并重新读取 */
+  /** 改片段：同一个片段的修改串行，默认取 store 最新 revision；若传入 expectedRevision 则严格按基线 CAS */
   const patch = useCallback<Studio["actions"]["patch"]>(
-    (sid, fields) => {
+    (sid, fields, options) => {
       const run = async () => {
         const current = useDramaSegmentsStore
           .getState()
           .byEpisode[key]?.find((item) => item.id === sid);
         if (!current) throw new Error("片段不存在");
+        const expectedRev = options?.expectedRevision ?? current.revision;
+        if (
+          options?.expectedRevision !== undefined &&
+          current.revision !== options.expectedRevision
+        ) {
+          toast.warning("这个片段在别处被修改过，已为你加载最新内容");
+          void reloadSegments(dramaId, no);
+          throw new ApiError("这个片段在别处被修改过，请重新载入最新版本后再保存", 30002, 409);
+        }
         try {
-          const next = await updateSegment(sid, { ...fields, revision: current.revision });
+          const next = await updateSegment(sid, { ...fields, revision: expectedRev });
           useDramaSegmentsStore.getState().apply(dramaId, no, next);
+          syncEpisodeVersion(next);
+          if (
+            fields.edit !== undefined ||
+            fields.chosenTaskId !== undefined ||
+            fields.expectedTaskId !== undefined
+          ) {
+            triggerRefresh();
+          }
           return next;
         } catch (e) {
           if (isRevisionConflict(e)) {
             toast.warning("这个片段在别处被修改过，已为你加载最新内容");
             void reloadSegments(dramaId, no);
+          } else if (isDramaError(e, DRAMA_ERR.jobBusy)) {
+            toast.warning(dramaErrorMessage(e, "这一集还有任务在跑，请等任务结束后再修改"));
+          } else if (isEditInvalidError(e)) {
+            toast.error(dramaErrorMessage(e, "分镜剪辑参数不合法"));
           } else if (isDramaError(e, DRAMA_ERR.segmentNotFound)) {
             toast.error(dramaErrorMessage(e));
             useDramaSegmentsStore.getState().remove(dramaId, no, sid);
@@ -313,7 +505,7 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
       );
       return result;
     },
-    [dramaId, key, no],
+    [dramaId, key, no, syncEpisodeVersion, triggerRefresh],
   );
 
   /** 带保存状态的一次性修改（时长、采用） */
@@ -387,6 +579,7 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         if (!current.prompt.trim()) throw new Error("原稿是空的，先写好原稿再转写");
         const next = await adaptSegment(segment.id, { format, revision: current.revision });
         useDramaSegmentsStore.getState().apply(dramaId, no, next);
+        syncEpisodeVersion(next);
         return true;
       } catch (e) {
         const message =
@@ -403,7 +596,7 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         markAdapting(segment.id, false);
       }
     },
-    [adapting, dramaId, flushEditors, format, latestOf, markAdapting, no],
+    [adapting, dramaId, flushEditors, format, latestOf, markAdapting, no, syncEpisodeVersion],
   );
 
   /**
@@ -416,24 +609,144 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
     async (segment: Segment, latest: RefAsset[]) => {
       const model = video.model;
       if (!model) return { ok: false as const, message: "没有可用的视频模型" };
+      const currentPrefs = useStudioPrefsStore.getState().byDrama[dramaId] ?? prefs;
+      const segOverrides = overridesForModel(currentPrefs, model.key, segment.id);
       const built = planSegmentInput({
         caps: model.capabilities,
         prompt: segment.prompt,
         seconds: segment.seconds,
         ratio: drama.ratio,
-        overrides: modelOverrides,
+        overrides: segOverrides,
         assets: latest,
       });
       const firstError = Object.values(built.errors)[0];
       if (firstError) return { ok: false as const, message: firstError };
+      if (
+        episode?.editSchema === 1 &&
+        built.input.count !== undefined &&
+        Number(built.input.count) !== 1
+      ) {
+        return {
+          ok: false as const,
+          message: "精裁模式（edit_schema=1）单次仅支持生成 1 条，请先将生成数量改为 1",
+        };
+      }
+
+      const quoteKey = `${segment.id}::${model.key}::${canonicalJson(built.input)}`;
+      const prevDisplayed =
+        selected?.id === segment.id &&
+        quoteSnapshotRef.current?.key === quoteKey &&
+        !quoteSnapshotRef.current.expired
+          ? quoteSnapshotRef.current.quote
+          : null;
+
+      const fetchQuote = async () => {
+        const quoted = await quoteSegment(segment.id, {
+          modelId: model.key,
+          input: built.input,
+        });
+        if (selected?.id === segment.id) {
+          setQuoteSnapshot({
+            key: quoteKey,
+            quote: quoted,
+            loading: false,
+            expired: false,
+            error: null,
+          });
+        }
+        return quoted;
+      };
+
+      const errorText = (err: unknown) => {
+        if (
+          isEditInvalidError(err) ||
+          isQuoteExpiredError(err) ||
+          (typeof (err as { code?: unknown })?.code === "number" &&
+            (err as { code: number }).code >= 67000)
+        ) {
+          return dramaErrorMessage(err);
+        }
+        return describeSubmitError(err).message;
+      };
+
+      let quoted: TaskQuote;
       try {
-        await submitSegmentTask(segment.id, { model_id: model.key, input: built.input });
+        quoted = await fetchQuote();
+      } catch (e) {
+        if (isQuoteExpiredError(e) && selected?.id === segment.id) {
+          setQuoteSnapshot((prev) => ({
+            key: quoteKey,
+            quote: prev?.key === quoteKey ? prev.quote : null,
+            loading: false,
+            expired: true,
+            error: dramaErrorMessage(e),
+          }));
+        }
+        return { ok: false as const, message: errorText(e) };
+      }
+
+      if (prevDisplayed && !sameQuoteTerms(prevDisplayed, quoted)) {
+        const msg = `报价已更新（${prevDisplayed.credits} → ${quoted.credits} 积分），请核对生效参数后再次点击生成`;
+        if (selected?.id === segment.id) {
+          setQuoteSnapshot({
+            key: quoteKey,
+            quote: quoted,
+            loading: false,
+            expired: false,
+            error: msg,
+          });
+        }
+        return { ok: false as const, message: msg };
+      }
+
+      try {
+        await submitSegmentTask(segment.id, {
+          model_id: model.key,
+          input: built.input,
+          quote_token: quoted.quoteToken,
+        });
         return { ok: true as const };
       } catch (e) {
-        return { ok: false as const, message: describeSubmitError(e).message };
+        if (isQuoteExpiredError(e)) {
+          try {
+            const refreshed = await fetchQuote();
+            // 仅当刷新前后价格、指纹与生效参数完全一致时自动重提；否则停下同步 UI 并等待用户再次点击
+            if (!sameQuoteTerms(quoted, refreshed)) {
+              const msg = `报价已过期且计费或生效参数已变化（${quoted.credits} → ${refreshed.credits} 积分），请核对后再次点击生成`;
+              if (selected?.id === segment.id) {
+                setQuoteSnapshot({
+                  key: quoteKey,
+                  quote: refreshed,
+                  loading: false,
+                  expired: false,
+                  error: msg,
+                });
+              }
+              return { ok: false as const, message: msg };
+            }
+            await submitSegmentTask(segment.id, {
+              model_id: model.key,
+              input: built.input,
+              quote_token: refreshed.quoteToken,
+            });
+            return { ok: true as const };
+          } catch (retryErr) {
+            if (isQuoteExpiredError(retryErr) && selected?.id === segment.id) {
+              setQuoteSnapshot((prev) => ({
+                key: quoteKey,
+                quote: prev?.key === quoteKey ? prev.quote : null,
+                loading: false,
+                expired: true,
+                error: dramaErrorMessage(retryErr),
+              }));
+            }
+            return { ok: false as const, message: errorText(retryErr) };
+          }
+        }
+        return { ok: false as const, message: errorText(e) };
       }
     },
-    [drama.ratio, modelOverrides, video.model],
+    [drama.ratio, dramaId, episode?.editSchema, prefs, selected?.id, video.model],
   );
 
   /**
@@ -546,12 +859,13 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
           toast.error("资产信息读取失败，请稍后重试");
           return;
         }
+        const currentPrefs = useStudioPrefsStore.getState().byDrama[dramaId] ?? prefs;
         const preview = planSegmentInput({
           caps: video.model?.capabilities,
           prompt: current.prompt,
           seconds: current.seconds,
           ratio: drama.ratio,
-          overrides: modelOverrides,
+          overrides: overridesForModel(currentPrefs, video.model?.key, current.id),
           assets: latest,
         });
         if (preview.deadLabels.length > 0) {
@@ -578,8 +892,8 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
       flushEditors,
       freshAssets,
       markSubmitting,
-      modelOverrides,
       no,
+      prefs,
       resolveSubmit,
       submitVideo,
       submitting,
@@ -723,6 +1037,7 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
       return;
     }
     // 引用失效的先一起问一次，允许继续
+    const currentPrefs = useStudioPrefsStore.getState().byDrama[dramaId] ?? prefs;
     const dead = new Set<string>();
     for (const item of targets) {
       const planned = planSegmentInput({
@@ -730,7 +1045,7 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         prompt: item.prompt,
         seconds: item.seconds,
         ratio: drama.ratio,
-        overrides: modelOverrides,
+        overrides: overridesForModel(currentPrefs, video.model?.key, item.id),
         assets: latest,
       });
       planned.deadLabels.forEach((label) => dead.add(label));
@@ -766,8 +1081,8 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
     freshAssets,
     key,
     markSubmitting,
-    modelOverrides,
     no,
+    prefs,
     prepareBatch,
     submitVideo,
     video.model,
@@ -779,12 +1094,13 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         seconds: effectiveDuration(video.model?.capabilities, DEFAULT_SECONDS).value,
       });
       useDramaSegmentsStore.getState().apply(dramaId, no, created);
+      syncEpisodeVersion(created);
       setSelectedId(created.id);
-      void refresh();
+      triggerRefresh();
     } catch (e) {
       toast.error(dramaErrorMessage(e, "新增失败，请稍后重试"));
     }
-  }, [dramaId, no, refresh, video.model]);
+  }, [dramaId, no, syncEpisodeVersion, triggerRefresh, video.model]);
 
   const remove = useCallback<Studio["actions"]["remove"]>(
     async (segment) => {
@@ -798,9 +1114,9 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
       if (!ok) return;
       useDramaSegmentsStore.getState().remove(dramaId, no, segment.id);
       void reloadSegments(dramaId, no);
-      void refresh();
+      triggerRefresh();
     },
-    [dramaId, no, refresh],
+    [dramaId, no, triggerRefresh],
   );
 
   const reorder = useCallback<Studio["actions"]["reorder"]>(
@@ -810,26 +1126,26 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
       // 先在本地换序，界面不等请求
       useDramaSegmentsStore.getState().setList(dramaId, no, applyOrder(current, ids));
       try {
-        useDramaSegmentsStore
-          .getState()
-          .setList(dramaId, no, await reorderSegments(dramaId, no, ids));
+        const reordered = await reorderSegments(dramaId, no, ids);
+        useDramaSegmentsStore.getState().setList(dramaId, no, reordered);
+        syncEpisodeVersion(...reordered);
         // 顺序变了：成片是否过期要跟着刷新
-        void refresh();
+        triggerRefresh();
       } catch (e) {
         toast.error(dramaErrorMessage(e, "排序失败，已恢复原顺序"));
         void reloadSegments(dramaId, no);
       }
     },
-    [dramaId, key, no, refresh],
+    [dramaId, key, no, syncEpisodeVersion, triggerRefresh],
   );
 
   const setSeconds = useCallback<Studio["actions"]["setSeconds"]>(
     async (segment, seconds) => {
       if (seconds === segment.seconds) return;
       await patchWithStatus(segment.id, { seconds }).catch(() => undefined);
-      void refresh();
+      triggerRefresh();
     },
-    [patchWithStatus, refresh],
+    [patchWithStatus, triggerRefresh],
   );
 
   const choose = useCallback<Studio["actions"]["choose"]>(
@@ -840,10 +1156,28 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
         toast.error(dramaErrorMessage(null, "只能采用本片段已成功的结果"));
         return;
       }
-      await patchWithStatus(segment.id, { chosenTaskId: taskId }).catch(() => undefined);
-      void refresh();
+      let resetEditOnTaskChange: boolean | undefined;
+      if (hasNonDefaultSegmentEdit(segmentEditOf(segment))) {
+        const picked = await chooseOption<"reset" | "keep">({
+          title: "当前镜头已有剪辑或原声设置",
+          description:
+            "切换采用的视频版本时，请选择重置精裁与原声参数，或保留当前参数继续应用到新视频。",
+          options: [
+            { value: "reset", label: "重置剪辑并切换", primary: true },
+            { value: "keep", label: "保留剪辑并切换" },
+          ],
+        });
+        if (!picked) return;
+        resetEditOnTaskChange = picked === "reset";
+      }
+      await patchWithStatus(segment.id, {
+        chosenTaskId: taskId,
+        expectedTaskId: segment.chosenTaskId || "",
+        ...(resetEditOnTaskChange !== undefined ? { resetEditOnTaskChange } : {}),
+      }).catch(() => undefined);
+      triggerRefresh();
     },
-    [patchWithStatus, refresh],
+    [patchWithStatus, triggerRefresh],
   );
 
   const registerEditor = useCallback((handle: EditorHandle) => {
@@ -858,9 +1192,42 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
       if (!activeModelKey) return;
       useStudioPrefsStore
         .getState()
-        .setModelOverride(dramaId, activeModelKey, name, value, drama.videoModel || activeModelKey);
+        .setModelOverride(
+          dramaId,
+          activeModelKey,
+          name,
+          value,
+          drama.videoModel || activeModelKey,
+          selected?.id,
+        );
     },
-    [activeModelKey, drama.videoModel, dramaId],
+    [activeModelKey, drama.videoModel, dramaId, selected?.id],
+  );
+
+  const [trimTarget, setTrimTarget] = useState<{
+    segmentId: string;
+    pendingTaskId?: string | null;
+  } | null>(null);
+  const openTrim = useCallback((segmentId: string, pendingTaskId?: string | null) => {
+    setTrimTarget({ segmentId, pendingTaskId: pendingTaskId ?? null });
+  }, []);
+  const closeTrim = useCallback(() => {
+    setTrimTarget(null);
+  }, []);
+  const trimDrawer = useMemo(
+    () => ({ target: trimTarget, open: openTrim, close: closeTrim }),
+    [closeTrim, openTrim, trimTarget],
+  );
+
+  const quoteState = useMemo(
+    () => ({
+      quote: activeServerQuote,
+      loading: quoteLoading,
+      expired: quoteExpired,
+      error: quoteError,
+      refresh: refreshQuote,
+    }),
+    [activeServerQuote, quoteError, quoteExpired, quoteLoading, refreshQuote],
   );
 
   return {
@@ -886,6 +1253,8 @@ export function useStudioState(drama: Drama, no: number, refresh: () => Promise<
     adaptStateOf,
     plan,
     credits,
+    quoteState,
+    trimDrawer,
     availableCredits,
     save,
     reportSave,

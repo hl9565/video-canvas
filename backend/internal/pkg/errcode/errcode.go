@@ -74,6 +74,7 @@ var (
 	ErrConfigNotFound      = New(40011, "配置不存在", http.StatusNotFound)
 	ErrSecretNotSet        = New(40013, "凭证尚未设置", http.StatusConflict)
 	ErrWSTicketInvalid     = New(40014, "连接凭证无效或已过期", http.StatusUnauthorized)
+	ErrIdempotencyConflict = New(40015, "幂等键已用于其他请求", http.StatusConflict)
 )
 
 // 协议插件 / 渠道 / 模型删除 5xxxx
@@ -272,6 +273,9 @@ var (
 	ErrDramaAdaptBusy            = New(67025, "这个片段正在转写", http.StatusConflict)
 	ErrDramaAdaptFailed          = New(67026, "转写结果不合格，请重试", http.StatusBadGateway)
 	ErrDramaAdaptMissing         = New(67027, "还没有这个格式的转写稿", http.StatusBadRequest)
+	ErrDramaManifestStale        = New(67028, "剧本分镜版本已变更，请刷新清单", http.StatusConflict)
+	ErrDramaQuoteExpired         = New(67029, "生成报价已失效，请重新获取报价", http.StatusConflict)
+	ErrDramaEditInvalid          = New(67030, "分镜剪辑参数不合法", http.StatusBadRequest)
 )
 
 // 环节协议层（stepkit）与营销工作室 68xxx。68001–68011、68015、68016 由营销业务使用（见 docs/design/营销工作室/接口契约.md §6），

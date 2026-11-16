@@ -13,6 +13,7 @@ import { Preview } from "./preview";
 import { StudioBar } from "./studio-bar";
 import { PlaybackContext, usePlayback } from "./use-playback";
 import { StudioContext, useStudio, useStudioState } from "./use-studio";
+import type { DramaWorkspace } from "../workspace/use-workspace";
 
 /**
  * 片场（工作台里的一道工序）：某一集的片段制作。
@@ -23,12 +24,14 @@ export function StudioView({
   drama,
   no,
   refresh,
+  applyEpisode,
 }: {
   drama: Drama;
   no: number;
   refresh: () => Promise<void>;
+  applyEpisode?: DramaWorkspace["applyEpisode"];
 }) {
-  const state = useStudioState(drama, no, refresh);
+  const state = useStudioState(drama, no, refresh, applyEpisode);
   return (
     <StudioContext.Provider value={state}>
       <Shell />

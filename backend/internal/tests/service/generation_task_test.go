@@ -44,7 +44,8 @@ type fakeTaskRepo struct {
 	enqueued       []uint64                  // 事务里入队的任务 id（事务回滚时一并撤销，和真实的“job 与任务同一个事务”一致）
 	agentNotified  []uint64                  // 事务里为 Agent 入队门铃的任务 id（同样随事务回滚）
 	slotReqs       []repository.SlotRequest  // AcquireSlot 收到的申请参数
-	slotResult     repository.SlotResult     // AcquireSlot 的返回值，空表示拿到
+	savepoints     map[int]taskRepoSnapshot
+	slotResult     repository.SlotResult // AcquireSlot 的返回值，空表示拿到
 }
 
 func newFakeTaskRepo() *fakeTaskRepo {
@@ -221,6 +222,62 @@ func (f *fakeTaskRepo) EnsureCredit(ctx context.Context, userID uint64, initial 
 	return nil
 }
 
+func (f *fakeTaskRepo) TxEnsureCredit(ctx context.Context, userID uint64, initial int) error {
+	if err := f.errs["TxEnsureCredit"]; err != nil {
+		return err
+	}
+	return f.EnsureCredit(ctx, userID, initial)
+}
+
+type taskRepoSnapshot struct {
+	tasks              map[uint64]*model.GenerationTask
+	credits            map[uint64]*model.UserCredit
+	ledger             []model.CreditLedger
+	enqueued, notified int
+}
+
+func (f *fakeTaskRepo) snapshot() taskRepoSnapshot {
+	state := taskRepoSnapshot{tasks: map[uint64]*model.GenerationTask{}, credits: map[uint64]*model.UserCredit{}, ledger: append([]model.CreditLedger(nil), f.ledger...), enqueued: len(f.enqueued), notified: len(f.agentNotified)}
+	for id, task := range f.tasks {
+		cp := *task
+		state.tasks[id] = &cp
+	}
+	for id, credit := range f.credits {
+		cp := *credit
+		state.credits[id] = &cp
+	}
+	return state
+}
+
+func (f *fakeTaskRepo) ExecSavepoint(_ context.Context, i int) error {
+	if err := f.errs["ExecSavepoint"]; err != nil {
+		return err
+	}
+	if f.savepoints == nil {
+		f.savepoints = map[int]taskRepoSnapshot{}
+	}
+	f.savepoints[i] = f.snapshot()
+	return nil
+}
+
+func (f *fakeTaskRepo) RollbackSavepoint(_ context.Context, i int) error {
+	if err := f.errs["RollbackSavepoint"]; err != nil {
+		return err
+	}
+	state := f.savepoints[i]
+	f.tasks, f.credits, f.ledger = state.tasks, state.credits, state.ledger
+	f.enqueued, f.agentNotified = f.enqueued[:state.enqueued], f.agentNotified[:state.notified]
+	return nil
+}
+
+func (f *fakeTaskRepo) ReleaseSavepoint(_ context.Context, i int) error {
+	if err := f.errs["ReleaseSavepoint"]; err != nil {
+		return err
+	}
+	delete(f.savepoints, i)
+	return nil
+}
+
 func (f *fakeTaskRepo) LockCredit(ctx context.Context, userID uint64) (*model.UserCredit, error) {
 	if err := f.errs["LockCredit"]; err != nil {
 		return nil, err
@@ -270,6 +327,13 @@ func (f *fakeTaskRepo) InsertTask(ctx context.Context, t *model.GenerationTask) 
 	cp := *t
 	f.tasks[t.ID] = &cp
 	return true, nil
+}
+
+func (f *fakeTaskRepo) TxInsertTask(ctx context.Context, t *model.GenerationTask) (bool, error) {
+	if err := f.errs["TxInsertTask"]; err != nil {
+		return false, err
+	}
+	return f.InsertTask(ctx, t)
 }
 
 // UpdateIf 复刻真实仓储的语义：状态不在 from 里返回 ErrStateConflict，命中则套用字段并返回更新后的拷贝。
@@ -1043,7 +1107,11 @@ func TestGenerationTaskService_Create_Idempotency(t *testing.T) {
 	t.Run("并发竞争：幂等查询都没看到，唯一索引拦住后回滚并返回赢家的任务", func(t *testing.T) {
 		env := newTaskSvcEnv(defaultTaskLimits())
 		env.repo.addCredit(user, 50, 10)
-		winner := env.repo.addTask(model.GenerationTask{UserID: user, Status: model.TaskPending, IdempotencyKey: "race", Credits: 10})
+		snapJSON, _ := json.Marshal(env.registry.snap)
+		normalized := map[string]any{"prompt": "一只猫", "op": modelcfg.OpT2V}
+		inputJSON, _ := json.Marshal(normalized)
+		cid := uint64(validCreateReq().CanvasID)
+		winner := env.repo.addTask(model.GenerationTask{UserID: user, Status: model.TaskPending, IdempotencyKey: "race", Credits: 10, Kind: model.KindVideo, ModelKey: "m1", CanvasProjectID: &cid, NodeID: validCreateReq().NodeID, InputJSON: inputJSON, ConfigSnapshot: snapJSON})
 		env.repo.hideKeyLookups = 2 // 快速路径和事务内复查都“没看到”赢家
 
 		view, err := createSingle(context.Background(), env.svc, user, "race", validCreateReq())

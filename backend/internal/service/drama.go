@@ -14,6 +14,7 @@ import (
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/pkg/ws"
 	"video-canvas/internal/provider"
 	"video-canvas/internal/repository"
@@ -76,19 +77,22 @@ type DramaModelStreamer interface {
 
 // DramaDeps 短剧服务依赖，文本步骤用后台的 Agent 模型：Registry 选模型，Streamer 经 LLM 网关请求渠道，Secrets 取渠道 Key。
 type DramaDeps struct {
-	Settings     DramaSettingsRepo
-	Skills       DramaSkills
-	Repo         DramaRepo
-	Registry     provider.Registry
-	Streamer     DramaModelStreamer
-	Secrets      provider.SecretResolver
-	Canvas       DramaCanvasWriter
-	Broadcaster  ws.Broadcaster
-	Credits      DramaCreditPolicy
-	CanvasAssets DramaStoryboardCanvasReader
-	Segments     DramaSegmentSummary
-	Compose      DramaVideoComposer
-	Assets       DramaComposeAssets
+	Probes        DramaSegmentProbeStore
+	PreviewSecret string
+	ProbeVideo    func(context.Context, string) (videoframe.NormalizedProbe, error)
+	Settings      DramaSettingsRepo
+	Skills        DramaSkills
+	Repo          DramaRepo
+	Registry      provider.Registry
+	Streamer      DramaModelStreamer
+	Secrets       provider.SecretResolver
+	Canvas        DramaCanvasWriter
+	Broadcaster   ws.Broadcaster
+	Credits       DramaCreditPolicy
+	CanvasAssets  DramaStoryboardCanvasReader
+	Segments      DramaSegmentSummary
+	Compose       DramaVideoComposer
+	Assets        DramaComposeAssets
 	// Covers 和 CoverURL 给列表配封面；任一为空时列表不返回封面。
 	Covers   DramaCoverReader
 	CoverURL func(key string) string
@@ -96,6 +100,9 @@ type DramaDeps struct {
 
 // DramaService 短剧项目和固定流水线的业务入口。
 type DramaService struct {
+	probes       DramaSegmentProbeStore
+	probeVideo   func(context.Context, string) (videoframe.NormalizedProbe, error)
+	preview      *dramaPreviewStore
 	settings     DramaSettingsRepo
 	skills       DramaSkills
 	repo         DramaRepo
@@ -115,7 +122,7 @@ type DramaService struct {
 
 // NewDramaService 创建短剧服务，不启动后台任务。
 func NewDramaService(d DramaDeps) *DramaService {
-	return &DramaService{settings: d.Settings, skills: d.Skills, repo: d.Repo, registry: d.Registry, streamer: d.Streamer, secrets: d.Secrets, canvas: d.Canvas, bc: d.Broadcaster, credits: d.Credits, canvasAssets: d.CanvasAssets, segments: d.Segments, compose: d.Compose, assets: d.Assets, covers: d.Covers, coverURL: d.CoverURL}
+	return &DramaService{probes: d.Probes, probeVideo: dramaProbeVideo(d), preview: newDramaPreviewStore(d.PreviewSecret), settings: d.Settings, skills: d.Skills, repo: d.Repo, registry: d.Registry, streamer: d.Streamer, secrets: d.Secrets, canvas: d.Canvas, bc: d.Broadcaster, credits: d.Credits, canvasAssets: d.CanvasAssets, segments: d.Segments, compose: d.Compose, assets: d.Assets, covers: d.Covers, coverURL: d.CoverURL}
 }
 
 // Create 校验原文和风格，在同一事务建立项目、画布与首个研读任务。
@@ -337,6 +344,7 @@ func (s *DramaService) Update(ctx context.Context, userID, id uint64, req *model
 		if p.Revision != req.Revision {
 			return errcode.ErrCanvasConflict
 		}
+		ratioChanged := req.Ratio != nil && *req.Ratio != p.Ratio
 		fields, err := dramaProjectPatch(p, req)
 		if err != nil {
 			return err
@@ -349,12 +357,24 @@ func (s *DramaService) Update(ctx context.Context, userID, id uint64, req *model
 			raw, _ := json.Marshal(settings)
 			fields["prompt_settings"] = raw
 		}
-		return tx.UpdateProject(ctx, userID, id, req.Revision, fields)
+		if err := tx.UpdateProject(ctx, userID, id, req.Revision, fields); err != nil {
+			return err
+		}
+		if ratioChanged {
+			if bumper, ok := tx.(dramaProjectRatioTx); ok {
+				return bumper.BumpProjectNewSchemaEpisodeVersions(ctx, userID, id)
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, dramaError(err)
 	}
 	return s.Get(ctx, userID, id)
+}
+
+type dramaProjectRatioTx interface {
+	BumpProjectNewSchemaEpisodeVersions(context.Context, uint64, uint64) error
 }
 
 // dramaProjectPatch 仅应用请求中出现的字段，风格始终按最终组合校验。
@@ -433,7 +453,12 @@ func episodeView(e model.DramaEpisode) model.DramaEpisodeView {
 	if status == "" {
 		status = "empty"
 	}
-	return model.DramaEpisodeView{DramaEpisodeSummary: model.DramaEpisodeSummary{No: e.No, Hook: e.Hook, Cliffhanger: e.Cliffhanger, UnitFrom: e.UnitFrom, UnitTo: e.UnitTo, Title: e.Title, Synopsis: e.Synopsis, ScriptStatus: e.ScriptStatus, StoryboardStatus: status, Locked: e.LockedAt != nil, Revision: e.Revision, UpdatedAt: e.UpdatedAt}, ScriptMD: e.ScriptMD}
+	var finalJobID *idcodec.ID
+	if e.FinalComposeJobID != nil {
+		v := idcodec.ID(*e.FinalComposeJobID)
+		finalJobID = &v
+	}
+	return model.DramaEpisodeView{DramaEpisodeSummary: model.DramaEpisodeSummary{ID: idcodec.ID(e.ID), No: e.No, Hook: e.Hook, Cliffhanger: e.Cliffhanger, UnitFrom: e.UnitFrom, UnitTo: e.UnitTo, Title: e.Title, Synopsis: e.Synopsis, ScriptStatus: e.ScriptStatus, StoryboardStatus: status, Locked: e.LockedAt != nil, Revision: e.Revision, SegmentVersion: e.SegmentVersion, EditSchema: e.EditSchema, FinalComposeJobID: finalJobID, UpdatedAt: e.UpdatedAt}, ScriptMD: e.ScriptMD}
 }
 
 // dramaEpisodeView 在基础状态上映射实时片段聚合，避免持久化重复计数。

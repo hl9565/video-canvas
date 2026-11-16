@@ -18,23 +18,41 @@ import (
 
 // reconcileScript 按出片任务对账脚本：状态、任务列表、最近失败原因；成功的成片带封面时更新项目封面。
 func (s *MarketingService) reconcileScript(ctx context.Context, userID, id uint64) (*model.MarketingScript, error) {
-	sc, err := s.repo.Script(ctx, userID, id, false)
+	probe, err := s.repo.Script(ctx, userID, id, false)
 	if err != nil {
 		return nil, err
 	}
-	tasks, err := s.repo.ScriptTasks(ctx, userID, []string{marketingNode(id)})
+	var sc *model.MarketingScript
+	err = s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
+		var err error
+		sc, err = lockMarketingScript(ctx, tx, userID, probe)
+		if err != nil {
+			return err
+		}
+		return reconcileMarketingScriptLocked(ctx, tx, sc)
+	})
+	return sc, err
+}
+
+// reconcileMarketingScriptLocked 仅在Project(active)→Round→Script锁内对账；重写态整行保持，防止回调清零新代状态。
+func reconcileMarketingScriptLocked(ctx context.Context, tx repository.MarketingTx, sc *model.MarketingScript) error {
+	if sc.Status == model.MarketingScriptRewriting {
+		return nil
+	}
+	tasks, err := tx.ScriptTasks(ctx, sc.UserID, []string{marketingNode(sc.ID)})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	status, msg := deriveScriptStatus(sc.Status, tasks)
 	ids := taskIDsJSON(tasks)
-	if status != sc.Status || msg != sc.Error || !sameJSON(ids, sc.TaskIDs) {
-		if err := s.repo.UpdateScript(ctx, id, map[string]any{"status": status, "error": msg, "task_ids": ids}); err != nil {
-			return nil, err
-		}
-		sc.Status, sc.Error, sc.TaskIDs = status, msg, ids
+	if status == sc.Status && msg == sc.Error && sameJSON(ids, sc.TaskIDs) {
+		return nil
 	}
-	return sc, nil
+	if err := tx.UpdateScript(ctx, sc.ID, map[string]any{"status": status, "error": msg, "task_ids": ids}); err != nil {
+		return err
+	}
+	sc.Status, sc.Error, sc.TaskIDs = status, msg, ids
+	return nil
 }
 
 // OnTaskChanged 实现 GenerationTaskObserver：营销脚本的出片任务状态变化后对账脚本、更新项目封面并推送 marketing.script。
@@ -48,7 +66,7 @@ func (s *MarketingService) OnTaskChanged(ctx context.Context, task *model.Genera
 		return nil
 	}
 	sc, err := s.reconcileScript(ctx, task.UserID, sid)
-	if mktNotFound(err) {
+	if mktNotFound(err) || errors.Is(err, errcode.ErrMarketingNotFound) {
 		return nil
 	}
 	if err != nil {
@@ -76,7 +94,13 @@ func (s *MarketingService) updateCover(ctx context.Context, sc *model.MarketingS
 	}
 	for _, o := range outputs {
 		if o.MediaType == model.KindVideo && o.CoverAssetID > 0 {
-			if err := s.repo.UpdateProject(ctx, sc.ProjectID, map[string]any{"cover_asset_id": o.CoverAssetID}); err != nil {
+			err := s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
+				if _, err := lockMarketingScript(ctx, tx, sc.UserID, sc); err != nil {
+					return err
+				}
+				return tx.UpdateProject(ctx, sc.ProjectID, map[string]any{"cover_asset_id": o.CoverAssetID})
+			})
+			if err != nil && !errors.Is(err, errcode.ErrMarketingNotFound) {
 				logger.Warn("更新营销项目封面失败", zap.Uint64("project_id", sc.ProjectID), zap.Error(err))
 			}
 			return
@@ -106,15 +130,25 @@ func GuardMarketingGeneration(ctx context.Context, tx repository.GenerationTaskT
 	if err != nil {
 		return err
 	}
-	// 锁顺序：项目、脚本；与删除项目、改脚本一致，防止并发穿透检查。
+	// 锁顺序：存活项目、轮次、脚本；与重写、取消和回调一致。
 	if _, err := mtx.Project(ctx, task.UserID, probe.ProjectID, true); mktNotFound(err) {
 		return errcode.ErrMarketingNotFound
 	} else if err != nil {
 		return err
 	}
+	round, err := mtx.Round(ctx, task.UserID, probe.RoundID, true)
+	if err != nil {
+		return marketingPublicError(err)
+	}
+	if round.ProjectID != probe.ProjectID {
+		return errcode.ErrMarketingNotFound
+	}
 	sc, err := mtx.Script(ctx, task.UserID, sid, true)
 	if err != nil {
 		return err
+	}
+	if sc.ProjectID != round.ProjectID || sc.RoundID != round.ID {
+		return errcode.ErrMarketingNotFound
 	}
 	if task.Kind != model.KindVideo || task.CanvasProjectID != nil {
 		return errcode.ErrInvalidParams

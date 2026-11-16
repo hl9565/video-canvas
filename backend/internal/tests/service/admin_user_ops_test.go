@@ -113,6 +113,15 @@ func (s *fakeCreditStore) CountActive(context.Context, uint64) (int64, error) { 
 func (s *fakeCreditStore) InsertTask(context.Context, *model.GenerationTask) (bool, error) {
 	return true, nil
 }
+func (s *fakeCreditStore) TxEnsureCredit(ctx context.Context, userID uint64, initial int) error {
+	return s.EnsureCredit(ctx, userID, initial)
+}
+func (s *fakeCreditStore) TxInsertTask(ctx context.Context, t *model.GenerationTask) (bool, error) {
+	return s.InsertTask(ctx, t)
+}
+func (s *fakeCreditStore) ExecSavepoint(context.Context, int) error     { return nil }
+func (s *fakeCreditStore) RollbackSavepoint(context.Context, int) error { return nil }
+func (s *fakeCreditStore) ReleaseSavepoint(context.Context, int) error  { return nil }
 
 func (s *fakeCreditStore) UpdateIf(context.Context, uint64, []string, map[string]any, bool) (*model.GenerationTask, error) {
 	return nil, repository.ErrStateConflict

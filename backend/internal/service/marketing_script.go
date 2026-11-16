@@ -118,12 +118,16 @@ func (s *MarketingService) afterScriptEdit(ctx context.Context, userID, id uint6
 	return v, nil
 }
 
-// editNarrations 在一个事务里改脚本的旁白：锁脚本、检查没有在出片或重写、按 revision 乐观锁写回，并重扫软问题。
+// editNarrations 在一个事务里改脚本的旁白：先锁存活项目、轮次与升序脚本、检查没有在出片或重写、按 revision 乐观锁写回，并重扫软问题。
 // pick 按当前镜头和脚本行给出新的旁白列表；revision 为 nil 时用当前版本（恢复原稿）。
 func (s *MarketingService) editNarrations(ctx context.Context, userID, id uint64, revision *int64,
 	pick func([]marketing.ScriptShot, *model.MarketingScript) ([]string, error)) error {
+	probe, err := s.repo.Script(ctx, userID, id, false)
+	if err != nil {
+		return marketingPublicError(err)
+	}
 	return s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		sc, err := tx.Script(ctx, userID, id, true)
+		sc, err := lockMarketingScript(ctx, tx, userID, probe)
 		if mktNotFound(err) {
 			return errcode.ErrMarketingNotFound
 		}

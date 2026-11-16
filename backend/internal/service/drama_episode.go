@@ -105,8 +105,11 @@ func (s *DramaService) DeleteEpisode(ctx context.Context, userID, id uint64, no 
 	return s.canvas.DeleteEpisode(ctx, userID, id, p.CanvasID, no)
 }
 
-// applyDramaEpisodePatch 校验revision与拆解锁，再应用实际出现的字段。
+// applyDramaEpisodePatch 校验预期分集 id、revision 与拆解锁，再应用实际出现的字段。
 func applyDramaEpisodePatch(ep *model.DramaEpisode, req *model.UpdateDramaEpisodeReq) error {
+	if req.ExpectedEpisodeID != nil && uint64(*req.ExpectedEpisodeID) != ep.ID {
+		return errcode.ErrCanvasConflict
+	}
 	if ep.Revision != req.Revision {
 		return errcode.ErrCanvasConflict
 	}

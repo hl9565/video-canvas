@@ -8,6 +8,7 @@ import (
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/pkg/ws"
 	"video-canvas/internal/repository"
 )
@@ -22,6 +23,8 @@ type DramaSegmentRepo interface {
 	Episodes(context.Context, uint64, uint64) ([]model.DramaEpisode, error)
 	// SegmentEpisode 按集ID反查存活项目下的分集。
 	SegmentEpisode(context.Context, uint64, uint64) (*model.DramaEpisode, error)
+	// SegmentTasks 返回本用户画布节点的正式任务，供事务外探测使用。
+	SegmentTasks(context.Context, uint64, uint64, string) ([]model.GenerationTask, error)
 	// Segment 查询用户片段，缺失返回ErrNotFound。
 	Segment(context.Context, uint64, uint64, bool) (*model.DramaSegment, error)
 	// Segments 返回按seq排序的用户片段。
@@ -30,6 +33,10 @@ type DramaSegmentRepo interface {
 
 // DramaSegmentTaskCreator 直接复用现有生成任务提交逻辑。
 type DramaSegmentTaskCreator interface {
+	// Quote 返回绑定片段版本的单镜报价。
+	Quote(context.Context, uint64, *model.QuoteGenerationTaskReq, ...QuoteTaskOptions) (*model.TaskQuoteView, error)
+	// CheckIdempotentReplay 在状态校验前核验已有任务的原始意图。
+	CheckIdempotentReplay(context.Context, uint64, string, *model.CreateGenerationTaskReq) (*model.GenerationTaskView, error)
 	// Create 校验生成参数、冻结积分并返回逐项创建结果。
 	Create(context.Context, uint64, string, *model.CreateGenerationTaskReq) (*model.CreateGenerationTaskResp, error)
 }
@@ -40,8 +47,19 @@ type DramaSegmentAssetReader interface {
 	View(context.Context, uint64, uint64) (*model.AssetView, error)
 }
 
+// DramaSegmentProbeStore 读写按素材内容指纹标识的媒体探测缓存。
+type DramaSegmentProbeStore interface {
+	// Get 按素材、哈希和版本精确读取缓存，缺失返回 repository.ErrNotFound。
+	Get(context.Context, uint64, string, int16) (*model.AssetMediaProbe, error)
+	// Upsert 幂等保存素材媒体探测结果。
+	Upsert(context.Context, *model.AssetMediaProbe) error
+}
+
 // DramaSegmentDeps 提供片段的持久化、生成、素材与用户事件依赖。
 type DramaSegmentDeps struct {
+	Probes DramaSegmentProbeStore
+	// ProbeVideo 在事务外探测本地视频的规范帧数；未注入时使用默认探测器。
+	ProbeVideo  func(context.Context, string) (videoframe.NormalizedProbe, error)
 	Repo        DramaSegmentRepo
 	Tasks       DramaSegmentTaskCreator
 	Assets      DramaSegmentAssetReader
@@ -52,11 +70,13 @@ type DramaSegmentDeps struct {
 
 // DramaSegmentService 管理片段编辑、真实任务结果与自动采用。
 type DramaSegmentService struct {
-	repo    DramaSegmentRepo
-	tasks   DramaSegmentTaskCreator
-	assets  DramaSegmentAssetReader
-	bc      ws.Broadcaster
-	adapter DramaSegmentAdapter
+	probes     DramaSegmentProbeStore
+	probeVideo func(context.Context, string) (videoframe.NormalizedProbe, error)
+	repo       DramaSegmentRepo
+	tasks      DramaSegmentTaskCreator
+	assets     DramaSegmentAssetReader
+	bc         ws.Broadcaster
+	adapter    DramaSegmentAdapter
 	// adapting 是进程内的转写锁，键为「片段:格式」
 	adapting sync.Map
 }
@@ -67,7 +87,11 @@ func NewDramaSegmentService(d DramaSegmentDeps) *DramaSegmentService {
 	if bc == nil {
 		bc = ws.NopBroadcaster{}
 	}
-	return &DramaSegmentService{repo: d.Repo, tasks: d.Tasks, assets: d.Assets, bc: bc, adapter: d.Adapter}
+	probe := d.ProbeVideo
+	if probe == nil {
+		probe = videoframe.New(videoframe.Options{}).ProbeNormalized24FPS
+	}
+	return &DramaSegmentService{probes: d.Probes, probeVideo: probe, repo: d.Repo, tasks: d.Tasks, assets: d.Assets, bc: bc, adapter: d.Adapter}
 }
 
 // List 校验用户项目后按顺序返回片段，并恢复漏处理的成功任务写回。
@@ -135,7 +159,7 @@ func (s *DramaSegmentService) episode(ctx context.Context, userID, dramaID uint6
 	return nil, nil, errcode.ErrDramaNotFound
 }
 
-// lockSegment 先非锁定反查父项目，再按项目→片段顺序加锁，和分镜替换保持一致。
+// lockSegment 无锁反查父链后按项目→集→片段顺序加锁，并复核持锁父链。
 func lockSegment(ctx context.Context, tx repository.DramaTx, userID, sid uint64) (*model.DramaProject, *model.DramaEpisode, *model.DramaSegment, error) {
 	row, err := tx.Segment(ctx, userID, sid, false)
 	if err != nil {
@@ -149,8 +173,18 @@ func lockSegment(ctx context.Context, tx repository.DramaTx, userID, sid uint64)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	row, err = tx.Segment(ctx, userID, sid, true)
-	return p, ep, row, err
+	eps, err := tx.LockEpisodes(ctx, userID, []uint64{ep.ID})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	rows, err := tx.LockSegments(ctx, userID, []uint64{sid})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if len(eps) != 1 || len(rows) != 1 || eps[0].DramaID != p.ID || rows[0].EpisodeID != eps[0].ID {
+		return nil, nil, nil, repository.ErrNotFound
+	}
+	return p, &eps[0], &rows[0], nil
 }
 
 // segmentError 将片段归属和版本哨兵转换为契约错误，不泄漏父项目是否存在。

@@ -405,7 +405,9 @@ func (s *MarketingService) GetProject(ctx context.Context, userID, id uint64) (*
 	if err != nil {
 		return nil, err
 	}
-	s.healScripts(ctx, vd)
+	if err := s.healScripts(ctx, vd); err != nil {
+		return nil, marketingPublicError(err)
+	}
 	v := &model.MarketingProjectView{ID: hexID(p.ID), Title: p.Title, Revision: p.Revision, CreatedAt: p.CreatedAt, UpdatedAt: p.UpdatedAt,
 		ProductAssets: []model.MarketingAssetRef{}}
 	if len(p.Product) > 0 {
@@ -450,22 +452,18 @@ func normalizeFacts(f *model.MarketingFacts) *model.MarketingFacts {
 	return f
 }
 
-// healScripts 把存的脚本状态和任务列表按出片任务对账（任务回调丢了也能在读取时自愈），差异写回；失败只记日志。
-func (s *MarketingService) healScripts(ctx context.Context, vd *viewData) {
+// healScripts 使用与任务回调相同的父锁对账，读取旧快照也不能覆盖并发重写或软删后的脚本。
+func (s *MarketingService) healScripts(ctx context.Context, vd *viewData) error {
 	for _, list := range vd.scripts {
 		for i := range list {
-			sc := &list[i]
-			tasks := vd.tasks[marketingNode(sc.ID)]
-			status, msg := deriveScriptStatus(sc.Status, tasks)
-			ids := taskIDsJSON(tasks)
-			if status == sc.Status && msg == sc.Error && sameJSON(ids, sc.TaskIDs) {
-				continue
+			sc, err := s.reconcileScript(ctx, list[i].UserID, list[i].ID)
+			if err != nil {
+				return err
 			}
-			if err := s.repo.UpdateScript(ctx, sc.ID, map[string]any{"status": status, "error": msg, "task_ids": ids}); err != nil {
-				logger.Warn("对账营销脚本状态失败", zap.Uint64("script_id", sc.ID), zap.Error(err))
-			}
+			list[i] = *sc
 		}
 	}
+	return nil
 }
 
 // taskIDsJSON 返回任务 id 列表（按时间正序）的 JSON。
