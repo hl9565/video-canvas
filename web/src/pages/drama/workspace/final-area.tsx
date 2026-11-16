@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 
 import { listJobs } from "@/api/drama";
-import { dramaErrorMessage } from "@/api/drama/errors";
+import { DRAMA_ERR, dramaErrorMessage } from "@/api/drama/errors";
 import type {
   DramaComposeExport,
   DramaComposeSize,
@@ -441,7 +441,9 @@ export function FinalArea({
               role="status"
               className="border-amber-500/40 bg-amber-500/10 flex items-start justify-between gap-2 rounded-xl border px-3 py-2.5 text-xs text-amber-900 dark:text-amber-200"
             >
-              <span>清单版本已更新（67028），已加载最新清单，请确认后再次导出。</span>
+              <span>
+                清单版本已更新（{DRAMA_ERR.manifestStale}），已加载最新清单，请确认后再次导出。
+              </span>
               <button
                 type="button"
                 className="shrink-0 underline underline-offset-2"

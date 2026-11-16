@@ -106,7 +106,7 @@ handler 和 repository 层：导出方法写一行以方法名开头的中文注
 生产库结构只由 [migrations/](migrations/) 里的 SQL 文件决定，服务启动时由 [internal/migration](internal/migration/runner.go) 执行未执行过的文件，记录在 `schema_migrations`。设计见 [自动更新设计](../docs/design/自动更新设计/自动更新设计.md) 第 3 节。
 
 15. **改了 `internal/model` 的表结构（新表、新列、改类型、索引），必须同时新增迁移文件。** `tests/migration` 的结构一致性测试会比较「只跑 SQL 迁移」和「只跑 AutoMigrate」两边的结构，不一致就失败。测试里的 `isolatedDB` 仍然用 AutoMigrate 建表，不受影响。
-16. **文件名** `NNNN_小写下划线描述.sql`，四位编号接着最后一个往下排。一个文件在一个事务里执行，可以有多条语句。`CREATE INDEX CONCURRENTLY` 这类不能放进事务的语句用 `NNNN_xxx.notx.sql`，一个文件只写一条，并且要幂等（`IF NOT EXISTS`）。
+16. **文件名** `NNNN_小写下划线描述.sql`，四位编号分成两个独立连续号段：`0001–8999` 保留给上游，从 `0001_baseline.sql` 起连续递增；`9001–9999` 保留给 Fork 专属迁移，如存在则从 `9001` 起连续递增。`0000` 与 `9000` 禁用，所有文件的四位前缀全局唯一（含 `.notx.sql`）。执行器按文件名排序并跳过已有记录，因此已执行 Fork 高段后仍会补跑后续新增的上游低段；历史版本夹具应显式选择阶段集合，不能按 Fork 高段文件名字典序截断。一个文件在一个事务里执行，可以有多条语句。`CREATE INDEX CONCURRENTLY` 这类不能放进事务的语句用 `NNNN_xxx.notx.sql`，一个文件只写一条，并且要幂等（`IF NOT EXISTS`）。
 17. **已发布的迁移文件永远不改、不删、不改名**，要修正就新增一个文件。改过的文件会在启动时因 checksum 不一致被拒绝，CI 也会检查。
 18. **只向前，不写 down 脚本。删列、改名、改类型分两个版本做（Expand–Contract）**：第 N 版加新列、代码兼容新旧两种结构；确认没有代码再读旧列后，第 N+1 版或更晚再删。这样升级出问题时，退回上一个版本的镜像仍能用当前的库。
 19. 大表加索引用 `.notx.sql` + `CREATE INDEX CONCURRENTLY IF NOT EXISTS`。

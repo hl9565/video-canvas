@@ -59,7 +59,8 @@ cd "$DIR"
 echo "==> 部署目录：$DIR，仓库：$REPO，镜像 Owner：$OWNER，版本：$TAG"
 # compose 与 update.sh 与目标 tag 严格对齐；失败直接中止，绝不回落其他仓库
 curl -fsSL "$RAW/$REF/docker-compose.yml" -o docker-compose.yml
-curl -fsSL "$RAW/$REF/scripts/update.sh" -o update.sh && chmod +x update.sh
+curl -fsSL "$RAW/$REF/scripts/update.sh" -o update.sh
+chmod +x update.sh
 
 if [ -f .env ]; then
   echo "==> 沿用已有 .env（不重新生成密钥）"

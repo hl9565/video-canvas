@@ -142,7 +142,7 @@ export type Studio = {
   plan: SegmentPlan | null;
   /** 选中片段的预估 / 报价积分；算不出来为 undefined */
   credits: number | undefined;
-  /** 选中片段最近一次服务端报价状态（含刷新入口与 67029 过期标记） */
+  /** 选中片段最近一次服务端报价状态（含刷新入口与 91002 过期标记） */
   quoteState?: {
     quote: TaskQuote | null;
     loading: boolean;

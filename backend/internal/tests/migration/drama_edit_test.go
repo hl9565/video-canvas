@@ -3,6 +3,7 @@ package migration_test
 import (
 	"context"
 	"io/fs"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -14,19 +15,25 @@ import (
 	"video-canvas/migrations"
 )
 
-// mapFSUpTo 从真实内嵌迁移集截取到指定文件名（含）的子集，用于构造旧版本升级测试库。
-func mapFSUpTo(t *testing.T, maxName string) fstest.MapFS {
+// dramaEditMigrationFiles 显式选择上游截至 0035 的迁移，以及可选的 Fork 9001；不混入后续上游或 Fork 文件。
+func dramaEditMigrationFiles(t *testing.T, source fs.FS, includeFork bool) fstest.MapFS {
 	t.Helper()
-	entries, err := fs.ReadDir(migrations.FS, ".")
+	entries, err := fs.ReadDir(source, ".")
 	if err != nil {
 		t.Fatalf("读取内嵌迁移失败：%v", err)
 	}
 	sub := fstest.MapFS{}
 	for _, entry := range entries {
-		if entry.IsDir() || entry.Name() > maxName {
+		if entry.IsDir() {
 			continue
 		}
-		data, readErr := fs.ReadFile(migrations.FS, entry.Name())
+		prefix, _, ok := strings.Cut(entry.Name(), "_")
+		upstream := ok && prefix >= "0001" && prefix <= "0035"
+		fork := includeFork && entry.Name() == "9001_drama_edit.sql"
+		if !upstream && !fork {
+			continue
+		}
+		data, readErr := fs.ReadFile(source, entry.Name())
 		if readErr != nil {
 			t.Fatalf("读取迁移 %s 失败：%v", entry.Name(), readErr)
 		}
@@ -35,7 +42,31 @@ func mapFSUpTo(t *testing.T, maxName string) fstest.MapFS {
 	return sub
 }
 
-func seedPre0036Rows(t *testing.T, db *gorm.DB) {
+// TestMigration9001_FixtureStages 保证未来上游低段与后续 Fork 文件不会混入 0035→9001 历史夹具。
+func TestMigration9001_FixtureStages(t *testing.T) {
+	source := fstest.MapFS{}
+	for _, name := range []string{
+		"0001_baseline.sql", "0035_marketing.sql", "0036_upstream.sql", "0037_upstream.sql",
+		"9001_drama_edit.sql", "9002_fork.sql",
+	} {
+		source[name] = &fstest.MapFile{Data: []byte("SELECT 1;")}
+	}
+	for _, includeFork := range []bool{false, true} {
+		names, err := fs.Glob(dramaEditMigrationFiles(t, source, includeFork), "*.sql")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"0001_baseline.sql", "0035_marketing.sql"}
+		if includeFork {
+			want = append(want, "9001_drama_edit.sql")
+		}
+		if !slices.Equal(names, want) {
+			t.Fatalf("includeFork=%v，得到 %v，期望 %v", includeFork, names, want)
+		}
+	}
+}
+
+func seedPre9001Rows(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	stmts := []string{
 		`INSERT INTO drama_jobs (user_id, drama_id, step, episodes, status, approval_id, output)
@@ -70,11 +101,11 @@ func mustExecFail(t *testing.T, db *gorm.DB, stmt string) {
 	}
 }
 
-// TestMigration0036_FileEmbedded 验证 0036 迁移已内嵌且包含全量新列、回填和探测表定义。
-func TestMigration0036_FileEmbedded(t *testing.T) {
-	data, err := fs.ReadFile(migrations.FS, "0036_drama_edit.sql")
+// TestMigration9001_FileEmbedded 验证 9001 迁移已内嵌且包含全量新列、回填和探测表定义。
+func TestMigration9001_FileEmbedded(t *testing.T) {
+	data, err := fs.ReadFile(migrations.FS, "9001_drama_edit.sql")
 	if err != nil {
-		t.Fatalf("读取 0036_drama_edit.sql 失败：%v", err)
+		t.Fatalf("读取 9001_drama_edit.sql 失败：%v", err)
 	}
 	sql := string(data)
 	for _, want := range []string{
@@ -87,32 +118,80 @@ func TestMigration0036_FileEmbedded(t *testing.T) {
 		"CREATE TABLE asset_media_probes",
 	} {
 		if !strings.Contains(sql, want) {
-			t.Errorf("0036_drama_edit.sql 缺少关键定义：%s", want)
+			t.Errorf("9001_drama_edit.sql 缺少关键定义：%s", want)
 		}
 	}
 }
 
-// TestMigration0036_UpgradeAndConstraints 验证 0035→0036 升级回填、旧 running 行识别及全量 CHECK/唯一索引负测。
-func TestMigration0036_UpgradeAndConstraints(t *testing.T) {
+// TestMigration9001_UpgradeAndConstraints 验证 0035→9001 升级回填、旧 running 行识别及全量 CHECK/唯一索引负测。
+func TestMigration9001_UpgradeAndConstraints(t *testing.T) {
 	db := isolatedDB(t)
 	ctx := context.Background()
 
 	if err := migration.Run(ctx, db, migration.Options{
-		FS:     mapFSUpTo(t, "0035_marketing.sql"),
+		FS:     dramaEditMigrationFiles(t, migrations.FS, false),
 		Logger: zap.NewNop(),
 	}); err != nil {
 		t.Fatalf("迁移至 0035 失败：%v", err)
 	}
-	seedPre0036Rows(t, db)
+	seedPre9001Rows(t, db)
 
-	if err := migration.Run(ctx, db, migration.Options{Logger: zap.NewNop()}); err != nil {
-		t.Fatalf("升级至 0036 失败：%v", err)
+	if err := migration.Run(ctx, db, migration.Options{FS: dramaEditMigrationFiles(t, migrations.FS, true), Logger: zap.NewNop()}); err != nil {
+		t.Fatalf("升级至 9001 失败：%v", err)
 	}
 
 	assertUpgradeBackfill(t, db)
-	assert0036SegmentConstraints(t, db)
-	assert0036EpisodeAndJobConstraints(t, db)
-	assert0036AssetMediaProbesPK(t, db)
+	assert9001SegmentConstraints(t, db)
+	assert9001EpisodeAndJobConstraints(t, db)
+	assert9001AssetMediaProbesPK(t, db)
+}
+
+// TestMigration9001_LateUpstreamMigrations 验证先执行上游 0035→Fork 9001，后来新增的 0036/0037 仍可补跑且只执行一次。
+func TestMigration9001_LateUpstreamMigrations(t *testing.T) {
+	db := isolatedDB(t)
+	ctx := context.Background()
+	files := dramaEditMigrationFiles(t, migrations.FS, false)
+	if err := migration.Run(ctx, db, migration.Options{FS: files, Logger: zap.NewNop()}); err != nil {
+		t.Fatal(err)
+	}
+	files = dramaEditMigrationFiles(t, migrations.FS, true)
+	if err := migration.Run(ctx, db, migration.Options{FS: files, AppVersion: "fork", Logger: zap.NewNop()}); err != nil {
+		t.Fatal(err)
+	}
+	// 只在内存里模拟未来上游文件，不改真实迁移；非幂等 SQL 也能发现意外重放。
+	files["0036_upstream_probe.sql"] = &fstest.MapFile{Data: []byte(`CREATE TABLE upstream_probe (step integer PRIMARY KEY); INSERT INTO upstream_probe VALUES (36);`)}
+	files["0037_upstream_probe.sql"] = &fstest.MapFile{Data: []byte(`INSERT INTO upstream_probe VALUES (37);`)}
+	for range 2 {
+		if err := migration.Run(ctx, db, migration.Options{FS: files, AppVersion: "late-upstream", Logger: zap.NewNop()}); err != nil {
+			t.Fatalf("补跑上游低段失败：%v", err)
+		}
+	}
+	var steps []int
+	if err := db.Raw(`SELECT step FROM upstream_probe ORDER BY step`).Scan(&steps).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(steps, []int{36, 37}) {
+		t.Fatalf("上游低段必须按序且只执行一次：%v", steps)
+	}
+	status, err := migration.Status(ctx, db, files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNames, err := fs.Glob(files, "*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(applied(t, db), wantNames) || len(status) != len(wantNames) {
+		t.Fatalf("迁移记录与文件不一致：%v", status)
+	}
+	for _, st := range status {
+		if !st.Applied || st.Modified || st.Unknown {
+			t.Fatalf("迁移状态异常：%+v", st)
+		}
+		if st.Filename == "9001_drama_edit.sql" && st.AppVersion != "fork" {
+			t.Fatalf("补跑上游时不应重放 Fork 9001：%+v", st)
+		}
+	}
 }
 
 func assertUpgradeBackfill(t *testing.T, db *gorm.DB) {
@@ -161,7 +240,7 @@ func assertUpgradeBackfill(t *testing.T, db *gorm.DB) {
 	}
 }
 
-func assert0036SegmentConstraints(t *testing.T, db *gorm.DB) {
+func assert9001SegmentConstraints(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	mustExecFail(t, db, `INSERT INTO drama_segments (user_id, episode_id, source_in_f) VALUES (1, 90, -1)`)
 	mustExecFail(t, db, `INSERT INTO drama_segments (user_id, episode_id, source_in_f, source_out_f) VALUES (1, 90, 10, 10)`)
@@ -180,7 +259,7 @@ func assert0036SegmentConstraints(t *testing.T, db *gorm.DB) {
 	mustExecOK(t, db, `INSERT INTO drama_segments (user_id, episode_id, av_pts_offset_ms) VALUES (1, 90, 10000)`)
 }
 
-func assert0036EpisodeAndJobConstraints(t *testing.T, db *gorm.DB) {
+func assert9001EpisodeAndJobConstraints(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	mustExecFail(t, db, `INSERT INTO drama_episodes (user_id, drama_id, no, edit_schema) VALUES (1, 10, 1, -1)`)
 	mustExecFail(t, db, `INSERT INTO drama_episodes (user_id, drama_id, no, edit_schema) VALUES (1, 10, 2, 2)`)
@@ -197,7 +276,7 @@ func assert0036EpisodeAndJobConstraints(t *testing.T, db *gorm.DB) {
 		VALUES (1, 11, 'storyboard', '[]'::jsonb, 'succeeded', '{}'::jsonb, 'cmp-1')`)
 }
 
-func assert0036AssetMediaProbesPK(t *testing.T, db *gorm.DB) {
+func assert9001AssetMediaProbesPK(t *testing.T, db *gorm.DB) {
 	t.Helper()
 	sha := strings.Repeat("a", 64)
 	mustExecOK(t, db, `INSERT INTO asset_media_probes (asset_id, sha256, probe_version, fps_num, fps_den, normalized_frames_24)

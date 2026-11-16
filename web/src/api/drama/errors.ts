@@ -1,6 +1,8 @@
 import { ApiError } from "@/utils/requests/request";
 
-/** 短剧业务错误码（后端 errcode 67xxx 号段，契约 §8） */
+import { FORK_ERR, FORK_ERROR_FALLBACK } from "./fork-errors";
+
+/** 短剧业务错误码（上游 67xxx + Fork 91xxx 号段，契约 §8） */
 export const DRAMA_ERR = {
   /** 短剧不存在 */
   notFound: 67001,
@@ -55,15 +57,16 @@ export const DRAMA_ERR = {
   /** 还没有这个格式的转写稿 */
   adaptMissing: 67027,
   /** 剧本分镜版本已变更，请刷新清单（409） */
-  manifestStale: 67028,
+  manifestStale: FORK_ERR.manifestStale,
   /** 生成报价已失效，请重新获取报价（409） */
-  quoteExpired: 67029,
+  quoteExpired: FORK_ERR.quoteExpired,
   /** 分镜剪辑参数不合法（400，Msg 写具体原因） */
-  editInvalid: 67030,
+  editInvalid: FORK_ERR.editInvalid,
 } as const;
 
 /** 各错误码的兜底文案：后端 Msg 为空时用 */
 const FALLBACK: Record<number, string> = {
+  ...FORK_ERROR_FALLBACK,
   [DRAMA_ERR.notFound]: "短剧不存在",
   [DRAMA_ERR.sourceInvalid]: "原文格式不支持或内容为空",
   [DRAMA_ERR.sourceTooLong]: "原文超过 500 万字，请删减后再试",
@@ -90,32 +93,28 @@ const FALLBACK: Record<number, string> = {
   [DRAMA_ERR.adaptBusy]: "这个片段正在转写，请稍候",
   [DRAMA_ERR.adaptInvalid]: "转写结果不合格，请重试",
   [DRAMA_ERR.adaptMissing]: "还没有这个格式的转写稿，请先转写",
-  [DRAMA_ERR.manifestStale]: "剧本分镜版本已变更，请刷新清单",
-  [DRAMA_ERR.quoteExpired]: "生成报价已失效，请重新获取报价",
-  [DRAMA_ERR.editInvalid]: "分镜剪辑参数不合法",
   30002: "数据版本已变更，请刷新后重试",
-  40015: "幂等请求参数不一致，请刷新后重试",
 };
 
 /** 后端通用 CAS revision 冲突业务码（errcode.ErrCanvasConflict，HTTP 409） */
 export const REVISION_CONFLICT_CODE = 30002;
 
-/** 后端幂等键参数冲突业务码（errcode.ErrIdempotencyConflict，HTTP 409） */
-export const IDEMPOTENCY_CONFLICT_CODE = 40015;
+/** Fork 幂等键参数冲突业务码（errcode.ErrIdempotencyConflict，HTTP 409） */
+export const IDEMPOTENCY_CONFLICT_CODE = FORK_ERR.idempotencyConflict;
 
 /** 错误是不是这个业务码 */
 export const isDramaError = (error: unknown, code: number): boolean =>
   error instanceof ApiError && error.code === code;
 
-/** 清单 / 版本已变更（67028，HTTP 409） */
+/** 清单 / 版本已变更（91001，HTTP 409） */
 export const isManifestStaleError = (error: unknown): boolean =>
   isDramaError(error, DRAMA_ERR.manifestStale);
 
-/** 生成报价已过期或价格已变动（67029，HTTP 409） */
+/** 生成报价已过期或价格已变动（91002，HTTP 409） */
 export const isQuoteExpiredError = (error: unknown): boolean =>
   isDramaError(error, DRAMA_ERR.quoteExpired);
 
-/** 逐镜精裁 / 原声参数不合法（67030，HTTP 400） */
+/** 逐镜精裁 / 原声参数不合法（91003，HTTP 400） */
 export const isEditInvalidError = (error: unknown): boolean =>
   isDramaError(error, DRAMA_ERR.editInvalid);
 
@@ -134,7 +133,7 @@ const MSG_FIRST = new Set<number>([
 
 /**
  * 把错误转成给用户看的一句话：
- * 67002 / 67006 / 67017 / 67030 后端 Msg 写了具体原因，优先用 Msg；其余优先用本地文案，Msg 兜底。
+ * 67002 / 67006 / 67017 / 91003 后端 Msg 写了具体原因，优先用 Msg；其余优先用本地文案，Msg 兜底。
  */
 export function dramaErrorMessage(error: unknown, fallback = "操作失败，请稍后重试"): string {
   if (!(error instanceof ApiError)) return fallback;
@@ -144,7 +143,7 @@ export function dramaErrorMessage(error: unknown, fallback = "操作失败，请
   return local ?? (error.message || fallback);
 }
 
-/** 进度卡上失败任务的说明：67xxx 用本地文案（67006 / 67002 后端 Msg 优先），其余用后端 Msg */
+/** 进度卡上失败任务的说明：67xxx / Fork 业务码用本地文案（67006 / 67002 后端 Msg 优先），其余用后端 Msg */
 export function jobFailureMessage(job: { errorCode: number; errorMessage: string }): string {
   const local = FALLBACK[job.errorCode];
   if (job.errorCode === DRAMA_ERR.stepNotReady || job.errorCode === DRAMA_ERR.sourceInvalid) {

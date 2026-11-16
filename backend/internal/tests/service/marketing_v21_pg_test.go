@@ -23,11 +23,11 @@ import (
 	"video-canvas/internal/stepkit"
 )
 
-// v21Env 仅使用 PG16 真实 SQL 迁移至0036，独立 schema 隔离每个用例。
+// v21Env 仅使用 PG16 真实 SQL 迁移（上游截至 0035 + Fork 9001），独立 schema 隔离每个用例。
 func v21Env(t *testing.T) *mktEnv {
 	t.Helper()
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, "0036_drama_edit.sql")
+	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
 	e := &mktEnv{t: t, db: db, repo: repository.NewMarketingRepository(db), taskRepo: repository.NewGenerationTaskRepository(db),
 		models: stepfake.NewModels(), caller: newMktCaller(), assets: &mktAssets{items: map[uint64]*mktAsset{}}, canvases: &mktCanvases{},
 		queue: &mktQueue{}, bc: &fakeTaskBroadcaster{}, user: 7, initial: 1000, reg: stepkit.NewRegistry(), resolver: stepkit.NewResolver(emptyBindings{}, stepfake.NewLibrary())}
@@ -720,7 +720,7 @@ func TestMarketingV21_PG_M_CrashRecovery(t *testing.T) {
 
 func TestMarketingV21_PG_N_Legacy0035DrainGate(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, "0035_marketing.sql")
+	slice2cMigrate(t, db, slice2cUpstream35Only)
 	for _, sql := range []string{
 		`INSERT INTO marketing_projects(id,user_id,title) VALUES(1,7,'旧项目')`,
 		`INSERT INTO marketing_rounds(id,user_id,project_id,no,settings) VALUES(1,7,1,1,'{}')`,
@@ -730,7 +730,7 @@ func TestMarketingV21_PG_N_Legacy0035DrainGate(t *testing.T) {
 	} {
 		v21Must(t, db.Exec(sql).Error)
 	}
-	slice2cMigrate(t, db, "0036_drama_edit.sql")
+	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
 	e := &mktEnv{t: t, db: db, repo: repository.NewMarketingRepository(db), user: 7}
 	e.svc = service.NewMarketingService(service.MarketingDeps{Repo: e.repo, Models: stepfake.NewModels()})
 	a, b := v21Run(t, e, 1), v21Run(t, e, 2)

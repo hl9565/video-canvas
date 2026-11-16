@@ -395,7 +395,7 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
     }
   });
 
-  test("单段生成遇 67029 自动刷新一次 quote 并重试成功；持续 67029 时展示「刷新报价」且不误当 revision 冲突", async () => {
+  test("单段生成遇 91002 自动刷新一次 quote 并重试成功；持续 91002 时展示「刷新报价」且不误当 revision 冲突", async () => {
     const s1 = makeSegment("s1", 0);
     useDramaSegmentsStore.getState().setList("d-studio", 1, [s1]);
 
@@ -443,7 +443,7 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
             if (generateAttempts === 3) {
               bumpPriceOnNextQuote = true;
             }
-            throw new ApiError("生成报价已失效", 67029, 409);
+            throw new ApiError("生成报价已失效", 91002, 409);
           }
           expect(token).toBe(`qt-${quoteSeq}`);
           return {
@@ -484,7 +484,7 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
         "720p",
       );
 
-      // 首次提交遇 67029 且价格条款一致 -> 刷新 quote 并自动重试成功
+      // 首次提交遇 91002 且价格条款一致 -> 刷新 quote 并自动重试成功
       await dom.act(async () => {
         await studio.actions.generate(s1);
       });
@@ -505,10 +505,10 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
         "1080p",
       );
 
-      // 遇 67029 刷新后价格/规格变化：同步新报价但停止第 2 次重提，避免按更高价位自动扣费
+      // 遇 91002 刷新后价格/规格变化：同步新报价但停止第 2 次重提，避免按更高价位自动扣费
       nextCredits = 45;
       bumpPriceOnNextQuote = false;
-      // 进入 generateAttempts === 3 触发 67029 后在回调里将下次 quote 涨到更高的下一档
+      // 进入 generateAttempts === 3 触发 91002 后在回调里将下次 quote 涨到更高的下一档
       await dom.act(async () => {
         await studio.actions.generate(s1);
       });
@@ -517,7 +517,7 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
       expect(mounted.container.textContent).toContain("·60");
       expect(segmentGetCalls - reloadBefore).toBe(0);
 
-      // 持续 67029：不得触发 revision 冲突重载，且暴露 quoteState.expired + 「刷新报价」按钮
+      // 持续 91002：不得触发 revision 冲突重载，且暴露 quoteState.expired + 「刷新报价」按钮
       forceAlwaysExpired = true;
       const beforeAlwaysFailReloads = segmentGetCalls - reloadBefore;
       await dom.act(async () => {
@@ -644,7 +644,7 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
     }
   });
 
-  test("actions.choose 对已有非默认 edit 的片段先弹保留/重置确认并传 expectedTaskId + resetEditOnTaskChange；patch 捕获 67030", async () => {
+  test("actions.choose 对已有非默认 edit 的片段先弹保留/重置确认并传 expectedTaskId + resetEditOnTaskChange；patch 捕获 91003", async () => {
     const segWithEdit = makeSegment("s1", 0, {
       takes: [
         ...makeSegment("s1", 0).takes,
@@ -678,7 +678,7 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
     useDramaSegmentsStore.getState().setList("d-studio", 1, [segWithEdit]);
 
     const patchPayloads: Array<Record<string, unknown>> = [];
-    let rejectNextPatchWith67030 = false;
+    let rejectNextPatchWith91003 = false;
     let currentSeg = segWithEdit;
 
     spies.push(
@@ -692,8 +692,8 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
         } as never;
       }),
       spyOn(service, "patch").mockImplementation(async (_url: string, body?: unknown) => {
-        if (rejectNextPatchWith67030) {
-          throw new ApiError("出点超出新素材总帧数", 67030, 400);
+        if (rejectNextPatchWith91003) {
+          throw new ApiError("出点超出新素材总帧数", 91003, 400);
         }
         const raw = body as Record<string, unknown>;
         patchPayloads.push(raw);
@@ -748,8 +748,8 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
       await dom.flush();
       expect(patchPayloads[1]?.reset_edit_on_task_change).toBe(true);
 
-      // 3. patch 遇 67030 透出 ApiError
-      rejectNextPatchWith67030 = true;
+      // 3. patch 遇 91003 透出 ApiError
+      rejectNextPatchWith91003 = true;
       await expect(studio.actions.patch("s1", { edit: { sourceInF: 200 } })).rejects.toThrow(
         "出点超出新素材总帧数",
       );

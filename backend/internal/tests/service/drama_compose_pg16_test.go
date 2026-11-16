@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -65,31 +67,68 @@ func slice2cPG16(t *testing.T) *gorm.DB {
 	return db
 }
 
-func slice2cMigrate(t *testing.T, db *gorm.DB, maxName string) {
+const (
+	slice2cUpstream35Only         = false
+	slice2cUpstream35WithFork9001 = true
+)
+
+// slice2cMigrationFiles 固定上游截至 0035，显式选择是否追加 Fork 9001，不纳入未来上游 0036/0037 或其他 Fork。
+func slice2cMigrationFiles(t *testing.T, source fs.FS, includeFork bool) fstest.MapFS {
 	t.Helper()
 	subset := fstest.MapFS{}
-	names, err := fs.Glob(migrations.FS, "*.sql")
+	names, err := fs.Glob(source, "*.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, name := range names {
-		if name > maxName {
+		prefix, _, ok := strings.Cut(name, "_")
+		upstream := ok && prefix >= "0001" && prefix <= "0035"
+		fork := includeFork && name == "9001_drama_edit.sql"
+		if !upstream && !fork {
 			continue
 		}
-		data, e := fs.ReadFile(migrations.FS, name)
+		data, e := fs.ReadFile(source, name)
 		if e != nil {
 			t.Fatal(e)
 		}
 		subset[name] = &fstest.MapFile{Data: data}
 	}
-	if err = migration.Run(context.Background(), db, migration.Options{FS: subset, Logger: zap.NewNop()}); err != nil {
+	return subset
+}
+
+func slice2cMigrate(t *testing.T, db *gorm.DB, includeFork bool) {
+	t.Helper()
+	if err := migration.Run(context.Background(), db, migration.Options{FS: slice2cMigrationFiles(t, migrations.FS, includeFork), Logger: zap.NewNop()}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDramaComposeMigrationFiles_FixtureStages(t *testing.T) {
+	source := fstest.MapFS{}
+	for _, name := range []string{
+		"0001_baseline.sql", "0035_marketing.sql", "0036_upstream.sql", "0037_upstream.sql",
+		"9001_drama_edit.sql", "9002_fork.sql",
+	} {
+		source[name] = &fstest.MapFile{Data: []byte("SELECT 1;")}
+	}
+	for _, includeFork := range []bool{slice2cUpstream35Only, slice2cUpstream35WithFork9001} {
+		names, err := fs.Glob(slice2cMigrationFiles(t, source, includeFork), "*.sql")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"0001_baseline.sql", "0035_marketing.sql"}
+		if includeFork {
+			want = append(want, "9001_drama_edit.sql")
+		}
+		if !slices.Equal(names, want) {
+			t.Fatalf("includeFork=%v，得到 %v，期望 %v", includeFork, names, want)
+		}
 	}
 }
 
 func TestDramaComposePG16_0035UpgradeLegacyApprovalReplay(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, "0035_marketing.sql")
+	slice2cMigrate(t, db, slice2cUpstream35Only)
 	for _, stmt := range []string{
 		`INSERT INTO drama_projects (id,user_id,canvas_project_id,title,source_text,style_key) VALUES (1,7,2,'剧','文','custom')`,
 		`INSERT INTO drama_jobs (id,user_id,drama_id,step,episodes,status,approval_id,input_json) VALUES (10,7,1,'compose','[1]','succeeded',55,'{"episode_id":3,"segment_version":4,"asset_ids":[30]}')`,
@@ -98,7 +137,7 @@ func TestDramaComposePG16_0035UpgradeLegacyApprovalReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	slice2cMigrate(t, db, "0036_drama_edit.sql")
+	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
 	repo := repository.NewDramaRepository(db)
 	svc := service.NewDramaService(service.DramaDeps{Repo: repo})
 	job, err := svc.CreateAgentJob(context.Background(), 7, 1, 55, composeReq(t, `,"compose":{"segment_version":4}`))
@@ -107,7 +146,7 @@ func TestDramaComposePG16_0035UpgradeLegacyApprovalReplay(t *testing.T) {
 	}
 	for _, extra := range []string{`,"compose":{"size":"1080p"}`, `,"compose_request_key":"new-key"`} {
 		_, err = svc.CreateAgentJob(context.Background(), 7, 1, 55, composeReq(t, extra))
-		dramaCheckCode(t, err, 40015)
+		dramaCheckCode(t, err, 90001)
 	}
 	var count int64
 	if err = db.Model(&model.DramaJob{}).Count(&count).Error; err != nil || count != 1 {
@@ -122,9 +161,9 @@ func (q *slice2cQueue) EnqueueDramaTx(context.Context, *sql.Tx, uint64, uint64, 
 	return nil
 }
 
-func TestDramaComposePG16_ConcurrentKeyAndSchema0036Only(t *testing.T) {
+func TestDramaComposePG16_ConcurrentKeyAndSchema9001Only(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, "0036_drama_edit.sql")
+	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
 	fixture := newComposeMemory()
 	fixture.episodes[0].EditSchema = 1
 	seedComposePGTask(&fixture.tasks[0])
@@ -200,7 +239,7 @@ func seedComposePGTask(t *model.GenerationTask) {
 
 func TestDramaComposePG16_ProbeReleasesLocksAndTx2RejectsConcurrentEdit(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, "0036_drama_edit.sql")
+	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
 	fixture := newComposeMemory()
 	fixture.episodes[0].EditSchema = 1
 	seedComposePGTask(&fixture.tasks[0])
@@ -261,7 +300,7 @@ func TestDramaComposePG16_ProbeReleasesLocksAndTx2RejectsConcurrentEdit(t *testi
 	}
 	select {
 	case err = <-result:
-		dramaCheckCode(t, err, 67028)
+		dramaCheckCode(t, err, 91001)
 	case <-ctx.Done():
 		t.Fatal("提交未结束")
 	}
@@ -272,7 +311,7 @@ func TestDramaComposePG16_ProbeReleasesLocksAndTx2RejectsConcurrentEdit(t *testi
 
 func TestDramaComposePG16_RatioChangeInvalidatesAndBlocksStaleSubmit(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, "0036_drama_edit.sql")
+	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
 
 	fixture := newComposeMemory()
 	fixture.project.Ratio = "16:9"
@@ -412,7 +451,7 @@ func TestDramaComposePG16_RatioChangeInvalidatesAndBlocksStaleSubmit(t *testing.
 			close(release)
 			select {
 			case err = <-resCh:
-				dramaCheckCode(t, err, 67028)
+				dramaCheckCode(t, err, 91001)
 			case <-subCtx.Done():
 				t.Fatal("提交未结束")
 			}
@@ -487,7 +526,7 @@ func (a *pgUniqueComposeAssets) PrepareDramaVideo(ctx context.Context, user uint
 
 func TestDramaComposePG16_Schema0FrozenManifestRatioInvalidation(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, "0036_drama_edit.sql")
+	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
 	seedSchema0RatioPG16(t, db)
 
 	repo := repository.NewDramaRepository(db)
@@ -579,7 +618,7 @@ func TestDramaComposePG16_Schema0FrozenManifestRatioInvalidation(t *testing.T) {
 		t.Fatalf("第 2 集刚完成定版应新鲜: %+v", cur.Episodes[1])
 	}
 
-	// 验证以旧版本=1（改画幅前版本）再发起第 1 集合成被 67028 拒绝。
+	// 验证以旧版本=1（改画幅前版本）再发起第 1 集合成被 91001 拒绝。
 	staleVer := int64(1)
 	if _, err = svc.CreateJob(ctx, 7, 1, &model.DramaJobReq{
 		Step: "compose", Episodes: []int{1}, ComposeRequestKey: "s0-stale-ver-reject",
@@ -587,7 +626,7 @@ func TestDramaComposePG16_Schema0FrozenManifestRatioInvalidation(t *testing.T) {
 	}); err == nil {
 		t.Fatal("改画幅后旧 segment_version 发起合成未被拒绝")
 	} else {
-		dramaCheckCode(t, err, 67028)
+		dramaCheckCode(t, err, 91001)
 	}
 
 	r34 := "3:4"
@@ -637,7 +676,7 @@ func TestDramaComposePG16_Schema0FrozenManifestRatioInvalidation(t *testing.T) {
 
 func TestDramaComposePG16_HistoricalFrozenJobDoesNotStaleNilManifestExport(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, "0036_drama_edit.sql")
+	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
 	seedSchema0RatioPG16(t, db)
 
 	repo := repository.NewDramaRepository(db)

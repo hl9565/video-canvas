@@ -7,6 +7,9 @@ import {
   dramaErrorMessage,
   jobFailureMessage,
   isDramaError,
+  isEditInvalidError,
+  isManifestStaleError,
+  isQuoteExpiredError,
   isRevisionConflict,
 } from "@/api/drama/errors";
 import { ApiError } from "@/utils/requests/request";
@@ -14,6 +17,39 @@ import { ApiError } from "@/utils/requests/request";
 const err = (code: number, status: number, msg = "后端文案") => new ApiError(msg, code, status);
 
 describe("短剧错误码映射（契约 §8）", () => {
+  test("Fork 错误码使用独立号段并保留原有语义", () => {
+    expect(IDEMPOTENCY_CONFLICT_CODE).toBe(90001);
+    expect(DRAMA_ERR.manifestStale).toBe(91001);
+    expect(DRAMA_ERR.quoteExpired).toBe(91002);
+    expect(DRAMA_ERR.editInvalid).toBe(91003);
+    expect(isManifestStaleError(err(91001, 409))).toBe(true);
+    expect(isQuoteExpiredError(err(91002, 409))).toBe(true);
+    expect(isEditInvalidError(err(91003, 400))).toBe(true);
+  });
+
+  test("上游 67029 / HTTP 502 与无 HTTP 状态的持久化失败不触发报价或 revision 恢复", () => {
+    const upstream = err(67029, 502, "上游模型请求失败");
+    const persisted = { errorCode: 67029, errorMessage: "上游模型请求失败" };
+    for (const failure of [
+      upstream,
+      persisted,
+      { code: 67029, message: persisted.errorMessage },
+      { code: 91002, message: "持久化报价失败" },
+      { code: 30002, message: "持久化版本冲突" },
+      err(67029, 0),
+      err(30002, 0),
+    ]) {
+      expect(isQuoteExpiredError(failure)).toBe(false);
+      expect(isRevisionConflict(failure)).toBe(false);
+    }
+    expect(dramaErrorMessage(upstream)).toBe("上游模型请求失败");
+    expect(jobFailureMessage(persisted)).toBe("上游模型请求失败");
+    expect(jobFailureMessage({ errorCode: 67029, errorMessage: "" })).toBe("任务失败");
+    expect(jobFailureMessage({ errorCode: 91002, errorMessage: "" })).toBe(
+      "生成报价已失效，请重新获取报价",
+    );
+  });
+
   test("67002 / 67006 后端 Msg 写了具体原因，优先展示 Msg", () => {
     expect(dramaErrorMessage(err(DRAMA_ERR.sourceInvalid, 400, "docx 里没有正文"))).toBe(
       "docx 里没有正文",
@@ -46,7 +82,7 @@ describe("短剧错误码映射（契约 §8）", () => {
     expect(isDramaError(new Error("x"), DRAMA_ERR.notFound)).toBe(false);
   });
 
-  test("revision 冲突：仅显式匹配 30002 + HTTP 409，排除 40015 与业务 409", () => {
+  test("revision 冲突：仅显式匹配 30002 + HTTP 409，排除 90001 与业务 409", () => {
     expect(isRevisionConflict(err(REVISION_CONFLICT_CODE, 409))).toBe(true);
     expect(isRevisionConflict(err(IDEMPOTENCY_CONFLICT_CODE, 409))).toBe(false);
     expect(isRevisionConflict(err(DRAMA_ERR.jobBusy, 409))).toBe(false);

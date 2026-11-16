@@ -1,7 +1,8 @@
 // Package migrations 存放版本化的数据库迁移 SQL，编译时内嵌进二进制，由 internal/migration 在启动时执行。
 //
 // 规则（详见 backend/AGENTS.md「数据库迁移」）：
-//   - 文件名 NNNN_小写下划线描述.sql，四位编号连续递增；.notx.sql 不包事务，只能有一条语句。
+//   - 文件名 NNNN_小写下划线描述.sql，0001–8999 留给上游、9001–9999 留给 Fork，各段从起点连续递增；0000、9000 禁用。
+//   - .notx.sql 不包事务，只能有一条语句。
 //   - 已发布的文件永远不改，要修正就新增一个文件。
 //   - 改了 internal/model 的表结构，必须同时新增迁移文件（结构一致性测试会检查）。
 package migrations

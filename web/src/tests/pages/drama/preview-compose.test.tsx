@@ -280,18 +280,18 @@ function StudioPreviewHarness({
 }
 
 describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea）", () => {
-  test("Preview 与 ClipBar 的「修剪」打开 SegmentTrimDrawer 并通过 actions.patch 保存，67030 在抽屉内就地告警", async () => {
+  test("Preview 与 ClipBar 的「修剪」打开 SegmentTrimDrawer 并通过 actions.patch 保存，91003 在抽屉内就地告警", async () => {
     const s1 = makeSegment("s1", 0);
     const patchCalls: Array<{ sid: string; fields: Omit<UpdateSegmentInput, "revision"> }> = [];
-    let shouldFail67030 = false;
+    let shouldFail91003 = false;
 
     const mounted = await dom.mount(
       <StudioPreviewHarness
         initialDrama={makeDrama()}
         initialSegments={[s1]}
         onPatch={async (sid, fields) => {
-          if (shouldFail67030) {
-            throw new ApiError("入点帧不能超过出点帧", 67030, 400);
+          if (shouldFail91003) {
+            throw new ApiError("入点帧不能超过出点帧", 91003, 400);
           }
           patchCalls.push({ sid, fields });
           return { ...s1, edit: { ...s1.edit!, ...fields.edit }, revision: s1.revision + 1 };
@@ -318,8 +318,8 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
       await dom.click(muteBtn);
       await dom.flush();
 
-      // 先测试 67030 错误就地留抽屉不崩溃
-      shouldFail67030 = true;
+      // 先测试 91003 错误就地留抽屉不崩溃
+      shouldFail91003 = true;
       const saveBtn = Array.from(dom.win.document.body.querySelectorAll("button")).find(
         (b) => b.getAttribute("aria-label") === "保存剪辑",
       );
@@ -329,7 +329,7 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
       expect(dom.win.document.body.textContent).toContain("入点帧不能超过出点帧");
 
       // 恢复正常保存：调用 actions.patch 并关闭抽屉
-      shouldFail67030 = false;
+      shouldFail91003 = false;
       await dom.click(saveBtn);
       await dom.flush();
       expect(patchCalls.length).toBe(1);
@@ -422,12 +422,12 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
     }
   });
 
-  test("CPU 整集预览走 manifest -> createPreview -> poll -> <video src>，处理 67028 并随版本变更重建", async () => {
+  test("CPU 整集预览走 manifest -> createPreview -> poll -> <video src>，处理 91001 并随版本变更重建", async () => {
     const s1 = makeSegment("s1", 0);
     let manifestRound = 0;
     let createCalls = 0;
     let pollCalls = 0;
-    let trigger67028Once = true;
+    let trigger91001Once = true;
     const previewPayloads: Array<{ body: unknown; withCredentials?: boolean; timeout?: number }> =
       [];
 
@@ -467,9 +467,9 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
               withCredentials: config?.withCredentials,
               timeout: config?.timeout,
             });
-            if (trigger67028Once) {
-              trigger67028Once = false;
-              throw new ApiError("分镜清单已变更", 67028, 409);
+            if (trigger91001Once) {
+              trigger91001Once = false;
+              throw new ApiError("分镜清单已变更", 91001, 409);
             }
             return {
               ticket: `tk-${createCalls}`,
@@ -495,12 +495,12 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
       );
       expect(cpuBtn).toBeDefined();
       await dom.click(cpuBtn);
-      // 等待 pending 轮询（400ms）与 67028 自动重拉完成
+      // 等待 pending 轮询（400ms）与 91001 自动重拉完成
       await dom.flush(550);
 
       expect(previewPayloads[0]?.withCredentials).toBe(true);
       expect(previewPayloads[0]?.timeout).toBe(630_000);
-      // 因第 1 次 create 返回 67028，自动刷新清单到 hash-v2 再创建 tk-2
+      // 因第 1 次 create 返回 91001，自动刷新清单到 hash-v2 再创建 tk-2
       expect(previewPayloads.length).toBe(2);
       expect(
         (previewPayloads[1]?.body as { manifest_hash?: string } | undefined)?.manifest_hash,
@@ -526,7 +526,7 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
     }
   });
 
-  test("FinalArea：读取清单、选 1080p 与 clean+packaged 导出、处理 67028 过期清单、渲染 exports[] 预览/下载", async () => {
+  test("FinalArea：读取清单、选 1080p 与 clean+packaged 导出、处理 91001 过期清单、渲染 exports[] 预览/下载", async () => {
     const s1 = makeSegment("s1", 0);
     const s2 = makeSegment("s2", 1, { chosenTaskId: "", takes: [], status: "idle" });
     useDramaSegmentsStore.getState().setList("d-prev", 1, [s1, s2]);
@@ -601,7 +601,7 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
 
     let manifestReads = 0;
     const jobPosts: Array<Record<string, unknown>> = [];
-    let rejectFirstComposeWith67028 = true;
+    let rejectFirstComposeWith91001 = true;
     const fetchUrls: string[] = [];
 
     spies.push(
@@ -661,9 +661,9 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
       spyOn(service, "post").mockImplementation(async (url: string, body?: unknown) => {
         if (url === "/dramas/d-prev/jobs") {
           jobPosts.push(body as Record<string, unknown>);
-          if (rejectFirstComposeWith67028) {
-            rejectFirstComposeWith67028 = false;
-            throw new ApiError("分镜清单已过期", 67028, 409);
+          if (rejectFirstComposeWith91001) {
+            rejectFirstComposeWith91001 = false;
+            throw new ApiError("分镜清单已过期", 91001, 409);
           }
           return {
             id: "job-compose-2",
@@ -715,7 +715,7 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
       await dom.click(pkgBtn);
       await dom.flush();
 
-      // 首次提交遇 67028 -> 刷新 manifest 并提示再次导出
+      // 首次提交遇 91001 -> 刷新 manifest 并提示再次导出
       const composeBtn = Array.from(mounted.container.querySelectorAll("button")).find((b) =>
         b.textContent?.includes("重新合成"),
       );
@@ -731,7 +731,7 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
       expect(firstCompose?.variants).toEqual(["clean", "packaged"]);
       expect(typeof jobPosts[0]?.compose_request_key).toBe("string");
       expect(String(jobPosts[0]?.compose_request_key).startsWith("approval:")).toBe(false);
-      expect(mounted.container.textContent).toContain("清单版本已更新（67028）");
+      expect(mounted.container.textContent).toContain("清单版本已更新（91001）");
 
       // 使用刷新后的 manifestHash 再点一次提交，成功并生成新的 composeRequestKey
       await dom.click(composeBtn);

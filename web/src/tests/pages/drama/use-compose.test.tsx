@@ -245,12 +245,12 @@ describe("useCompose 幂等键保留与竞态防护", () => {
     await h.unmount();
   });
 
-  test("67028（manifestStale）与 40015（幂等冲突）和非重试 4xx 会清理旧 key，下次使用新 key", async () => {
+  test("91001（manifestStale）与 90001（幂等冲突）和非重试 4xx 会清理旧 key，下次使用新 key", async () => {
     const get = spyOn(service, "get").mockResolvedValue(rawManifest(9, "f".repeat(64)));
     const post = spyOn(service, "post")
-      // 67028 后轮换
+      // 91001 后轮换
       .mockRejectedValueOnce(new ApiError("stale", DRAMA_ERR.manifestStale, 409))
-      // 40015 后轮换
+      // 90001 后轮换
       .mockRejectedValueOnce(new ApiError("idem", IDEMPOTENCY_CONFLICT_CODE, 409))
       // 400 业务拒绝后轮换
       .mockRejectedValueOnce(new ApiError("empty", DRAMA_ERR.nothingToCompose, 400))

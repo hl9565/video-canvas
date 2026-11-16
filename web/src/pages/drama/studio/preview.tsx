@@ -1231,8 +1231,8 @@ function CpuEpisodePreview({
           className="border-amber-500/40 bg-amber-500/10 rounded-lg border px-3 py-2 text-xs text-amber-900 dark:text-amber-200"
         >
           {error
-            ? "分镜清单版本已变更（67028），已拉取最新清单。"
-            : "分镜清单版本已变更（67028），已自动拉取最新清单重新构建预览。"}
+            ? `分镜清单版本已变更（${DRAMA_ERR.manifestStale}），已拉取最新清单。`
+            : `分镜清单版本已变更（${DRAMA_ERR.manifestStale}），已自动拉取最新清单重新构建预览。`}
         </div>
       )}
 

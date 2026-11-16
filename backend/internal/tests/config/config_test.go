@@ -110,6 +110,48 @@ func TestLoad_UpdateDefaultsAndEnvOverride(t *testing.T) {
 	}
 }
 
+// TestLoad_UpdateRepo 验证通用默认值、旧 YAML 兼容与部署环境覆盖；空透传不得覆盖自定义 YAML。
+func TestLoad_UpdateRepo(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		yaml   string
+		envSet bool
+		env    string
+		want   string
+	}{
+		{"默认配置使用上游仓库", "", false, "", "zaylora/video-canvas"},
+		{"空环境变量保留自定义 YAML", "update:\n  repo: custom/repo\n", true, "", "custom/repo"},
+		{"缺 update 段回落默认仓库", "server:\n  port: 8080\n", false, "", "zaylora/video-canvas"},
+		{"显式环境变量覆盖 YAML", "update:\n  repo: custom/repo\n", true, "hl9565/video-canvas", "hl9565/video-canvas"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("APP_UPDATE_REPO", tc.env)
+			if !tc.envSet {
+				if err := os.Unsetenv("APP_UPDATE_REPO"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := "../../../configs/config.yaml"
+			if tc.yaml != "" {
+				path = t.TempDir() + "/config.yaml"
+				if err := os.WriteFile(path, []byte(tc.yaml), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Update.Repo != tc.want {
+				t.Fatalf("update.repo=%q，期望 %q", cfg.Update.Repo, tc.want)
+			}
+			if DefaultUpdateRepo != "zaylora/video-canvas" {
+				t.Fatalf("DefaultUpdateRepo=%q，期望上游仓库", DefaultUpdateRepo)
+			}
+		})
+	}
+}
+
 // 联网工具（搜索、读网页）默认开启，用 APP_AGENT_WEB_ENABLED 关闭；SearXNG 地址可选，用 APP_AGENT_SEARXNG_URL 配。
 func TestLoad_AgentWebSettings(t *testing.T) {
 	cfg, err := Load("../../../configs/config.yaml")

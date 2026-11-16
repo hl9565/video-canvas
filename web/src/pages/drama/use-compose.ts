@@ -109,7 +109,7 @@ const terminalComposeJobIds = (dramaId: string, no: number): Set<string> => {
   return ids;
 };
 
-/** 仅网络异常、超时、408/429、5xx 属于可原样重试的瞬时失败；业务拒绝与 40015 应清理幂等键 */
+/** 仅网络异常、超时、408/429、5xx 属于可原样重试的瞬时失败；业务拒绝与 90001 应清理幂等键 */
 const isTransientComposeError = (error: unknown): boolean => {
   if (isManifestStaleError(error) || isDramaError(error, IDEMPOTENCY_CONFLICT_CODE)) {
     return false;

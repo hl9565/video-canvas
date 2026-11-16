@@ -124,7 +124,7 @@ func TestDramaPreview_CookieTokenOwnershipAndCache(t *testing.T) {
 	}
 	req.ManifestHash = strings.Repeat("b", 64)
 	_, _, err = s.CreateEpisodePreview(ctx, 7, 1, 1, req)
-	dramaCheckCode(t, err, 67028)
+	dramaCheckCode(t, err, 91001)
 }
 
 func TestDramaPreview_DeletedEpisodeCannotReuseTicketAfterRenumber(t *testing.T) {

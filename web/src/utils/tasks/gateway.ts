@@ -62,7 +62,7 @@ export async function submitCanvasTasks(data: CreateTaskRequest): Promise<Create
  * 支持在 body 内传 quoteToken / quote_token，或作为第三参数传入 quoteToken。
  * @param sid 片段 id
  * @param body 模型、按 capabilities 组装好的 input 与可选 quoteToken
- * @param quoteToken 可选服务端报价签名令牌（67029 过期时由调用方刷新后重试）
+ * @param quoteToken 可选服务端报价签名令牌（91002 过期时由调用方刷新后重试）
  * @returns 任务快照
  */
 export async function submitSegmentTask(

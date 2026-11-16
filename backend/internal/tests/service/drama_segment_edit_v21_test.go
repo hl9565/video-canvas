@@ -190,7 +190,7 @@ func TestDramaSegmentService_V21_EditBoundsResetAndSchema(t *testing.T) {
 	})
 	segmentCode(t, err, errcode.ErrCanvasConflict.Code)
 
-	// 3. 非法编辑边界 -> 67030 (400)
+	// 3. 非法编辑边界 -> 91003 (400)
 	for _, tc := range []struct {
 		name  string
 		patch model.DramaSegmentEditPatch
@@ -247,7 +247,7 @@ func TestDramaSegmentService_V21_EditBoundsResetAndSchema(t *testing.T) {
 		t.Fatalf("恢复 EOF 失败：err=%v view=%+v", err, eofView)
 	}
 
-	// 6. 切换 take 且 reset_edit=false 携带旧 90 出点 (> t2 81帧) -> 67030；合法 81 -> 通过
+	// 6. 切换 take 且 reset_edit=false 携带旧 90 出点 (> t2 81帧) -> 91003；合法 81 -> 通过
 	keepFalse := false
 	newT2 := idcodec.ID(t2ID)
 	_, err = segSvc.Update(ctx, userID, seg.ID, &model.UpdateDramaSegmentReq{
@@ -344,7 +344,7 @@ func TestDramaSegmentService_V21_QuoteAndGenerateGuard(t *testing.T) {
 	})
 	assertTaskCode(t, err, errcode.ErrInvalidParams.Code)
 
-	// 2. Quote 测试 Sora raw_size 解析 & 报价令牌生成，以及 edit_schema=1 时 count=2 拒绝 (67030)
+	// 2. Quote 测试 Sora raw_size 解析 & 报价令牌生成，以及 edit_schema=1 时 count=2 拒绝 (91003)
 	reg.snap.Plugin = provider.PluginSnapshot{Key: "sora", Version: "1.0.0", SHA256: "sora-sha", Meta: pluginmeta.Meta{Key: "sora", Version: "1.0.0"}}
 	qSora, err := segSvc.Quote(ctx, userID, seg.ID, &model.GenerateDramaSegmentReq{
 		ModelID: "m1",
@@ -356,7 +356,7 @@ func TestDramaSegmentService_V21_QuoteAndGenerateGuard(t *testing.T) {
 	if qSora.RawSize != "1792x1024" || qSora.Credits != 10 || qSora.QuoteToken == "" || qSora.PriceFingerprint == "" || !qSora.ExpiresAt.After(now) {
 		t.Fatalf("Quote 返回不符契约：%+v", qSora)
 	}
-	// edit_schema=1 时 count=2 被 Quote 与 Generate 拒绝 (67030)
+	// edit_schema=1 时 count=2 被 Quote 与 Generate 拒绝 (91003)
 	_, err = segSvc.Quote(ctx, userID, seg.ID, &model.GenerateDramaSegmentReq{
 		ModelID: "m1",
 		Input:   map[string]any{"prompt": "审讯室", "count": 2},
@@ -369,14 +369,14 @@ func TestDramaSegmentService_V21_QuoteAndGenerateGuard(t *testing.T) {
 	})
 	segmentCode(t, err, errcode.ErrDramaEditInvalid.Code)
 
-	// 3. edit_schema=1 无 quote_token 拒绝 67029，零任务零冻结
+	// 3. edit_schema=1 无 quote_token 拒绝 91002，零任务零冻结
 	_, err = segSvc.Generate(ctx, userID, seg.ID, "seg-no-quote", &model.GenerateDramaSegmentReq{
 		ModelID: "m1",
 		Input:   map[string]any{"prompt": "审讯室"},
 	})
 	segmentCode(t, err, errcode.ErrDramaQuoteExpired.Code)
 
-	// 4. Quote 后调价漂移（10->25）或默认值漂移：Generate 与直接 POST /generation-tasks seg: 均返 67029 (409) 且零冻结
+	// 4. Quote 后调价漂移（10->25）或默认值漂移：Generate 与直接 POST /generation-tasks seg: 均返 91002 (409) 且零冻结
 	qValid, err := segSvc.Quote(ctx, userID, seg.ID, &model.GenerateDramaSegmentReq{
 		ModelID: "m1",
 		Input:   map[string]any{"prompt": "审讯室"},
@@ -401,7 +401,7 @@ func TestDramaSegmentService_V21_QuoteAndGenerateGuard(t *testing.T) {
 		QuoteToken: qValid.QuoteToken,
 	})
 	if err != nil || len(respDirect.Items) != 1 || respDirect.Items[0].Error == nil || respDirect.Items[0].Error.Code != errcode.ErrDramaQuoteExpired.Code {
-		t.Fatalf("直接提交 seg: 变价应返回 67029：err=%v resp=%+v", err, respDirect)
+		t.Fatalf("直接提交 seg: 变价应返回 91002：err=%v resp=%+v", err, respDirect)
 	}
 	var creditCheck model.UserCredit
 	if err := db.Where("user_id = ?", userID).First(&creditCheck).Error; err != nil {
@@ -411,7 +411,7 @@ func TestDramaSegmentService_V21_QuoteAndGenerateGuard(t *testing.T) {
 		t.Fatalf("变价被拒不应冻结积分，实际 frozen=%d", creditCheck.Frozen)
 	}
 
-	// 5. Token 过期（clock 越过 TTL）-> 67029
+	// 5. Token 过期（clock 越过 TTL）-> 91002
 	now = now.Add(5 * time.Minute)
 	reg.snap.Model.Pricing.Unit = 10
 	_, err = segSvc.Generate(ctx, userID, seg.ID, "seg-expired", &model.GenerateDramaSegmentReq{

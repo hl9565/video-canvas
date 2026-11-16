@@ -55,7 +55,7 @@ func TestDramaComposeIntent_NamespaceAndReplay(t *testing.T) {
 	}
 	for _, extra := range []string{`,"compose":{"size":"1080p"}`, `,"compose_request_key":"replacement"`, `,"ratio":"16:9"`} {
 		_, err = s.CreateAgentJob(ctx, 7, 1, 55, composeReq(t, extra))
-		dramaCheckCode(t, err, 40015)
+		dramaCheckCode(t, err, 90001)
 	}
 }
 
@@ -75,7 +75,7 @@ func TestDramaComposeIntent_LegacyFailClosed(t *testing.T) {
 		}
 		for _, extra := range []string{`,"compose":{"size":"1080p"}`, `,"compose":{"segment_version":5}`, `,"compose_request_key":"new"`} {
 			_, err = s.CreateAgentJob(context.Background(), 7, 1, 55, composeReq(t, extra))
-			dramaCheckCode(t, err, 40015)
+			dramaCheckCode(t, err, 90001)
 		}
 	}
 }
@@ -119,12 +119,12 @@ func TestDramaJobIntent_AllStepsPersistAndRawSeconds(t *testing.T) {
 			changed := *req
 			changed.Ratio = "16:9"
 			_, err = s.CreateAgentJob(context.Background(), 7, 1, 101, &changed)
-			dramaCheckCode(t, err, 40015)
+			dramaCheckCode(t, err, 90001)
 			if step == "storyboard" {
 				changed = *req
 				changed.MaxSeconds = 15
 				_, err = s.CreateAgentJob(context.Background(), 7, 1, 101, &changed)
-				dramaCheckCode(t, err, 40015)
+				dramaCheckCode(t, err, 90001)
 			}
 			if len(r.jobs) != baselineJobs+1 || r.credit.Frozen != frozen || len(r.ledger) != ledger {
 				t.Fatal("重放冲突产生副作用")
@@ -176,7 +176,7 @@ func TestDramaComposeIntent_ApprovalAndKeyCannotBorrowJobs(t *testing.T) {
 			} else {
 				_, err = s.CreateAgentJob(context.Background(), 7, 1, a, req)
 			}
-			dramaCheckCode(t, err, 40015)
+			dramaCheckCode(t, err, 90001)
 		})
 	}
 }
@@ -203,11 +203,11 @@ func TestDramaJobIntent_LegacyEveryStepUsesOnlyFrozenFields(t *testing.T) {
 			req.MaxSeconds = 4
 		}
 		_, err = s.CreateAgentJob(context.Background(), 7, 1, approval, req)
-		dramaCheckCode(t, err, 40015)
+		dramaCheckCode(t, err, 90001)
 		req.MaxSeconds = 0
 		req.Ratio = "16:9"
 		_, err = s.CreateAgentJob(context.Background(), 7, 1, approval, req)
-		dramaCheckCode(t, err, 40015)
+		dramaCheckCode(t, err, 90001)
 		if len(r.jobs) != 1 || len(r.ledger) != 0 || r.credit.Frozen != 0 {
 			t.Fatal("旧签名重放产生副作用")
 		}

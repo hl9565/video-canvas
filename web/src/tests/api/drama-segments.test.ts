@@ -294,7 +294,7 @@ describe("api/drama：转写稿（片场平台适配）", () => {
   });
 });
 
-describe("api/drama：二期剪辑、报价、清单、预览与 67028-67030 错误语义", () => {
+describe("api/drama：二期剪辑、报价、清单、预览与 91001-91003 错误语义", () => {
   test("mapSegment 补齐 edit 默认值与 sourceFrameCount/hasAudio，segmentEditOf 兼容旧夹具", () => {
     const bare = mapSegment(rawSegment());
     expect(bare.sourceFrameCount).toBeNull();
@@ -522,14 +522,14 @@ describe("api/drama：二期剪辑、报价、清单、预览与 67028-67030 错
     post.mockRestore();
   });
 
-  test("67028 / 67029 绝不当作 revision 冲突，67030 优先展示后端具体 Msg", () => {
+  test("91001 / 91002 绝不当作 revision 冲突，91003 优先展示后端具体 Msg", () => {
     const stale = new ApiError("stale", DRAMA_ERR.manifestStale, 409);
     const expired = new ApiError("expired", DRAMA_ERR.quoteExpired, 409);
     const invalid = new ApiError("帧终点越界", DRAMA_ERR.editInvalid, 400);
 
-    expect(DRAMA_ERR.manifestStale).toBe(67028);
-    expect(DRAMA_ERR.quoteExpired).toBe(67029);
-    expect(DRAMA_ERR.editInvalid).toBe(67030);
+    expect(DRAMA_ERR.manifestStale).toBe(91001);
+    expect(DRAMA_ERR.quoteExpired).toBe(91002);
+    expect(DRAMA_ERR.editInvalid).toBe(91003);
 
     expect(isManifestStaleError(stale)).toBe(true);
     expect(isQuoteExpiredError(expired)).toBe(true);

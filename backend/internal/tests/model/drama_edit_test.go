@@ -78,9 +78,9 @@ func TestDramaEditErrorCodes(t *testing.T) {
 		code   int
 		status int
 	}{
-		{"ErrDramaManifestStale", errcode.ErrDramaManifestStale, 67028, http.StatusConflict},
-		{"ErrDramaQuoteExpired", errcode.ErrDramaQuoteExpired, 67029, http.StatusConflict},
-		{"ErrDramaEditInvalid", errcode.ErrDramaEditInvalid, 67030, http.StatusBadRequest},
+		{"ErrDramaManifestStale", errcode.ErrDramaManifestStale, 91001, http.StatusConflict},
+		{"ErrDramaQuoteExpired", errcode.ErrDramaQuoteExpired, 91002, http.StatusConflict},
+		{"ErrDramaEditInvalid", errcode.ErrDramaEditInvalid, 91003, http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		if tc.err == nil {

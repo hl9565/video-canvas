@@ -73,7 +73,7 @@ func TestDramaComposeManifest_ProbeOutsideLocksAndTx2VersionFence(t *testing.T) 
 		return videoframe.NormalizedProbe{NormalizedFrames24: 120}, nil
 	}})
 	_, err := s.CreateJob(context.Background(), 7, 1, composeReq(t, `,"compose_request_key":"changed-during-probe"`))
-	dramaCheckCode(t, err, 67028)
+	dramaCheckCode(t, err, 91001)
 	if len(r.jobs) != 0 || len(r.assets) != 0 || r.creditCalls != 0 {
 		t.Fatal("tx2 冲突写入或冻结")
 	}
@@ -157,7 +157,7 @@ func TestDramaComposeManifest_Tx2ChecksAssetContentHash(t *testing.T) {
 	probes.rows[files.sha] = &model.AssetMediaProbe{NormalizedFrames24: 120}
 	svc := service.NewDramaService(service.DramaDeps{Repo: repo, Assets: files, Probes: probes})
 	_, err := svc.CreateJob(context.Background(), 7, 1, composeReq(t, ""))
-	dramaCheckCode(t, err, 67028)
+	dramaCheckCode(t, err, 91001)
 	if len(memory.jobs) != 0 || memory.creditCalls != 0 {
 		t.Fatal("素材哈希变化仍然入队")
 	}

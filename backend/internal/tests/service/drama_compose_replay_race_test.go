@@ -73,7 +73,7 @@ func TestDramaComposeIntent_AllFourReplayExitsRejectTampering(t *testing.T) {
 						t.Fatalf("同意图未恢复赢家: %+v %v", got, err)
 					}
 				} else {
-					dramaCheckCode(t, err, 40015)
+					dramaCheckCode(t, err, 90001)
 				}
 				if len(memory.jobs) != 0 || len(memory.assets) != 0 || memory.creditCalls != 0 || bc.calls != 0 {
 					t.Fatal("重放出口产生写入、冻结或推送")

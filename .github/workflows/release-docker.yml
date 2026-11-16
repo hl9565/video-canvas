@@ -90,8 +90,8 @@ jobs:
           test -z "$(gofmt -l .)"
           go vet ./...
 
-      - name: 安装 ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: 安装 ffmpeg 和 nginx
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg nginx
 
       - name: Go tests
         working-directory: backend

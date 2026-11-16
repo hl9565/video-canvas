@@ -2,6 +2,7 @@ package migration_test
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"regexp"
 	"sort"
@@ -29,25 +30,83 @@ var autoMigrateOnly = map[string]bool{
 	"index idx_task_waiting":       true,
 }
 
-// TestMigrationFileNames 检查内嵌迁移文件的命名：符合规则、从 0001 开始连续编号、不重复。
+// TestMigrationFileNames 检查命名、基线和全局唯一前缀：上游从 0001、Fork 从 9001 分别连续编号。
 func TestMigrationFileNames(t *testing.T) {
 	names, err := fs.Glob(migrations.FS, "*.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(names) == 0 || names[0] != migration.BaselineFile {
-		t.Fatalf("第一个迁移必须是 %s，得到 %v", migration.BaselineFile, names)
+	if err := validateMigrationFileNames(names); err != nil {
+		t.Fatal(err)
 	}
+}
+
+// validateMigrationFileNames 同时约束两个独立连续号段，避免 Fork 高编号挤占未来上游迁移。
+func validateMigrationFileNames(names []string) error {
+	names = append([]string(nil), names...)
 	sort.Strings(names)
+	if len(names) == 0 {
+		return fmt.Errorf("第一个迁移必须是 %s", migration.BaselineFile)
+	}
 	pattern := regexp.MustCompile(`^([0-9]{4})_[a-z0-9_]+(\.notx)?\.sql$`)
+	seen := map[string]string{}
+	nextUpstream, nextFork := 1, 9001
 	for i, name := range names {
 		m := pattern.FindStringSubmatch(name)
 		if m == nil {
-			t.Fatalf("文件名 %s 不合规：应为 NNNN_小写下划线描述.sql 或 .notx.sql", name)
+			return fmt.Errorf("文件名 %s 不合规：应为 NNNN_小写下划线描述.sql 或 .notx.sql", name)
 		}
-		if n, _ := strconv.Atoi(m[1]); n != i+1 {
-			t.Fatalf("迁移编号应从 0001 起连续：第 %d 个文件是 %s", i+1, name)
+		n, _ := strconv.Atoi(m[1])
+		if n == 0 || n == 9000 {
+			return fmt.Errorf("迁移编号 %04d 禁用：%s", n, name)
 		}
+		if prev, ok := seen[m[1]]; ok {
+			return fmt.Errorf("迁移文件 %s 与 %s 编号重复", prev, name)
+		}
+		seen[m[1]] = name
+		if i == 0 && name != migration.BaselineFile {
+			return fmt.Errorf("第一个迁移必须是 %s，得到 %s", migration.BaselineFile, name)
+		}
+		if n <= 8999 {
+			if n != nextUpstream {
+				return fmt.Errorf("上游迁移 0001–8999 应连续：期望 %04d，得到 %s", nextUpstream, name)
+			}
+			nextUpstream++
+		} else {
+			if n != nextFork {
+				return fmt.Errorf("Fork 迁移 9001–9999 应连续：期望 %04d，得到 %s", nextFork, name)
+			}
+			nextFork++
+		}
+	}
+	return nil
+}
+
+func TestMigrationFileNames_DualRanges(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		files []string
+		valid bool
+	}{
+		{"只有基线", []string{"0001_baseline.sql"}, true},
+		{"双段各自连续且允许 notx", []string{"9002_index.notx.sql", "0002_upstream.sql", "9001_fork.sql", "0001_baseline.sql"}, true},
+		{"空集合", nil, false},
+		{"基线名称错误", []string{"0001_other.sql"}, false},
+		{"0000 禁用", []string{"0000_x.sql", "0001_baseline.sql"}, false},
+		{"9000 禁用", []string{"0001_baseline.sql", "9000_x.sql"}, false},
+		{"低段断档", []string{"0001_baseline.sql", "0003_x.sql", "9001_fork.sql"}, false},
+		{"高段起点断档", []string{"0001_baseline.sql", "9002_x.sql"}, false},
+		{"高段内部断档", []string{"0001_baseline.sql", "9001_x.sql", "9003_x.sql"}, false},
+		{"低段重复前缀", []string{"0001_baseline.sql", "0002_x.sql", "0002_y.notx.sql"}, false},
+		{"高段重复前缀", []string{"0001_baseline.sql", "9001_x.sql", "9001_y.notx.sql"}, false},
+		{"超过四位", []string{"0001_baseline.sql", "10000_x.sql"}, false},
+		{"名称必须小写", []string{"0001_baseline.sql", "0002_X.sql"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateMigrationFileNames(tc.files); (err == nil) != tc.valid {
+				t.Fatalf("files=%v valid=%v err=%v", tc.files, tc.valid, err)
+			}
+		})
 	}
 }
 
