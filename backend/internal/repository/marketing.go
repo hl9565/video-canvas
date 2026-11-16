@@ -83,6 +83,10 @@ type MarketingTx interface {
 	UpdateScript(ctx context.Context, id uint64, fields map[string]any) error
 	// ScriptTasks 返回这些节点的正式生成任务，按创建时间、id 正序。
 	ScriptTasks(ctx context.Context, userID uint64, nodeIDs []string) ([]model.GenerationTask, error)
+	// ProjectScriptIDs 查询用户项目下全部脚本，供父锁内删除复核。
+	ProjectScriptIDs(context.Context, uint64, uint64) ([]uint64, error)
+	// ActiveProjectTasks 统计用户节点的活动正式任务，供同事务忙态复核。
+	ActiveProjectTasks(context.Context, uint64, []string) (int64, error)
 	// EnqueueRound 在当前业务事务里为轮次入队 River job。
 	EnqueueRound(ctx context.Context, roundID uint64) error
 	// EnsureCredit 惰性建立积分账户。

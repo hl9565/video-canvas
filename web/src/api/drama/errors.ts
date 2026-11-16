@@ -62,6 +62,8 @@ export const DRAMA_ERR = {
   quoteExpired: FORK_ERR.quoteExpired,
   /** 分镜剪辑参数不合法（400，Msg 写具体原因） */
   editInvalid: FORK_ERR.editInvalid,
+  /** 内容触发了模型的安全过滤（Msg 可点名被过滤的资产） */
+  contentFiltered: 67029,
 } as const;
 
 /** 各错误码的兜底文案：后端 Msg 为空时用 */
@@ -94,6 +96,7 @@ const FALLBACK: Record<number, string> = {
   [DRAMA_ERR.adaptInvalid]: "转写结果不合格，请重试",
   [DRAMA_ERR.adaptMissing]: "还没有这个格式的转写稿，请先转写",
   30002: "数据版本已变更，请刷新后重试",
+  [DRAMA_ERR.contentFiltered]: "内容触发了模型的安全过滤，调整相关描述后重试",
 };
 
 /** 后端通用 CAS revision 冲突业务码（errcode.ErrCanvasConflict，HTTP 409） */

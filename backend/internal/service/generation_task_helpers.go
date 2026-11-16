@@ -22,7 +22,7 @@ func taskView(t *model.GenerationTask) *model.GenerationTaskView {
 	if len(t.OutputJSON) > 0 {
 		var decoded []model.TaskOutput
 		if err := json.Unmarshal(t.OutputJSON, &decoded); err != nil {
-			logger.Warn("解析任务 output_json 失败", logger.TaskID(t.ID), zap.Error(err))
+			logger.Warn("解析任务 output_json 失败", logger.GenRun(t.ID), zap.Error(err))
 		} else if decoded != nil {
 			outputs = decoded
 		}
@@ -131,4 +131,49 @@ func canvasRef(id *uint64) *idcodec.ID {
 	}
 	ref := idcodec.ID(*id)
 	return &ref
+}
+
+func reqNodes(single string, many []string) []string {
+	if len(many) > 0 {
+		return many
+	}
+	return []string{single}
+}
+
+func sameUint64Ptr(a, b *uint64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func cloneMap(src map[string]any) map[string]any {
+	if src == nil {
+		return map[string]any{}
+	}
+	b, err := json.Marshal(src)
+	if err != nil {
+		out := make(map[string]any, len(src))
+		for k, v := range src {
+			out[k] = v
+		}
+		return out
+	}
+	var out map[string]any
+	if err := json.Unmarshal(b, &out); err != nil || out == nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func nonNilMap(m map[string]any) map[string]any {
+	if m == nil {
+		return map[string]any{}
+	}
+	return m
+}
+
+func asString(v any) string {
+	s, _ := v.(string)
+	return s
 }

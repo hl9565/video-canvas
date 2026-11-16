@@ -103,6 +103,13 @@ func slice2cMigrate(t *testing.T, db *gorm.DB, includeFork bool) {
 	}
 }
 
+func migrateCurrentSchemaPG16(t *testing.T, db *gorm.DB) {
+	t.Helper()
+	if err := migration.Run(context.Background(), db, migration.Options{FS: migrations.FS, Logger: zap.NewNop()}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDramaComposeMigrationFiles_FixtureStages(t *testing.T) {
 	source := fstest.MapFS{}
 	for _, name := range []string{

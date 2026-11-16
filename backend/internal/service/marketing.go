@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"sync"
 	"time"
 
 	"video-canvas/internal/model"
@@ -110,6 +111,8 @@ type MarketingService struct {
 	repo                 MarketingRepo
 	steps                *stepkit.Registry
 	resolver             *stepkit.Resolver
+	caller               stepkit.Caller
+	adapting             sync.Map // 仅本机限重；写权限和扣费由数据库锁决定。
 	runner               *stepkit.Runner
 	models               provider.Registry
 	assets               MarketingAssets
@@ -124,7 +127,7 @@ type MarketingService struct {
 
 // NewMarketingService 创建营销服务；Broadcaster 为 nil 时换成空实现。
 func NewMarketingService(d MarketingDeps, opts ...MarketingOption) *MarketingService {
-	s := &MarketingService{repo: d.Repo, steps: d.Steps, resolver: d.Resolver, runner: stepkit.NewRunner(d.Caller), models: d.Models,
+	s := &MarketingService{repo: d.Repo, steps: d.Steps, resolver: d.Resolver, runner: stepkit.NewRunner(d.Caller), caller: d.Caller, models: d.Models,
 		assets: d.Assets, tasks: d.Tasks, canvases: d.Canvases, frames: d.Frames, credits: d.Credits, bc: d.Broadcaster, now: d.Now}
 	if s.bc == nil {
 		s.bc = ws.NopBroadcaster{}

@@ -150,7 +150,8 @@ func (c *mktCanvases) Create(_ context.Context, _ uint64, req *model.CreateCanva
 // mktCaller 按提示词里的环节职责区分环节，给每个环节脚本化的回复；可让某个环节阻塞直到放行或被取消。
 type mktCaller struct {
 	mu      sync.Mutex
-	replies map[string]func(call int) (string, error) // 环节 key → 回复
+	replies map[string]func(call int) (string, error)      // 环节 key → 回复
+	byText  map[string]func(prompt string) (string, error) // 环节 key → 按提示词现拼的回复（并发调用时用，优先于 replies）
 	calls   map[string]int
 	block   map[string]chan struct{}
 	started map[string]chan struct{}
@@ -164,8 +165,11 @@ var mktDuty = map[string]string{
 	marketing.StepCreate:  "按给定的创意角度各写",
 }
 
+// mktAdaptStep 是假模型里出片前转写的调用 key（转写不是环节，没有环节 key）。
+const mktAdaptStep = "adapt"
+
 func newMktCaller() *mktCaller {
-	return &mktCaller{replies: map[string]func(int) (string, error){}, calls: map[string]int{}, block: map[string]chan struct{}{}, started: map[string]chan struct{}{}}
+	return &mktCaller{replies: map[string]func(int) (string, error){}, byText: map[string]func(string) (string, error){}, calls: map[string]int{}, block: map[string]chan struct{}{}, started: map[string]chan struct{}{}}
 }
 
 func (c *mktCaller) on(step string, fn func(call int) (string, error)) { c.replies[step] = fn }
@@ -187,10 +191,16 @@ func (c *mktCaller) Complete(ctx context.Context, _ *provider.Snapshot, msgs []l
 			step = k
 		}
 	}
+	if strings.HasPrefix(prompt, marketing.AdaptDuty) {
+		step = mktAdaptStep // 转写提示词里带着原稿，可能含其他环节的字样，以开头的职责句为准
+	}
 	c.mu.Lock()
 	c.calls[step]++
 	n := c.calls[step]
 	fn := c.replies[step]
+	if byText := c.byText[step]; byText != nil {
+		fn = func(int) (string, error) { return byText(prompt) }
+	}
 	blk := c.block[step]
 	started := c.started[step]
 	c.mu.Unlock()
@@ -280,7 +290,7 @@ func newMktEnv(t *testing.T, initial int) *mktEnv {
 	env.models.Snapshots[mktVideoKey] = mktVideoSnapshot()
 	env.repo.SetEnqueuer(env.queue)
 	limits := &fakeLimits{initial: initial, defMax: 20}
-	env.taskSvc = NewGenerationTaskService(GenerationTaskDeps{Repo: env.taskRepo, Registry: &mktRegistry{snap: mktVideoSnapshot()}, Executor: &fakeTaskExecutor{},
+	env.taskSvc = NewGenerationTaskService(GenerationTaskDeps{Repo: env.taskRepo, Registry: env.models, Executor: &fakeTaskExecutor{},
 		Assets: env.assets, Broadcaster: env.bc, Limits: limits})
 	env.initial = initial
 	env.reg = stepkit.NewRegistry()
@@ -478,4 +488,30 @@ func (e *mktEnv) rebuild(frames MarketingFrames) {
 	e.svc = NewMarketingService(MarketingDeps{Repo: e.repo, Steps: e.reg, Resolver: e.resolver, Caller: e.caller, Models: e.models, Assets: e.assets,
 		Tasks: e.taskSvc, Canvases: e.canvases, Frames: frames, Credits: stepfake.Policy{Initial: e.initial}, Broadcaster: e.bc})
 	e.taskSvc.SetTaskObserver(e.svc)
+}
+
+// promptVersion 从真实预览读取CAS凭据；转写目标还不存在时其版本为0。
+func (e *mktEnv) promptVersion(id idcodec.ID, adapted bool) *int64 {
+	e.t.Helper()
+	preview, err := e.svc.Prompt(context.Background(), e.user, uint64(id), "")
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	version := preview.Version
+	if adapted {
+		version = 0
+		if preview.Adaptation != nil {
+			version = preview.Adaptation.Version
+		}
+	}
+	return &version
+}
+
+// m2RoundReq 固定同一次出片的原始目标，用已有对外ID编码传给HTTP和服务。
+func m2RoundReq(key string, scripts []model.MarketingScriptView) *model.RenderMarketingRoundReq {
+	ids := make([]idcodec.ID, 0, len(scripts))
+	for _, sc := range scripts {
+		ids = append(ids, sc.ID)
+	}
+	return &model.RenderMarketingRoundReq{IdempotencyKey: key, ScriptIDs: ids}
 }

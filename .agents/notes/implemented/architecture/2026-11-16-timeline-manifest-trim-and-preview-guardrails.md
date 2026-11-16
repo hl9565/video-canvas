@@ -12,7 +12,7 @@ Stage A 在媒体精裁、前端等待/版本号保护以及上下游基线边�
 
 - **规范探针与整帧范围清单（`must`）**：`backend/internal/pkg/videoframe/compose_manifest.go` 中的 `ComposeManifest`（L67）基于已落库探针规范化信息校验 `FrameRange`（`resolveManifestRange`，L172）并驱动服务端混音/拼接渲染；`backend/internal/service/drama_manifest.go` 中的 `ResolveEpisodeManifest`（L40）与 `PrepareOrResolveEpisodeManifest`（L50）通过 `backend/internal/service/drama_preview_auth.go` 中的 HMAC 签名票据 `dramaPreviewStore`（L49）与并发渲染信号量（`maxConcurrentPreviewRenders = 4`、`maxManifestErrEntries = 256`）控制预览资源。
 - **前端清单轮询与版本单调守卫**：`web/src/utils/drama/manifest.ts` 中的 `waitForEpisodeManifest`（L133）使用 `raceWithinDeadline` + 可取消 `sleep` 严格封顶等待窗口；`web/src/pages/drama/workspace/use-workspace.ts` 中的 `mergeEpisodeListWithMonotonicVersions`（L37）防止陈旧异步响应与缺 ID patch 覆盖高版本分集状态；[锁序与保存点笔记](./2026-11-16-drama-lock-hierarchy-and-savepoint-avoidance.md) 约定删除/保存竞态由 `expected_episode_id` 闭环。
-- **策略 A 上游基线冻结**：Phase 2 期间保持 fork `v0.6.11` + Stage A PR1（迁移至 `backend/migrations/0036_drama_edit.sql`）为唯一实施基线，暂不并入上游 `zaylora/video-canvas` `v0.6.12` 的 `23` 个提交（其迁移 `0036/0037` 与本地 `0036_drama_edit.sql` 及规划中的 Stage B `0037` 撞号，且重叠 `25` 个文件含 `14` 处直接文本冲突）。
+- **策略 A 上游基线冻结（已被双段合入部分取代）**：原 Stage A 期间曾暂缓并入 `v0.6.12`；现已按双段迁移与独立错误码方案在 `sync/upstream-0.6.12` 完成上游 `v0.6.12`（`90b950f1`）合入，并将原 `0036_drama_edit.sql` 迁移至 `backend/migrations/9001_drama_edit.sql`，详见 [上游双段迁移与出片原子保存点笔记](./2026-11-16-upstream-merge-dual-band-and-render-atomicity.md)。本笔记关于整数帧清单、预览鉴权与前端单调版本的契约继续有效。
 
 被否决策见 [拒绝批量复用 InsertTask 与 Phase 2 中途合并上游](../../rejected/architecture/2026-11-16-reuse-inserttask-in-batch-and-early-upstream-merge.md)。
 

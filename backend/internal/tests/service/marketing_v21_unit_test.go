@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"video-canvas/internal/marketing"
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/repository"
@@ -108,4 +109,72 @@ func TestMarketingV21_LatestRunUsesGenerationThenID(t *testing.T) {
 
 func (r *deletedMarketingRepo) Run(context.Context, uint64, uint64, bool) (*model.MarketingStepRun, error) {
 	return &model.MarketingStepRun{ID: 9, UserID: 7, RoundID: 2, Status: model.MarketingRunSucceeded}, nil
+}
+
+// 实际素材、角色、镜头和限制都是转写输入，原稿文字相同不能证明缓存有效。
+func TestMarketingV21_AdaptInputHashCoversRealInput(t *testing.T) {
+	base := marketing.AdaptInput{Source: "手改原稿", Seconds: 15, ProductImages: 1, MaxLen: 6000, Shots: []marketing.AdaptShot{{No: 1, Narration: "开场"}}}
+	original := marketing.AdaptInputHash("h3", base, 1)
+	if original == "" || original != marketing.AdaptInputHash("h3", base, 1) {
+		t.Fatal("指纹必须稳定")
+	}
+	for _, change := range []func(*marketing.AdaptInput){
+		func(in *marketing.AdaptInput) { in.ProductImages = 2 },
+		func(in *marketing.AdaptInput) { in.HasModel = true },
+		func(in *marketing.AdaptInput) { in.HasRefVideo = true },
+		func(in *marketing.AdaptInput) { in.Seconds = 10 },
+		func(in *marketing.AdaptInput) { in.MaxLen = 5000 },
+		func(in *marketing.AdaptInput) { in.Shots = []marketing.AdaptShot{{No: 1, Narration: "新旁白"}} },
+	} {
+		next := base
+		change(&next)
+		if marketing.AdaptInputHash("h3", next, 1) == original {
+			t.Fatal("输入变更必须失效")
+		}
+	}
+	if marketing.AdaptInputHash("h3", base, 2) == original || marketing.AdaptInputHash("generic", base, 1) == original || marketing.AdaptInputHash("h3", base, 1, 2) == marketing.AdaptInputHash("h3", base, 2, 1) {
+		t.Fatal("格式、素材身份与顺序必须参与指纹")
+	}
+}
+
+type versionProbeRepo struct {
+	service.MarketingRepo
+	reads int
+}
+
+func (r *versionProbeRepo) Script(context.Context, uint64, uint64, bool) (*model.MarketingScript, error) {
+	r.reads++
+	return nil, errors.New("不应读取")
+}
+func TestMarketingV21_MissingVersionRejectsBeforeDependencies(t *testing.T) {
+	for _, op := range []string{"adapt", "adaptation", "prompt", "restore"} {
+		t.Run(op, func(t *testing.T) {
+			repo := &versionProbeRepo{}
+			svc := service.NewMarketingService(service.MarketingDeps{Repo: repo})
+			var err error
+			switch op {
+			case "adapt":
+				_, err = svc.Adapt(context.Background(), 7, 3, &model.AdaptMarketingScriptReq{})
+			case "adaptation":
+				_, err = svc.EditAdaptation(context.Background(), 7, 3, &model.EditMarketingAdaptationReq{Format: "h3", Prompt: "新稿"})
+			case "prompt":
+				_, err = svc.EditPrompt(context.Background(), 7, 3, &model.EditMarketingPromptReq{Format: "h3", Prompt: "新稿"})
+			case "restore":
+				_, err = svc.RestorePrompt(context.Background(), 7, 3, &model.RestoreMarketingPromptReq{Format: "h3"})
+			}
+			wantMktCode(t, err, errcode.ErrMarketingConflict.Code)
+			if repo.reads != 0 {
+				t.Fatal("缺版本时必须在加载或调用模型前拒绝")
+			}
+		})
+	}
+}
+
+func TestMarketingV21_RenderRoundMissingOriginalTargetsFailsBeforeLLM(t *testing.T) {
+	m, e := m2AdaptMemory(t)
+	_, err := e.svc.RenderRound(context.Background(), 7, m.r.ID, &model.RenderMarketingRoundReq{IdempotencyKey: "old-click"})
+	wantMktCode(t, err, errcode.ErrInvalidParams.Code)
+	if e.caller.count(mktAdaptStep) != 0 || len(m.ledgers) != 0 {
+		t.Fatal("无原目标凭据不得调用模型或收费")
+	}
 }

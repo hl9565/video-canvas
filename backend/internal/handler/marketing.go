@@ -1,9 +1,13 @@
 package handler
 
 import (
+	"strconv"
+	"strings"
+
 	"github.com/gin-gonic/gin"
 
 	"video-canvas/internal/model"
+	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/response"
 	"video-canvas/internal/service"
 	"video-canvas/pkg/pagination"
@@ -69,7 +73,7 @@ func (h *MarketingHandler) Get(c *gin.Context) {
 	reply(c, v, err)
 }
 
-// Update 改标题或事实卡（PUT /marketing-projects/:id）。
+// Update 改标题、事实卡或商品图（PUT /marketing-projects/:id）。
 func (h *MarketingHandler) Update(c *gin.Context) {
 	id, ok := CanvasPathID(c)
 	if !ok {
@@ -141,6 +145,30 @@ func (h *MarketingHandler) RestoreReverse(c *gin.Context) {
 		return
 	}
 	v, err := h.svc.RestoreReverse(c.Request.Context(), currentUserID(c), id)
+	reply(c, v, err)
+}
+
+// UpdateRoundSettings 改一轮的出片设置：视频模型、分辨率、换模特图（PUT /marketing-rounds/:id/settings）。
+func (h *MarketingHandler) UpdateRoundSettings(c *gin.Context) {
+	id, ok := CanvasPathID(c)
+	if !ok {
+		return
+	}
+	var req model.UpdateMarketingRoundSettingsReq
+	if !BindJSON(c, &req) {
+		return
+	}
+	v, err := h.svc.UpdateRoundSettings(c.Request.Context(), currentUserID(c), id, &req)
+	reply(c, v, err)
+}
+
+// RefreshFacts 按当前商品图重新识别外观锚点（POST /marketing-projects/:id/refresh-facts）。
+func (h *MarketingHandler) RefreshFacts(c *gin.Context) {
+	id, ok := CanvasPathID(c)
+	if !ok {
+		return
+	}
+	v, err := h.svc.RefreshFacts(c.Request.Context(), currentUserID(c), id)
 	reply(c, v, err)
 }
 
@@ -218,6 +246,74 @@ func (h *MarketingHandler) Prompt(c *gin.Context) {
 	reply(c, v, err)
 }
 
+// Adapt 手动转写出片提示词（POST /marketing-scripts/:id/adapt）。
+func (h *MarketingHandler) Adapt(c *gin.Context) {
+	id, ok := CanvasPathID(c)
+	if !ok {
+		return
+	}
+	var req model.AdaptMarketingScriptReq
+	if !BindJSON(c, &req) {
+		return
+	}
+	if !marketingExpectedVersion(c, &req.ExpectedVersion) {
+		return
+	}
+	v, err := h.svc.Adapt(c.Request.Context(), currentUserID(c), id, &req)
+	reply(c, v, err)
+}
+
+// EditAdaptation 手改转写稿（PUT /marketing-scripts/:id/adaptation）。
+func (h *MarketingHandler) EditAdaptation(c *gin.Context) {
+	id, ok := CanvasPathID(c)
+	if !ok {
+		return
+	}
+	var req model.EditMarketingAdaptationReq
+	if !BindJSON(c, &req) {
+		return
+	}
+	if !marketingExpectedVersion(c, &req.ExpectedVersion) {
+		return
+	}
+	v, err := h.svc.EditAdaptation(c.Request.Context(), currentUserID(c), id, &req)
+	reply(c, v, err)
+}
+
+// EditPrompt 手改出片原稿（PUT /marketing-scripts/:id/prompt）。
+func (h *MarketingHandler) EditPrompt(c *gin.Context) {
+	id, ok := CanvasPathID(c)
+	if !ok {
+		return
+	}
+	var req model.EditMarketingPromptReq
+	if !BindJSON(c, &req) {
+		return
+	}
+	if !marketingExpectedVersion(c, &req.ExpectedVersion) {
+		return
+	}
+	v, err := h.svc.EditPrompt(c.Request.Context(), currentUserID(c), id, &req)
+	reply(c, v, err)
+}
+
+// RestorePrompt 还原出片原稿，回到按脚本拼出的提示词（DELETE /marketing-scripts/:id/prompt?format=）。
+func (h *MarketingHandler) RestorePrompt(c *gin.Context) {
+	id, ok := CanvasPathID(c)
+	if !ok {
+		return
+	}
+	var req model.RestoreMarketingPromptReq
+	if !BindQuery(c, &req) {
+		return
+	}
+	if !marketingExpectedVersion(c, &req.ExpectedVersion) {
+		return
+	}
+	v, err := h.svc.RestorePrompt(c.Request.Context(), currentUserID(c), id, &req)
+	reply(c, v, err)
+}
+
 // Render 单份出片（POST /marketing-scripts/:id/render）。
 func (h *MarketingHandler) Render(c *gin.Context) {
 	id, ok := CanvasPathID(c)
@@ -258,4 +354,23 @@ func created(c *gin.Context, v any, err error) {
 		return
 	}
 	response.Created(c, v)
+}
+
+// marketingExpectedVersion 同时接受If-Match与JSON凭据；双凭据不一致或非法格式均拒绝。
+func marketingExpectedVersion(c *gin.Context, expected **int64) bool {
+	header := strings.TrimSpace(c.GetHeader("If-Match"))
+	if header == "" {
+		return true
+	}
+	raw := header
+	if len(raw) >= 2 && strings.HasPrefix(raw, "\"") && strings.HasSuffix(raw, "\"") {
+		raw = raw[1 : len(raw)-1]
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v < 0 || (*expected != nil && **expected != v) {
+		response.Fail(c, errcode.ErrMarketingConflict)
+		return false
+	}
+	*expected = &v
+	return true
 }

@@ -2,8 +2,11 @@ package service_test
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,18 +19,20 @@ import (
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/ws"
 	"video-canvas/internal/provider"
+	"video-canvas/internal/provider/modelcfg"
 	"video-canvas/internal/repository"
 	"video-canvas/internal/service"
 	"video-canvas/internal/service/stepfake"
 	"video-canvas/internal/stepkit"
 )
 
-// v21Env 仅使用 PG16 真实 SQL 迁移（上游截至 0035 + Fork 9001），独立 schema 隔离每个用例。
+// v21Env 仅使用 PG16 真实 SQL 迁移（上游截至 0037 + Fork 9001），独立 schema 隔离每个用例。
 func v21Env(t *testing.T) *mktEnv {
 	t.Helper()
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
+	migrateCurrentSchemaPG16(t, db)
 	e := &mktEnv{t: t, db: db, repo: repository.NewMarketingRepository(db), taskRepo: repository.NewGenerationTaskRepository(db),
 		models: stepfake.NewModels(), caller: newMktCaller(), assets: &mktAssets{items: map[uint64]*mktAsset{}}, canvases: &mktCanvases{},
 		queue: &mktQueue{}, bc: &fakeTaskBroadcaster{}, user: 7, initial: 1000, reg: stepkit.NewRegistry(), resolver: stepkit.NewResolver(emptyBindings{}, stepfake.NewLibrary())}
@@ -35,7 +40,7 @@ func v21Env(t *testing.T) *mktEnv {
 	e.repo.SetEnqueuer(e.queue)
 	e.models.Snapshots["text-a"] = stepfake.TextModel("text-a", true, true, 3)
 	e.models.Snapshots[mktVideoKey] = mktVideoSnapshot()
-	e.taskSvc = service.NewGenerationTaskService(service.GenerationTaskDeps{Repo: e.taskRepo, Registry: &mktRegistry{snap: mktVideoSnapshot()}, Executor: &fakeTaskExecutor{}, Assets: e.assets, Broadcaster: e.bc, Limits: &fakeLimits{initial: 1000, defMax: 20}})
+	e.taskSvc = service.NewGenerationTaskService(service.GenerationTaskDeps{Repo: e.taskRepo, Registry: e.models, Executor: &fakeTaskExecutor{}, Assets: e.assets, Broadcaster: e.bc, Limits: &fakeLimits{initial: 1000, defMax: 20}})
 	e.rebuild(nil)
 	for id, kind := range map[uint64]string{1: "image", 2: "image", 3: "image", 4: "video"} {
 		mime := "image/jpeg"
@@ -389,10 +394,8 @@ func TestMarketingV21_PG_C_CreateVersusCancel(t *testing.T) {
 			v21ConcurrentAtProject(t, e, uint64(r.ID), cancelFirst, cancel, create)
 			var n int64
 			v21Must(t, e.db.Model(&model.GenerationTask{}).Where("node_id = ?", "mkt:"+idcodec.Encode(uint64(r.Scripts[0].ID))).Count(&n).Error)
+			// 本轮仍在重写或已取消，两种锁顺序都不能创建媒体任务。
 			want := int64(0)
-			if cancelFirst {
-				want = 1
-			}
 			if n != want {
 				t.Fatalf("创建/取消屏障后任务数=%d want%d", n, want)
 			}
@@ -730,7 +733,7 @@ func TestMarketingV21_PG_N_Legacy0035DrainGate(t *testing.T) {
 	} {
 		v21Must(t, db.Exec(sql).Error)
 	}
-	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
+	migrateCurrentSchemaPG16(t, db)
 	e := &mktEnv{t: t, db: db, repo: repository.NewMarketingRepository(db), user: 7}
 	e.svc = service.NewMarketingService(service.MarketingDeps{Repo: e.repo, Models: stepfake.NewModels()})
 	a, b := v21Run(t, e, 1), v21Run(t, e, 2)
@@ -1011,5 +1014,562 @@ func TestMarketingV21_PG_HeartbeatDoesNotResurrectAcrossLockWait(t *testing.T) {
 	v21Must(t, e.db.Raw("SELECT lease_until FROM marketing_step_runs WHERE id = ?", id).Scan(&afterLease).Error)
 	if !afterLease.Equal(origLease) {
 		t.Fatalf("lease_until 不应被修改: orig=%v after=%v", origLease, afterLease)
+	}
+}
+
+// m2SQLQueue 是仅用于独立测试schema的事务队列替身，写完再报错也必须随任务保存点回滚。
+type m2SQLQueue struct{ fail error }
+
+func (q *m2SQLQueue) EnqueueTx(ctx context.Context, tx *sql.Tx, id uint64, _ string, _ time.Time) error {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO m2_test_queue(task_id) VALUES ($1)", id); err != nil {
+		return err
+	}
+	return q.fail
+}
+func (*m2SQLQueue) EnqueueAgentNotifyTx(context.Context, *sql.Tx, uint64, uint64) error {
+	return errors.New("营销出片不应创建Agent通知")
+}
+func m2PGH3(t *testing.T) (*mktEnv, []model.MarketingScriptView, *m2SQLQueue) {
+	t.Helper()
+	e := v21Env(t)
+	e.useH3()
+	_, scripts := e.h3Scripts()
+	q := &m2SQLQueue{}
+	v21Must(t, e.db.Exec("CREATE TABLE m2_test_queue (task_id bigint PRIMARY KEY)").Error)
+	e.taskRepo.SetEnqueuer(q)
+	return e, scripts, q
+}
+func m2ServiceInstance(e *mktEnv, caller stepkit.Caller) *service.MarketingService {
+	tasks := service.NewGenerationTaskService(service.GenerationTaskDeps{Repo: e.taskRepo, Registry: e.models, Assets: e.assets, Broadcaster: e.bc, Limits: &fakeLimits{initial: e.initial, defMax: 20}})
+	svc := service.NewMarketingService(service.MarketingDeps{Repo: e.repo, Models: e.models, Caller: caller, Tasks: tasks, Assets: e.assets, Credits: stepfake.Policy{Initial: e.initial}, Broadcaster: e.bc})
+	tasks.SetTaskObserver(svc)
+	return svc
+}
+func m2Wait(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(8 * time.Second):
+		t.Fatal("模型屏障超时")
+	}
+}
+func m2Result(t *testing.T, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(8 * time.Second):
+		t.Fatal("请求未收尾，可能死锁")
+		return nil
+	}
+}
+func m2GatedCaller(entered, release chan struct{}, marker string) *mktCaller {
+	c := newMktCaller()
+	c.byText[mktAdaptStep] = func(prompt string) (string, error) {
+		close(entered)
+		select {
+		case <-release:
+		case <-time.After(8 * time.Second):
+			return "", errors.New("模型屏障超时")
+		}
+		return strings.ReplaceAll(h3Reply(prompt), "Quiet room tone.", marker), nil
+	}
+	return c
+}
+func m2TaskBroadcasts(e *mktEnv) int {
+	e.bc.mu.Lock()
+	defer e.bc.mu.Unlock()
+	n := 0
+	for _, msg := range e.bc.msgs {
+		if msg.Type == ws.TypeTaskUpdated {
+			n++
+		}
+	}
+	return n
+}
+func m2SetAvailable(t *testing.T, e *mktEnv, n int) {
+	t.Helper()
+	c := e.credit()
+	delta := c.Frozen + n - c.Balance
+	v21Must(t, e.repo.AddCredit(context.Background(), e.user, delta, 0))
+	_, err := e.repo.InsertLedger(context.Background(), &model.CreditLedger{UserID: e.user, Type: model.LedgerAdminAdjust, Amount: delta})
+	v21Must(t, err)
+}
+func m2CheckPGAccounting(t *testing.T, e *mktEnv, balance, frozen, tasks int) {
+	t.Helper()
+	c, err := e.taskRepo.Reconcile(context.Background(), e.user)
+	v21Must(t, err)
+	if c.Balance != balance || c.Frozen != frozen || c.BalanceDiff() != 0 || c.FrozenDiff() != 0 || c.ActiveDiff() != 0 {
+		t.Fatalf("账户/流水/任务不守恒: %+v want %d/%d", c, balance, frozen)
+	}
+	var count, queued int64
+	v21Must(t, e.db.Model(&model.GenerationTask{}).Count(&count).Error)
+	v21Must(t, e.db.Table("m2_test_queue").Count(&queued).Error)
+	if count != int64(tasks) || queued != count || m2TaskBroadcasts(e) != tasks {
+		t.Fatalf("任务/队列/提交后通知: %d/%d/%d want %d", count, queued, m2TaskBroadcasts(e), tasks)
+	}
+}
+func m2TaskPrompt(t *testing.T, task model.GenerationTask) string {
+	t.Helper()
+	var input map[string]any
+	v21Must(t, json.Unmarshal(task.InputJSON, &input))
+	prompt, _ := input["prompt"].(string)
+	return prompt
+}
+
+func TestMarketingV21_PG_M2_RenderReplayRejectsDifferentIntentBeforeLLM(t *testing.T) {
+	e, scripts, _ := m2PGH3(t)
+	ctx := context.Background()
+	id := uint64(scripts[0].ID)
+	before := e.credit().Balance
+	got, err := e.svc.Render(ctx, e.user, id, &model.RenderMarketingScriptReq{IdempotencyKey: "render"})
+	v21Must(t, err)
+	if got.RenderCredits != 20 {
+		t.Fatalf("返回视图不得继续报价已提交的转写: %d", got.RenderCredits)
+	}
+	if _, err := e.svc.Render(ctx, e.user, id, &model.RenderMarketingScriptReq{IdempotencyKey: "render"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range []model.RenderMarketingScriptReq{
+		{IdempotencyKey: "render", Params: map[string]any{}},
+		{IdempotencyKey: "render", VideoModel: mktH3Key},
+		{IdempotencyKey: "render", Params: map[string]any{"duration": 10}},
+	} {
+		_, err := e.svc.Render(ctx, e.user, id, &req)
+		wantMktCode(t, err, errcode.ErrIdempotencyConflict.Code)
+	}
+	_, err = e.svc.Render(ctx, e.user, uint64(scripts[1].ID), &model.RenderMarketingScriptReq{IdempotencyKey: "render"})
+	wantMktCode(t, err, errcode.ErrIdempotencyConflict.Code)
+	if e.caller.count(mktAdaptStep) != 1 || len(e.adaptLedger(scripts[0].ID)) != 2 || len(e.adaptLedger(scripts[1].ID)) != 0 {
+		t.Fatal("重放/异载进行了模型调用或扣费")
+	}
+	m2CheckPGAccounting(t, e, before-3, 20, 1)
+}
+
+func TestMarketingV21_PG_M2_TwoInstancesBothMissRenderKey(t *testing.T) {
+	for _, differentScript := range []bool{false, true} {
+		t.Run(fmt.Sprint(differentScript), func(t *testing.T) {
+			e, scripts, _ := m2PGH3(t)
+			before := e.credit().Balance
+			entered, release := []chan struct{}{make(chan struct{}), make(chan struct{})}, []chan struct{}{make(chan struct{}), make(chan struct{})}
+			done := make(chan error, 2)
+			for i := range 2 {
+				svc := m2ServiceInstance(e, m2GatedCaller(entered[i], release[i], fmt.Sprintf("instance-%d", i)))
+				id := scripts[0].ID
+				if differentScript {
+					id = scripts[i].ID
+				}
+				go func() {
+					_, err := svc.Render(context.Background(), e.user, uint64(id), &model.RenderMarketingScriptReq{IdempotencyKey: "same"})
+					done <- err
+				}()
+			}
+			for i := range 2 {
+				m2Wait(t, entered[i])
+			}
+			close(release[0])
+			close(release[1])
+			conflicts := 0
+			for range 2 {
+				err := m2Result(t, done)
+				if differentScript && errors.Is(err, errcode.ErrIdempotencyConflict) {
+					conflicts++
+					continue
+				}
+				v21Must(t, err)
+			}
+			if differentScript && conflicts != 1 {
+				t.Fatalf("同键异脚本必须恰有一个409: %d", conflicts)
+			}
+			var all []model.GenerationTask
+			v21Must(t, e.db.Find(&all).Error)
+			if len(all) != 1 {
+				t.Fatalf("只能创建一个赢家: %+v", all)
+			}
+			sid, ok := idcodec.Decode(strings.TrimPrefix(all[0].NodeID, model.MarketingNodePrefix))
+			if !ok {
+				t.Fatal("节点身份错误")
+			}
+			pv, err := e.svc.Prompt(context.Background(), e.user, sid, "")
+			v21Must(t, err)
+			if pv.Adaptation == nil || pv.Adaptation.Version != 1 || pv.Adaptation.Prompt != m2TaskPrompt(t, all[0]) {
+				t.Fatal("任务必须使用库内赢家实际稿与版本")
+			}
+			m2CheckPGAccounting(t, e, before-3, 20, 1)
+			if len(e.adaptLedger(idcodec.ID(sid))) != 2 {
+				t.Fatal("转写只能扣一次")
+			}
+		})
+	}
+}
+
+func TestMarketingV21_PG_M2_RenderAdoptsConcurrentSavedWinner(t *testing.T) {
+	e, scripts, _ := m2PGH3(t)
+	id := uint64(scripts[0].ID)
+	before := e.credit().Balance
+	entered, release := make(chan struct{}), make(chan struct{})
+	svc := m2ServiceInstance(e, m2GatedCaller(entered, release, "loser-output"))
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.Render(context.Background(), e.user, id, &model.RenderMarketingScriptReq{IdempotencyKey: "auto"})
+		done <- err
+	}()
+	m2Wait(t, entered)
+	// 第二个独立服务先成功保存同输入的稿，自动候选不得继续使用自己的输出。
+	winner := m2ServiceInstance(e, e.caller)
+	pv, err := winner.Adapt(context.Background(), e.user, id, &model.AdaptMarketingScriptReq{ExpectedVersion: e.promptVersion(scripts[0].ID, true)})
+	close(release)
+	v21Must(t, err)
+	v21Must(t, m2Result(t, done))
+	tasks := e.scriptTasks(scripts[0].ID)
+	if len(tasks) != 1 || pv.Adaptation == nil || m2TaskPrompt(t, tasks[0]) != pv.Adaptation.Prompt || strings.Contains(m2TaskPrompt(t, tasks[0]), "loser-output") {
+		t.Fatal("输家输出污染出片")
+	}
+	current, err := e.svc.Prompt(context.Background(), e.user, id, "")
+	v21Must(t, err)
+	if current.Adaptation.Version != pv.Adaptation.Version || len(e.adaptLedger(scripts[0].ID)) != 2 {
+		t.Fatal("采用赢家时重复写稿、推进版本或收费")
+	}
+	m2CheckPGAccounting(t, e, before-3, 20, 1)
+}
+
+func TestMarketingV21_PG_M2_RenderFailureRollsBackAdaptAndAllMoney(t *testing.T) {
+	for _, failure := range []string{"balance", "queue", "task_limit"} {
+		t.Run(failure, func(t *testing.T) {
+			e, scripts, q := m2PGH3(t)
+			if failure == "balance" {
+				m2SetAvailable(t, e, 3)
+			}
+			if failure == "queue" {
+				q.fail = errors.New("queue unavailable after insert")
+			}
+			if failure == "task_limit" {
+				e.taskSvc = service.NewGenerationTaskService(service.GenerationTaskDeps{Repo: e.taskRepo, Registry: e.models, Assets: e.assets, Broadcaster: e.bc, Limits: &fakeLimits{initial: e.initial, defMax: 0}})
+				e.rebuild(nil)
+			}
+			before := e.credit()
+			var ledgerBefore int64
+			v21Must(t, e.db.Model(&model.CreditLedger{}).Count(&ledgerBefore).Error)
+			_, err := e.render(scripts[0].ID, "failure")
+			switch failure {
+			case "balance":
+				wantMktCode(t, err, errcode.ErrInsufficientCredits.Code)
+			case "task_limit":
+				wantMktCode(t, err, errcode.ErrTooManyTasks.Code)
+			default:
+				if !errors.Is(err, q.fail) {
+					t.Fatalf("队列错误: %v", err)
+				}
+			}
+			var ledgerAfter int64
+			v21Must(t, e.db.Model(&model.CreditLedger{}).Count(&ledgerAfter).Error)
+			if ledgerAfter != ledgerBefore || len(e.adaptLedger(scripts[0].ID)) != 0 || string(v21Script(t, e, uint64(scripts[0].ID)).Adaptations) != "{}" {
+				t.Fatal("零任务残留了转写稿或费用")
+			}
+			m2CheckPGAccounting(t, e, before.Balance, before.Frozen, 0)
+		})
+	}
+}
+
+func TestMarketingV21_PG_M2_RenderRoundPartialReplayAndTargetBinding(t *testing.T) {
+	e, scripts, _ := m2PGH3(t)
+	m2SetAvailable(t, e, 23)
+	ctx := context.Background()
+	req := m2RoundReq("round", scripts)
+	first, err := e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), req)
+	v21Must(t, err)
+	if len(first.Skipped) != 1 || len(e.scriptTasks(scripts[0].ID)) != 1 || len(e.scriptTasks(scripts[1].ID)) != 0 {
+		t.Fatalf("部分成功: %+v", first)
+	}
+	if len(e.adaptLedger(scripts[1].ID)) != 0 {
+		t.Fatal("失败项不应单独收转写费")
+	}
+	m2CheckPGAccounting(t, e, 20, 20, 1)
+	m2SetAvailable(t, e, 23)
+	_, err = e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), req)
+	v21Must(t, err)
+	calls, before := e.caller.count(mktAdaptStep), e.credit()
+	m2CheckPGAccounting(t, e, 40, 40, 2)
+	_, err = e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), req)
+	v21Must(t, err)
+	if e.caller.count(mktAdaptStep) != calls || e.credit() != before {
+		t.Fatal("整轮全命中重复调用/扣费")
+	}
+	added := *v21Script(t, e, uint64(scripts[0].ID))
+	added.ID, added.Seq, added.Status, added.TaskIDs, added.Adaptations = 0, 99, model.MarketingScriptDraft, []byte(`[]`), []byte(`{}`)
+	v21Must(t, e.db.Create(&added).Error)
+	req.ScriptIDs = append(req.ScriptIDs, idcodec.ID(added.ID))
+	_, err = e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), req)
+	wantMktCode(t, err, errcode.ErrIdempotencyConflict.Code)
+	if e.caller.count(mktAdaptStep) != calls || len(e.scriptTasks(idcodec.ID(added.ID))) != 0 || e.credit() != before {
+		t.Fatal("旧键为新脚本偷跑")
+	}
+	// 显式携带旧目标清单可安全重放，新增脚本仍被跳过。
+	req.ScriptIDs = []idcodec.ID{scripts[0].ID, scripts[1].ID}
+	out, err := e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), req)
+	v21Must(t, err)
+	if len(out.Skipped) != 1 || e.caller.count(mktAdaptStep) != calls {
+		t.Fatal("显式原目标应只读重放")
+	}
+	m2CheckPGAccounting(t, e, before.Balance, before.Frozen, 2)
+}
+
+// 模型真正运行在父链锁外，公开写抢先提交后，旧HTTP候选必须零覆盖、零新增费用。
+func TestMarketingV21_PG_M2_InFlightCandidateRejectsPublicEdits(t *testing.T) {
+	for _, auto := range []bool{false, true} {
+		for _, change := range []string{"original", "narration", "images", "settings", "generation", "cancel", "deleted"} {
+			t.Run(fmt.Sprintf("auto=%v/%s", auto, change), func(t *testing.T) {
+				e, scripts, _ := m2PGH3(t)
+				e.addVideoModel("video-b")
+				entered, release := make(chan struct{}), make(chan struct{})
+				svc := m2ServiceInstance(e, m2GatedCaller(entered, release, "obsolete candidate"))
+				id := uint64(scripts[0].ID)
+				expected := e.promptVersion(scripts[0].ID, true)
+				done := make(chan error, 1)
+				go func() {
+					var err error
+					if auto {
+						_, err = svc.Render(context.Background(), e.user, id, &model.RenderMarketingScriptReq{IdempotencyKey: "inflight"})
+					} else {
+						_, err = svc.Adapt(context.Background(), e.user, id, &model.AdaptMarketingScriptReq{ExpectedVersion: expected})
+					}
+					done <- err
+				}()
+				m2Wait(t, entered)
+				err := m2ChangePublicInput(e, &scripts[0], change)
+				credit := e.credit()
+				saved := *v21Script(t, e, id)
+				var ledgers int64
+				v21Must(t, e.db.Model(&model.CreditLedger{}).Count(&ledgers).Error)
+				close(release)
+				v21Must(t, err)
+				code := errcode.ErrMarketingConflict.Code
+				if change == "deleted" {
+					code = errcode.ErrMarketingNotFound.Code
+				}
+				wantMktCode(t, m2Result(t, done), code)
+				after := v21Script(t, e, id)
+				var actual int64
+				v21Must(t, e.db.Model(&model.CreditLedger{}).Count(&actual).Error)
+				if mustJSONText(saved) != mustJSONText(after) || e.credit() != credit || actual != ledgers || len(e.scriptTasks(scripts[0].ID)) != 0 || m2TaskBroadcasts(e) != 0 {
+					t.Fatal("陈旧候选覆盖了当前稿或留下收费、任务、通知")
+				}
+			})
+		}
+	}
+}
+
+func m2ChangePublicInput(e *mktEnv, sc *model.MarketingScriptView, change string) error {
+	ctx := context.Background()
+	switch change {
+	case "original":
+		_, err := e.svc.EditPrompt(ctx, e.user, uint64(sc.ID), &model.EditMarketingPromptReq{Format: "h3", Prompt: "用户刚保存的原稿", ExpectedVersion: e.promptVersion(sc.ID, false)})
+		return err
+	case "narration":
+		narr := make([]string, len(sc.Shots))
+		for i, shot := range sc.Shots {
+			narr[i] = shot.Narration
+		}
+		narr[0] = "用户刚修改的旁白"
+		_, err := e.svc.UpdateScript(ctx, e.user, uint64(sc.ID), &model.UpdateMarketingScriptReq{Narrations: narr, Revision: sc.Revision})
+		return err
+	case "images":
+		p, err := e.repo.Project(ctx, e.user, v21Script(e.t, e, uint64(sc.ID)).ProjectID, false)
+		if err != nil {
+			return err
+		}
+		_, err = e.svc.UpdateProject(ctx, e.user, p.ID, &model.UpdateMarketingProjectReq{ProductAssetIDs: []uint64{2, 1}, Revision: p.Revision})
+		return err
+	case "settings":
+		r, err := e.repo.Round(ctx, e.user, uint64(sc.RoundID), false)
+		if err != nil {
+			return err
+		}
+		var st model.MarketingSettings
+		if err := json.Unmarshal(r.Settings, &st); err != nil {
+			return err
+		}
+		_, err = e.svc.UpdateRoundSettings(ctx, e.user, r.ID, &model.UpdateMarketingRoundSettingsReq{VideoModel: "video-b", Params: st.Params})
+		return err
+	case "generation", "cancel":
+		p := v21Script(e.t, e, uint64(sc.ID)).ProjectID
+		r, err := e.svc.RefreshFacts(ctx, e.user, p)
+		if err == nil && change == "cancel" {
+			_, err = e.svc.CancelRound(ctx, e.user, uint64(r.ID))
+		}
+		return err
+	case "deleted":
+		return e.svc.DeleteProject(ctx, e.user, v21Script(e.t, e, uint64(sc.ID)).ProjectID)
+	}
+	return errors.New("未知输入变化")
+}
+
+func TestMarketingV21_PG_M2_AllFailedRoundRetainsOriginalTargets(t *testing.T) {
+	e, scripts, _ := m2PGH3(t)
+	ctx := context.Background()
+	req := m2RoundReq("all-failed", scripts)
+	m2SetAvailable(t, e, 3)
+	_, err := e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), req)
+	wantMktCode(t, err, errcode.ErrInsufficientCredits.Code)
+	m2CheckPGAccounting(t, e, 3, 0, 0)
+	added := *v21Script(t, e, uint64(scripts[0].ID))
+	added.ID, added.Seq = 0, 99
+	v21Must(t, e.db.Create(&added).Error)
+	calls := e.caller.count(mktAdaptStep)
+	_, err = e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), &model.RenderMarketingRoundReq{IdempotencyKey: req.IdempotencyKey})
+	wantMktCode(t, err, errcode.ErrInvalidParams.Code)
+	if e.caller.count(mktAdaptStep) != calls {
+		t.Fatal("丢失目标清单不得重新调用模型")
+	}
+	m2SetAvailable(t, e, 23)
+	_, err = e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), req)
+	v21Must(t, err)
+	if len(e.scriptTasks(idcodec.ID(added.ID))) != 0 {
+		t.Fatal("旧点击带出了后来新增脚本")
+	}
+	m2CheckPGAccounting(t, e, 20, 20, 1)
+}
+
+func TestMarketingV21_PG_M2_RenderAutoAdaptAffordabilityPrecheck(t *testing.T) {
+	e, scripts, _ := m2PGH3(t)
+	ctx := context.Background()
+	m2SetAvailable(t, e, 3)
+	calls := e.caller.count(mktAdaptStep)
+	_, err := e.render(scripts[0].ID, "poor-single")
+	wantMktCode(t, err, errcode.ErrInsufficientCredits.Code)
+	// 注入 params.prompt="" 或非法参数均不得绕过预检或悄然回落 0 积分而调用转写 LLM。
+	_, err = e.svc.Render(ctx, e.user, uint64(scripts[0].ID), &model.RenderMarketingScriptReq{
+		IdempotencyKey: "poor-prompt-override",
+		Params:         map[string]any{"prompt": ""},
+	})
+	wantMktCode(t, err, errcode.ErrInsufficientCredits.Code)
+	_, err = e.svc.Render(ctx, e.user, uint64(scripts[0].ID), &model.RenderMarketingScriptReq{
+		IdempotencyKey: "bad-duration-param",
+		Params:         map[string]any{"duration": 999},
+	})
+	wantMktCode(t, err, errcode.ErrTaskInput.Code)
+	_, err = e.svc.RenderRound(ctx, e.user, uint64(scripts[0].RoundID), m2RoundReq("poor-round", scripts))
+	wantMktCode(t, err, errcode.ErrInsufficientCredits.Code)
+	if e.caller.count(mktAdaptStep) != calls || string(v21Script(t, e, uint64(scripts[0].ID)).Adaptations) != "{}" {
+		t.Fatal("余额不足或非法参数时自动出片不得调用转写 LLM 或写稿")
+	}
+
+	// 有声定价高于无声定价时，即使模型默认或请求伪造 generate_audio=false，预检仍按强制 generate_audio=true 核验余额。
+	audioSnap := mktVideoSnapshot()
+	audioSnap.Model.Key = "video-h3-audio"
+	audioSnap.Model.Capabilities.PromptFormat = "h3"
+	paramsCopy := append(modelcfg.ParamSet(nil), audioSnap.Model.Capabilities.Params...)
+	for i := range paramsCopy {
+		if paramsCopy[i].Name == "generate_audio" {
+			paramsCopy[i].Default = false
+		}
+	}
+	audioSnap.Model.Capabilities.Params = paramsCopy
+	audioSnap.Model.Pricing.Tiers = []modelcfg.Tier{
+		{On: true, Unit: 10},
+		{On: true, Unit: 25, When: map[string]any{"generate_audio": true}},
+	}
+	e.models.Snapshots[audioSnap.Model.Key] = audioSnap
+	m2SetAvailable(t, e, 22) // 足付无声(10+3=13)及旧基础视频(20)，但不足支付有声全额(25+3=28)
+	_, err = e.svc.Render(ctx, e.user, uint64(scripts[0].ID), &model.RenderMarketingScriptReq{
+		IdempotencyKey: "poor-audio-override",
+		VideoModel:     audioSnap.Model.Key,
+		Params:         map[string]any{"generate_audio": false},
+	})
+	wantMktCode(t, err, errcode.ErrInsufficientCredits.Code)
+	if e.caller.count(mktAdaptStep) != calls {
+		t.Fatalf("伪造 generate_audio=false 绕过了有声报价预检，仍调用 LLM: calls=%d", e.caller.count(mktAdaptStep))
+	}
+
+	// 无账户行的新用户在初始积分不足时同样前置拒绝且不得惰性开户。
+	v21Must(t, e.db.Where("user_id = ?", e.user).Delete(&model.UserCredit{}).Error)
+	e.taskSvc = service.NewGenerationTaskService(service.GenerationTaskDeps{Repo: e.taskRepo, Registry: e.models, Assets: e.assets, Broadcaster: e.bc, Limits: &fakeLimits{initial: 3, defMax: 20}})
+	e.svc = service.NewMarketingService(service.MarketingDeps{Repo: e.repo, Models: e.models, Caller: e.caller, Tasks: e.taskSvc, Assets: e.assets, Credits: stepfake.Policy{Initial: 3}, Broadcaster: e.bc})
+	e.taskSvc.SetTaskObserver(e.svc)
+	_, err = e.render(scripts[0].ID, "poor-new-user")
+	wantMktCode(t, err, errcode.ErrInsufficientCredits.Code)
+	var rows int64
+	v21Must(t, e.db.Model(&model.UserCredit{}).Where("user_id = ?", e.user).Count(&rows).Error)
+	if rows != 0 || e.caller.count(mktAdaptStep) != calls {
+		t.Fatalf("余额不足前置拒绝不得开户或调用模型: rows=%d calls=%d", rows, e.caller.count(mktAdaptStep))
+	}
+}
+
+func TestMarketingV21_PG_M2_RenderRoundRejectsDisjointTargetsSequentialAndConcurrent(t *testing.T) {
+	e, scripts, _ := m2PGH3(t)
+	ctx := context.Background()
+	roundID := uint64(scripts[0].RoundID)
+	reqA := &model.RenderMarketingRoundReq{IdempotencyKey: "disjoint-seq", ScriptIDs: []idcodec.ID{scripts[0].ID}}
+	_, err := e.svc.RenderRound(ctx, e.user, roundID, reqA)
+	v21Must(t, err)
+	calls, credit := e.caller.count(mktAdaptStep), e.credit()
+
+	// 同根键切换成完全不交的目标集合 [B]，及同根键混用单条 Render，必须在 LLM 前 90001 拒绝。
+	reqB := &model.RenderMarketingRoundReq{IdempotencyKey: "disjoint-seq", ScriptIDs: []idcodec.ID{scripts[1].ID}}
+	_, err = e.svc.RenderRound(ctx, e.user, roundID, reqB)
+	wantMktCode(t, err, errcode.ErrIdempotencyConflict.Code)
+	_, err = e.render(scripts[1].ID, "disjoint-seq")
+	wantMktCode(t, err, errcode.ErrIdempotencyConflict.Code)
+	if e.caller.count(mktAdaptStep) != calls || len(e.scriptTasks(scripts[1].ID)) != 0 || e.credit() != credit {
+		t.Fatal("同根键不交集合/混用单条调用触发了 LLM 或创建任务")
+	}
+
+	// 单条先提交后，再用同根键走 RenderRound（不交脚本）也必须 90001 拒绝。
+	_, err = e.render(scripts[0].ID, "single-first")
+	wantMktCode(t, err, errcode.ErrMarketingScriptBusy.Code) // scripts[0] 已在出片中
+	if err := e.db.Model(&model.GenerationTask{}).Where("node_id = ?", "mkt:"+idcodec.Encode(uint64(scripts[0].ID))).Update("status", model.TaskSucceeded).Error; err != nil {
+		t.Fatal(err)
+	}
+	v21Must(t, e.svc.OnTaskChanged(ctx, &model.GenerationTask{UserID: e.user, Kind: model.KindVideo, NodeID: "mkt:" + idcodec.Encode(uint64(scripts[0].ID))}))
+	_, err = e.render(scripts[0].ID, "single-first")
+	v21Must(t, err)
+	calls2 := e.caller.count(mktAdaptStep)
+	_, err = e.svc.RenderRound(ctx, e.user, roundID, &model.RenderMarketingRoundReq{IdempotencyKey: "single-first", ScriptIDs: []idcodec.ID{scripts[1].ID}})
+	wantMktCode(t, err, errcode.ErrIdempotencyConflict.Code)
+	if e.caller.count(mktAdaptStep) != calls2 || len(e.scriptTasks(scripts[1].ID)) != 0 {
+		t.Fatal("单条占用根键后整轮不交集合仍调用了模型或创建了任务")
+	}
+
+	// 并发竞态：两实例同时携带同根键和不交目标集合 [A] vs [B]，双过预检后 PG 根键锁只允许一个提交，另一个必须 90001 回滚。
+	e2, scripts2, _ := m2PGH3(t)
+	round2 := uint64(scripts2[0].RoundID)
+	before2 := e2.credit().Balance
+	entered := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	release := []chan struct{}{make(chan struct{}), make(chan struct{})}
+	done := make(chan error, 2)
+	for i := range 2 {
+		svc := m2ServiceInstance(e2, m2GatedCaller(entered[i], release[i], fmt.Sprintf("race-%d", i)))
+		target := scripts2[i].ID
+		go func() {
+			_, err := svc.RenderRound(context.Background(), e2.user, round2, &model.RenderMarketingRoundReq{
+				IdempotencyKey: "concurrent-disjoint",
+				ScriptIDs:      []idcodec.ID{target},
+			})
+			done <- err
+		}()
+	}
+	for i := range 2 {
+		m2Wait(t, entered[i])
+	}
+	close(release[0])
+	close(release[1])
+	var okCnt, conflictCnt int
+	for range 2 {
+		err := m2Result(t, done)
+		if err == nil {
+			okCnt++
+		} else if errors.Is(err, errcode.ErrIdempotencyConflict) {
+			conflictCnt++
+		} else {
+			t.Fatalf("非预期错误: %v", err)
+		}
+	}
+	if okCnt != 1 || conflictCnt != 1 {
+		t.Fatalf("并发不交根键应恰有一胜一负(90001): ok=%d conflict=%d", okCnt, conflictCnt)
+	}
+	var totalTasks int64
+	v21Must(t, e2.db.Model(&model.GenerationTask{}).Count(&totalTasks).Error)
+	if totalTasks != 1 || e2.credit().Frozen != 20 || e2.credit().Balance != before2-3 {
+		t.Fatalf("并发不交根键只能建1个任务并扣1次转写: tasks=%d credit=%+v", totalTasks, e2.credit())
 	}
 }

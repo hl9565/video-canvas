@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test, type Mock } from "bun:test";
 
 import {
+  adaptMarketingScript,
   createMarketingProject,
+  editMarketingAdaptation,
+  editMarketingPrompt,
   getMarketingOptions,
   getMarketingPrompt,
   listMarketingProjects,
@@ -12,6 +15,7 @@ import {
   quoteMarketing,
   renderMarketingRound,
   renderMarketingScript,
+  restoreMarketingPrompt,
   saveMarketingReverse,
   saveMarketingScript,
   sendMarketingScriptToCanvas,
@@ -27,6 +31,7 @@ import type {
 } from "@/api/marketing/type";
 import { ApiError } from "@/utils/requests/request";
 import service from "@/utils/requests/service";
+import { useMarketingStore } from "@/store/marketing";
 
 const rawScript = (patch: Partial<BackendScript> = {}): BackendScript => ({
   id: "x1",
@@ -292,15 +297,18 @@ describe("api/marketing：请求", () => {
   let get: Mock<typeof service.get>;
   let post: Mock<typeof service.post>;
   let put: Mock<typeof service.put>;
+  let del: Mock<typeof service.delete>;
   beforeEach(() => {
     get = spyOn(service, "get");
     post = spyOn(service, "post");
     put = spyOn(service, "put");
+    del = spyOn(service, "delete");
   });
   afterEach(() => {
     get.mockRestore();
     post.mockRestore();
     put.mockRestore();
+    del.mockRestore();
   });
 
   test("预设：snake→camel，数组 null 兜底", async () => {
@@ -382,10 +390,39 @@ describe("api/marketing：请求", () => {
       round: rawRound(),
       skipped: [{ script_id: "x2", reason: "旁白有问题" }],
     });
+    useMarketingStore
+      .getState()
+      .setProject(
+        mapProject(rawProject({ rounds: [rawRound({ scripts: [rawScript({ flags: [] })] })] })),
+      );
     const result = await renderMarketingRound("r1", "key-2");
+    expect(post.mock.calls[1][1]).toEqual({ idempotency_key: "key-2", script_ids: ["x1"] });
     expect(post.mock.calls[1][0]).toBe("/marketing-rounds/r1/render");
     expect(result.skipped).toEqual([{ scriptId: "x2", reason: "旁白有问题" }]);
     expect(result.round.no).toBe(2);
+  });
+
+  test("整轮全部失败后仍复用最初目标，不把后来新增脚本带进旧请求", async () => {
+    const firstRound = rawRound({
+      scripts: [rawScript({ id: "old", status: "draft", flags: [] })],
+    });
+    useMarketingStore.getState().setProject(mapProject(rawProject({ rounds: [firstRound] })));
+    post.mockRejectedValueOnce(new ApiError("积分不足", 40001, 402));
+    await expect(renderMarketingRound("r1", "all-failed-key")).rejects.toBeInstanceOf(ApiError);
+    const later = rawRound({
+      scripts: [
+        rawScript({ id: "old", status: "draft", flags: [] }),
+        rawScript({ id: "new", status: "draft", flags: [] }),
+      ],
+    });
+    useMarketingStore.getState().setProject(mapProject(rawProject({ rounds: [later] })));
+    post.mockResolvedValueOnce({ round: later, skipped: [] });
+    await renderMarketingRound("r1", "all-failed-key");
+    expect(post.mock.calls[0][1]).toEqual({
+      idempotency_key: "all-failed-key",
+      script_ids: ["old"],
+    });
+    expect(post.mock.calls[1][1]).toEqual(post.mock.calls[0][1]);
   });
 
   test("提示词与发到画布", async () => {
@@ -396,6 +433,84 @@ describe("api/marketing：请求", () => {
     post.mockResolvedValue({ canvas_id: "c9" });
     expect(await sendMarketingScriptToCanvas("x1")).toBe("c9");
     expect(post.mock.calls[0][0]).toBe("/marketing-scripts/x1/to-canvas");
+  });
+
+  test("H3 提示词：转写稿 snake→camel，转写与手改的路径和请求体", async () => {
+    get.mockResolvedValue({
+      format: "h3",
+      prompt: "[分镜] …",
+      version: 7,
+      input_hash: "input",
+      adaptation: {
+        prompt: "subject_definitions: …",
+        stale: true,
+        edited: false,
+        updated_at: "t1",
+        version: 4,
+        input_hash: "older",
+      },
+      adapt_credits: 3,
+    });
+    expect(await getMarketingPrompt("x1")).toEqual({
+      format: "h3",
+      prompt: "[分镜] …",
+      version: 7,
+      inputHash: "input",
+      edited: false,
+      stale: false,
+      adaptation: {
+        prompt: "subject_definitions: …",
+        stale: true,
+        edited: false,
+        updatedAt: "t1",
+        version: 4,
+        inputHash: "older",
+      },
+      adaptCredits: 3,
+    });
+    get.mockResolvedValue({ format: "seedance", prompt: "p", edited: true, stale: true });
+    expect(await getMarketingPrompt("x1")).toMatchObject({
+      edited: true,
+      stale: true,
+      adaptation: null,
+      adaptCredits: 0,
+    });
+
+    post.mockResolvedValue({ format: "h3", prompt: "p", adaptation: null, adapt_credits: 0 });
+    await adaptMarketingScript("x1", 4, "h3-model");
+    expect(post.mock.calls[0]).toEqual([
+      "/marketing-scripts/x1/adapt",
+      { video_model: "h3-model", expected_version: 4 },
+    ]);
+    put.mockResolvedValue({ format: "h3", prompt: "p", adaptation: null });
+    await editMarketingAdaptation("x1", "手改", 5);
+    expect(put.mock.calls[0]).toEqual([
+      "/marketing-scripts/x1/adaptation",
+      { format: "h3", prompt: "手改", expected_version: 5 },
+    ]);
+  });
+
+  test("手改原稿与还原：按格式提交，返回最新预览", async () => {
+    put.mockResolvedValue({ format: "seedance", prompt: "手改原稿", edited: true, stale: false });
+    expect(await editMarketingPrompt("x1", "seedance", "手改原稿", 7)).toMatchObject({
+      prompt: "手改原稿",
+      edited: true,
+    });
+    expect(put.mock.calls[0]).toEqual([
+      "/marketing-scripts/x1/prompt",
+      { format: "seedance", prompt: "手改原稿", expected_version: 7 },
+    ]);
+
+    del.mockResolvedValue({
+      format: "seedance",
+      prompt: "拼出的原稿",
+      edited: false,
+      stale: false,
+    });
+    expect(await restoreMarketingPrompt("x1", "seedance", 8)).toMatchObject({ edited: false });
+    expect(del.mock.calls[0][0]).toBe(
+      "/marketing-scripts/x1/prompt?format=seedance&expected_version=8",
+    );
   });
 });
 

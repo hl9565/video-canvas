@@ -36,7 +36,8 @@ type DramaFrameRunBind struct {
 
 // CreateTaskOptions 携带服务端内部任务提交选项（仅同进程受信服务构造）。
 type CreateTaskOptions struct {
-	DramaRunBind *DramaFrameRunBind
+	DramaRunBind    *DramaFrameRunBind
+	MarketingRender *MarketingRenderCommit
 }
 
 // QuoteTaskOptions 配置报价令牌绑定的短剧片段上下界及单镜约束。
@@ -233,6 +234,9 @@ func (s *GenerationTaskService) validateTaskReplayHit(exp taskReplayExpectation,
 	if hit == nil {
 		return nil
 	}
+	if strings.HasPrefix(exp.RawIntentSig, marketingIntentSigPrefix) && hit.RequestIntentSig == "" {
+		return errcode.ErrIdempotencyConflict
+	}
 	if hit.IsTest != exp.IsTest || hit.AgentRunID != exp.AgentRunID {
 		return errcode.ErrIdempotencyConflict
 	}
@@ -424,49 +428,4 @@ func priceFingerprint(snap *provider.Snapshot) (string, error) {
 		PluginKey: snap.Plugin.Key, PluginVer: snap.Plugin.Version, PluginSHA: snap.Plugin.SHA256,
 		Caps: snap.Model.Capabilities, Pricing: snap.Model.Pricing,
 	})
-}
-
-func reqNodes(single string, many []string) []string {
-	if len(many) > 0 {
-		return many
-	}
-	return []string{single}
-}
-
-func sameUint64Ptr(a, b *uint64) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
-}
-
-func cloneMap(src map[string]any) map[string]any {
-	if src == nil {
-		return map[string]any{}
-	}
-	b, err := json.Marshal(src)
-	if err != nil {
-		out := make(map[string]any, len(src))
-		for k, v := range src {
-			out[k] = v
-		}
-		return out
-	}
-	var out map[string]any
-	if err := json.Unmarshal(b, &out); err != nil || out == nil {
-		return map[string]any{}
-	}
-	return out
-}
-
-func nonNilMap(m map[string]any) map[string]any {
-	if m == nil {
-		return map[string]any{}
-	}
-	return m
-}
-
-func asString(v any) string {
-	s, _ := v.(string)
-	return s
 }

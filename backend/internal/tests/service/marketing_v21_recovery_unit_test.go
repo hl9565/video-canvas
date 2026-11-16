@@ -119,6 +119,12 @@ func (m *v21Memory) UpdateScript(_ context.Context, _ uint64, f map[string]any) 
 	if x, ok := f["error"].(string); ok {
 		m.sc.Error = x
 	}
+	if raw, ok := f["adaptations"].([]byte); ok {
+		m.sc.Adaptations = raw
+	}
+	if raw, ok := f["prompt_edits"].([]byte); ok {
+		m.sc.PromptEdits = raw
+	}
 	return nil
 }
 func v21IntUpdate(cur int, v any) int {
@@ -325,4 +331,23 @@ func TestMarketingV21_RecoveryDoesNotDispatchOldGeneration(t *testing.T) {
 	if m.enqueued != 0 || m.run.Status != "canceled" {
 		t.Fatalf("旧代不应重新派发: %d %+v", m.enqueued, m.run)
 	}
+}
+
+func (m *v21Memory) EnsureCredit(context.Context, uint64, int) error { return nil }
+func (m *v21Memory) SaveScript(ctx context.Context, u, id uint64, rev int64, fields map[string]any) error {
+	if m.sc.ID != id || m.sc.UserID != u {
+		return repository.ErrNotFound
+	}
+	if m.sc.Revision != rev {
+		return repository.ErrRevisionConflict
+	}
+	if err := m.UpdateScript(ctx, id, fields); err != nil {
+		return err
+	}
+	m.sc.Revision++
+	return nil
+}
+
+func (m *v21Memory) ProjectRounds(context.Context, uint64, uint64) ([]model.MarketingRound, error) {
+	return []model.MarketingRound{m.r}, nil
 }

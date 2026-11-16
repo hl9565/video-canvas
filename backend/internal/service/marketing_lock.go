@@ -4,6 +4,8 @@ import (
 	"context"
 	"slices"
 
+	"video-canvas/internal/pkg/jsonhash"
+
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/repository"
@@ -106,4 +108,103 @@ func lockMarketingScript(ctx context.Context, tx repository.MarketingTx, userID 
 		return nil, errcode.ErrMarketingNotFound
 	}
 	return sc, nil
+}
+
+// lockedScriptContext 只从持锁事务重建父链、设置和内容快照，锁外探查不能授予写权限。
+func lockedScriptContext(ctx context.Context, tx repository.MarketingTx, userID uint64, probe *model.MarketingScript) (*scriptCtx, error) {
+	sc, err := lockMarketingScript(ctx, tx, userID, probe)
+	if err != nil {
+		return nil, err
+	}
+	r, err := tx.Round(ctx, userID, sc.RoundID, false)
+	if err != nil {
+		return nil, marketingPublicError(err)
+	}
+	if sc.Status == model.MarketingScriptRewriting {
+		return nil, errcode.ErrMarketingScriptBusy
+	}
+	if r.Status == model.MarketingRoundScripting || r.Status == model.MarketingRoundCanceled {
+		return nil, errcode.ErrMarketingConflict
+	}
+	p, err := tx.Project(ctx, userID, sc.ProjectID, false)
+	if err != nil {
+		return nil, marketingPublicError(err)
+	}
+	st, err := settingsOf(r)
+	if err != nil {
+		return nil, err
+	}
+	return &scriptCtx{sc: sc, round: r, project: p, st: st}, nil
+}
+
+// snapshotScript 在短事务中取得一致输入，模型调用在事务结束后进行。
+func (s *MarketingService) snapshotScript(ctx context.Context, userID, id uint64) (*scriptCtx, error) {
+	return s.snapshotScriptChecked(ctx, userID, id, false)
+}
+
+// snapshotRenderScript 在短事务中确认脚本既未重写也无在途出片，避免无效的模型转写。
+func (s *MarketingService) snapshotRenderScript(ctx context.Context, userID, id uint64) (*scriptCtx, error) {
+	return s.snapshotScriptChecked(ctx, userID, id, true)
+}
+
+func (s *MarketingService) snapshotScriptChecked(ctx context.Context, userID, id uint64, requireIdle bool) (*scriptCtx, error) {
+	probe, err := s.repo.Script(ctx, userID, id, false)
+	if err != nil {
+		return nil, marketingPublicError(err)
+	}
+	var c *scriptCtx
+	err = s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
+		locked, e := lockedScriptContext(ctx, tx, userID, probe)
+		if e != nil {
+			return e
+		}
+		if requireIdle {
+			if e := s.scriptIdle(ctx, tx, locked.sc); e != nil {
+				return e
+			}
+		}
+		c = locked
+		return nil
+	})
+	return c, err
+}
+
+// marketingContentSignature 保护原稿、旁白、父项目、执行代与实际参考顺序；转写稿独立版本允许自动请求采用赢家。
+func marketingContentSignature(c *scriptCtx) (string, error) {
+	return jsonhash.CanonicalSHA256(struct {
+		ScriptID                                   uint64
+		Version                                    int64
+		Title, Hook, Music, Voice                  string
+		Shots, PromptEdits, Product, ProductAssets []byte
+		ProjectVersion, ExecutionGen               int64
+		Settings                                   []byte
+		Model, Reference                           *uint64
+		Reverse, FollowBasis                       []byte
+	}{c.sc.ID, c.sc.Revision, c.sc.Title, c.sc.Hook, c.sc.Music, c.sc.Voice, c.sc.Shots, c.sc.PromptEdits,
+		c.project.Product, c.project.ProductAssetIDs, c.project.Revision, c.round.ExecutionGen, c.round.Settings,
+		c.round.ModelAssetID, c.round.RefVideoAssetID, c.round.Reverse, c.round.FollowBasis})
+}
+
+// sameMarketingContent 对在途请求重新验证全部可变输入，版本相同仍不能代替素材和设置校验。
+func sameMarketingContent(before, now *scriptCtx) error {
+	old, err := marketingContentSignature(before)
+	if err != nil {
+		return err
+	}
+	current, err := marketingContentSignature(now)
+	if err != nil {
+		return err
+	}
+	if old != current {
+		return errcode.ErrMarketingConflict
+	}
+	return nil
+}
+
+// requireMarketingVersion 缺少预览凭据的收费或内容写请求必须失败关闭。
+func requireMarketingVersion(expected *int64) error {
+	if expected == nil || *expected < 0 {
+		return errcode.ErrMarketingConflict
+	}
+	return nil
 }

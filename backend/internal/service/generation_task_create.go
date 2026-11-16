@@ -38,6 +38,9 @@ func (s *GenerationTaskService) CreateWithOptions(ctx context.Context, userID ui
 		return nil, errcode.ErrInvalidParams.WithMsg("Idempotency-Key 过长")
 	}
 	sig, err := computeCreateIntentSig(userID, key, req, nodes)
+	if opts.MarketingRender != nil {
+		sig, err = marketingCommitIntent(userID, key, req, nodes, opts.MarketingRender)
+	}
 	if err != nil {
 		return nil, err
 	}

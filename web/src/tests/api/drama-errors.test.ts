@@ -42,9 +42,10 @@ describe("短剧错误码映射（契约 §8）", () => {
       expect(isQuoteExpiredError(failure)).toBe(false);
       expect(isRevisionConflict(failure)).toBe(false);
     }
-    expect(dramaErrorMessage(upstream)).toBe("上游模型请求失败");
-    expect(jobFailureMessage(persisted)).toBe("上游模型请求失败");
-    expect(jobFailureMessage({ errorCode: 67029, errorMessage: "" })).toBe("任务失败");
+    expect(DRAMA_ERR.contentFiltered).toBe(67029);
+    expect(dramaErrorMessage(upstream)).toContain("安全过滤");
+    expect(jobFailureMessage(persisted)).toContain("安全过滤");
+    expect(jobFailureMessage({ errorCode: 67029, errorMessage: "" })).toContain("安全过滤");
     expect(jobFailureMessage({ errorCode: 91002, errorMessage: "" })).toBe(
       "生成报价已失效，请重新获取报价",
     );

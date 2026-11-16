@@ -37,6 +37,7 @@ type preResolvedTarget struct {
 	episode    *model.DramaEpisode
 	project    *model.DramaProject
 	script     *model.MarketingScript
+	marketing  *marketingLockedRender
 	mediaNodes []string
 }
 
@@ -61,12 +62,17 @@ func (s *GenerationTaskService) createAllAtomic(ctx context.Context, b *taskBatc
 	// 3. 外层事务已提交并解锁，观察者重入不会看见半批数据。
 	for _, t := range b.createdTasks {
 		s.publish(ctx, t)
+		logGenCreated(ctx, t)
 	}
 	return b.errs, nil
 }
 
 // createBatchTx 在固定锁序和账户锁内复查后逐项执行保存点。
 func (s *GenerationTaskService) createBatchTx(ctx context.Context, tx repository.GenerationTaskTx, b *taskBatch) error {
+	// 0. 营销出片先以事务咨询锁按 (user, rootKey) 串行化，再复核同根键是否已服务不交的目标集合。
+	if err := s.lockAndCheckMarketingRoot(ctx, tx, b); err != nil {
+		return err
+	}
 	// 1. 严格按 seg → mkt → credit 锁序解析，后续保存点禁止重新读取目标行。
 	preResolvedTargets, err := preResolveBatchTargets(ctx, tx, b)
 	if err != nil {
@@ -180,7 +186,7 @@ func (s *GenerationTaskService) freezeBatchItem(ctx context.Context, tx reposito
 	if err != nil {
 		return nil, err
 	}
-	if acc.Balance-acc.Frozen < unit {
+	if acc.Balance-acc.Frozen < unit+marketingAdaptCredits(target) {
 		return nil, errcode.ErrInsufficientCredits
 	}
 	active, err := tx.CountActive(ctx, b.userID)
@@ -189,6 +195,9 @@ func (s *GenerationTaskService) freezeBatchItem(ctx context.Context, tx reposito
 	}
 	if active >= b.activeLimit {
 		return nil, errcode.ErrTooManyTasks
+	}
+	if err := commitBatchMarketingAdapt(ctx, tx, target); err != nil {
+		return nil, err
 	}
 	task := &model.GenerationTask{UserID: b.userID, Credits: unit, NodeID: b.nodes[i], IdempotencyKey: idemKeyAt(b.key, i), AgentRunID: b.req.AgentRunID, RequestIntentSig: b.sig, RequestBatchIndex: int16(i)}
 	if b.req.CanvasID > 0 {
@@ -219,6 +228,9 @@ func (s *GenerationTaskService) freezeBatchItem(ctx context.Context, tx reposito
 
 // batchItemCredits 在账户锁内复核精裁单镜限制与报价断言。
 func (s *GenerationTaskService) batchItemCredits(ctx context.Context, tx repository.GenerationTaskTx, b *taskBatch, target preResolvedTarget) (*provider.Snapshot, map[string]any, int, error) {
+	if b.opts.MarketingRender != nil {
+		return s.marketingBatchItemCredits(ctx, tx, b, target)
+	}
 	var schema int16
 	var sid uint64
 	var rev int64

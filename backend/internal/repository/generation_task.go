@@ -2,7 +2,9 @@ package repository
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -567,4 +569,31 @@ func (r *GenerationTaskRepository) SaveTrace(ctx context.Context, id uint64, tra
 		return ErrNotFound
 	}
 	return nil
+}
+
+func marketingRootAdvisoryKey(userID uint64, rootKey string) int64 {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("vc-mkt-root:%d:%s", userID, rootKey)))
+	return int64(binary.BigEndian.Uint64(sum[:8]) & ((uint64(1) << 63) - 1))
+}
+
+// LockMarketingRoot 在 PG 事务内按 (userID, rootKey) 获取事务级咨询锁，串行化同根键竞争提交。
+func (r *GenerationTaskRepository) LockMarketingRoot(ctx context.Context, userID uint64, rootKey string) error {
+	if rootKey == "" || r.db.Name() != "postgres" {
+		return nil
+	}
+	return r.db.WithContext(ctx).Exec("SELECT pg_advisory_xact_lock(?)", marketingRootAdvisoryKey(userID, rootKey)).Error
+}
+
+// ListMarketingRootTasks 按精确根键或其子脚本键前缀列出已落库任务，用于校验营销整轮根键绑定。
+func (r *GenerationTaskRepository) ListMarketingRootTasks(ctx context.Context, userID uint64, rootKey string) ([]model.GenerationTask, error) {
+	if rootKey == "" {
+		return nil, nil
+	}
+	var rows []model.GenerationTask
+	pat := escapeLike(rootKey) + ":%"
+	err := r.db.WithContext(ctx).
+		Where("user_id = ? AND (idempotency_key = ? OR (idempotency_key LIKE ? ESCAPE '\\' AND request_intent_sig LIKE ?))", userID, rootKey, pat, "mkt:v1:%").
+		Order("id ASC").
+		Find(&rows).Error
+	return rows, err
 }

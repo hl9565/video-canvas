@@ -298,7 +298,7 @@ func TestMarketing_RenderRound_SkipsWithReasons(t *testing.T) {
 	if _, err := env.svc.UpdateScript(ctx, env.user, uint64(scripts[1].ID), &model.UpdateMarketingScriptReq{Narrations: []string{"全网第一", "留香", "下班"}, Revision: scripts[1].Revision}); err != nil {
 		t.Fatal(err)
 	}
-	out, err := env.svc.RenderRound(ctx, env.user, uint64(scripts[0].RoundID), &model.RenderMarketingRoundReq{IdempotencyKey: "batch"})
+	out, err := env.svc.RenderRound(ctx, env.user, uint64(scripts[0].RoundID), m2RoundReq("batch", scripts))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,11 +308,11 @@ func TestMarketing_RenderRound_SkipsWithReasons(t *testing.T) {
 	if out.Round.Scripts[0].Status != model.MarketingScriptRendering || out.Round.Scripts[1].Status != model.MarketingScriptDraft {
 		t.Fatalf("只出了第一份：%+v", out.Round.Scripts)
 	}
-	again, err := env.svc.RenderRound(ctx, env.user, uint64(scripts[0].RoundID), &model.RenderMarketingRoundReq{IdempotencyKey: "batch2"})
+	again, err := env.svc.RenderRound(ctx, env.user, uint64(scripts[0].RoundID), m2RoundReq("batch2", scripts))
 	if err != nil || len(again.Skipped) != 2 || len(env.scriptTasks(scripts[0].ID)) != 1 {
 		t.Fatalf("已在出片的跳过，不重复建任务：%v %+v", err, again.Skipped)
 	}
-	_, err = env.svc.RenderRound(ctx, env.user+1, uint64(scripts[0].RoundID), &model.RenderMarketingRoundReq{IdempotencyKey: "x"})
+	_, err = env.svc.RenderRound(ctx, env.user+1, uint64(scripts[0].RoundID), m2RoundReq("x", scripts))
 	wantMktCode(t, err, errcode.ErrMarketingNotFound.Code)
 	_ = pid
 }
@@ -321,7 +321,7 @@ func TestMarketing_RenderRound_InsufficientCreditsWhenNothingCreated(t *testing.
 	env := newMktEnv(t, 40)
 	_, scripts := env.readyScripts()
 	env.db.Model(&model.UserCredit{}).Where("user_id = ?", env.user).Updates(map[string]any{"balance": 5, "frozen": 0})
-	_, err := env.svc.RenderRound(context.Background(), env.user, uint64(scripts[0].RoundID), &model.RenderMarketingRoundReq{IdempotencyKey: "b"})
+	_, err := env.svc.RenderRound(context.Background(), env.user, uint64(scripts[0].RoundID), m2RoundReq("b", scripts))
 	wantMktCode(t, err, errcode.ErrInsufficientCredits.Code)
 }
 

@@ -22,35 +22,61 @@ func (s *MarketingService) finishRun(ctx context.Context, round *model.Marketing
 	if err != nil {
 		return err
 	}
-	return s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
-		p, cur, err := lockMarketingBackground(ctx, tx, probe)
-		if err != nil {
-			return err
+	committed, staleResult := false, false
+	finalStatus := out.status
+	err = s.repo.WithTx(ctx, func(tx repository.MarketingTx) error {
+		var txCommitted, txStale bool
+		var txStatus string
+		var txErr error
+		txCommitted, txStale, txStatus, txErr = s.finishRunTx(ctx, tx, probe, run, out, charged)
+		if txErr != nil {
+			return txErr
 		}
-		owned, err := tx.Run(ctx, cur.UserID, run.ID, false)
-		if err != nil {
-			return err
+		if txCommitted {
+			committed, staleResult, finalStatus = true, txStale, txStatus
 		}
-		if owned.RoundID != cur.ID || !ownsMarketingExecution(owned, run) {
-			return nil
-		}
-		status, msg := out.status, out.errMsg
-		stale := staleMarketingRun(p, cur, owned)
-		if stale {
-			status, msg = model.MarketingRunCanceled, ""
-		}
-		// 2. 先状态CAS，再结算一次；陈旧结果禁止落业务产出、清重写态或写警告。
-		if err := s.closeOutcome(ctx, tx, owned, out, status, msg); err != nil {
-			if errorsIsConflict(err) {
-				return nil
-			}
-			return err
-		}
-		if err := s.applyCurrentMarketingOutcome(ctx, tx, cur, owned, out, status, stale); err != nil {
-			return err
-		}
-		return s.settleRun(ctx, tx, owned, charged)
+		return nil
 	})
+	if err == nil {
+		out.committed, out.stale = committed, staleResult
+		if committed {
+			out.status = finalStatus
+		}
+	}
+	return err
+}
+
+func (s *MarketingService) finishRunTx(ctx context.Context, tx repository.MarketingTx, probe *model.MarketingRound, run *model.MarketingStepRun, out *stepOutcome, charged int) (committed, staleResult bool, finalStatus string, err error) {
+	p, cur, err := lockMarketingBackground(ctx, tx, probe)
+	if err != nil {
+		return false, false, "", err
+	}
+	owned, err := tx.Run(ctx, cur.UserID, run.ID, false)
+	if err != nil {
+		return false, false, "", err
+	}
+	if owned.RoundID != cur.ID || !ownsMarketingExecution(owned, run) {
+		return false, false, "", nil
+	}
+	status, msg := out.status, out.errMsg
+	stale := staleMarketingRun(p, cur, owned)
+	if stale {
+		status, msg = model.MarketingRunCanceled, ""
+	}
+	// 2. 先状态CAS，再结算一次；陈旧结果禁止落业务产出、清重写态或写警告。
+	if err := s.closeOutcome(ctx, tx, owned, out, status, msg); err != nil {
+		if errorsIsConflict(err) {
+			return false, false, "", nil
+		}
+		return false, false, "", err
+	}
+	if err := s.applyCurrentMarketingOutcome(ctx, tx, cur, owned, out, status, stale); err != nil {
+		return false, false, "", err
+	}
+	if err := s.settleRun(ctx, tx, owned, charged); err != nil {
+		return false, false, "", err
+	}
+	return true, stale, status, nil
 }
 
 // applyCurrentMarketingOutcome 将陈旧结局与业务写入隔离；陈旧结局只允许会计结算。

@@ -171,7 +171,7 @@ func TestQuoteLockAssetLookup_MaxOpenConnsOneNoDeadlock(t *testing.T) {
 // 持信用锁核验报价断言期间即使 Registry TTL 过期，仍通过当前事务连接直查且不自锁，同时感知库中实时改价。
 func TestQuoteLockSnapshot_MaxOpenConnsOneExpiredRegistryNoDeadlock(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
+	migrateCurrentSchemaPG16(t, db)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

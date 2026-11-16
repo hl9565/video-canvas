@@ -72,6 +72,7 @@ func (s *DramaService) createComposeJob(ctx context.Context, user, id uint64, in
 	}
 	if created {
 		s.publish(ctx, job)
+		logDramaCreated(ctx, job, nil)
 	}
 	v := jobView(*job)
 	return &v, nil

@@ -113,6 +113,7 @@ func (s *GenerationTaskService) SubmitTest(ctx context.Context, userID uint64, s
 	if err != nil {
 		return nil, err
 	}
+	logGenCreated(ctx, task)
 	return taskView(task), nil
 }
 
