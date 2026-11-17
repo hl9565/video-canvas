@@ -4,6 +4,36 @@ import type { Segment, SegmentTake } from "@/api/drama/type";
 export const sortSegments = (list: readonly Segment[]): Segment[] =>
   [...list].sort((a, b) => a.seq - b.seq);
 
+const parseTimeMs = (value: string | undefined): number | null => {
+  if (!value) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+};
+
+/** 避免不递增 fragment revision 的列表拉取或迟到推送覆盖更新的首帧流程快照。 */
+export function preserveNewerFrameRun(existing: Segment | undefined, incoming: Segment): Segment {
+  const previous = existing?.frameRun ?? null;
+  if (!previous) return incoming;
+  const next = incoming.frameRun ?? null;
+  if (next) {
+    if (previous.id === next.id) {
+      return previous.revision > next.revision ? { ...incoming, frameRun: previous } : incoming;
+    }
+    const prevTime = parseTimeMs(previous.updatedAt || previous.createdAt);
+    const nextTime = parseTimeMs(next.updatedAt || next.createdAt);
+    if (prevTime !== null && nextTime !== null && prevTime > nextTime) {
+      return { ...incoming, frameRun: previous };
+    }
+    return incoming;
+  }
+  const prevTime = parseTimeMs(previous.updatedAt || previous.createdAt);
+  const segTime = parseTimeMs(incoming.updatedAt);
+  if (prevTime !== null && segTime !== null && prevTime > segTime) {
+    return { ...incoming, frameRun: previous };
+  }
+  return incoming;
+}
+
 /**
  * 并入一条服务端快照（WebSocket 推送 / 接口返回）：
  * 同 id 更新；revision 更小的迟到快照忽略；相同 revision 也采用（take 状态变化不改 revision）；
@@ -12,7 +42,8 @@ export const sortSegments = (list: readonly Segment[]): Segment[] =>
 export function mergeSegment(list: readonly Segment[], incoming: Segment): Segment[] {
   const existing = list.find((item) => item.id === incoming.id);
   if (existing && incoming.revision < existing.revision) return [...list];
-  return sortSegments([...list.filter((item) => item.id !== incoming.id), incoming]);
+  const merged = preserveNewerFrameRun(existing, incoming);
+  return sortSegments([...list.filter((item) => item.id !== incoming.id), merged]);
 }
 
 /** 从列表里拿掉一个片段；其余片段的 seq 不动（以服务端为准） */
@@ -75,7 +106,8 @@ export const isRunning = (segment: Segment): boolean => segment.status === "runn
  */
 export function chooseCheck(segment: Segment, taskId: string): "ok" | "already" | "invalid" {
   const take = segment.takes.find((item) => item.taskId === taskId);
-  if (!take || take.status !== "succeeded" || !take.asset) return "invalid";
+  if (!take || take.status !== "succeeded" || !take.asset || take.qc === "rejected")
+    return "invalid";
   return segment.chosenTaskId === taskId ? "already" : "ok";
 }
 

@@ -21,7 +21,7 @@ func (s *DramaService) applyDramaOutput(ctx context.Context, tx repository.Drama
 	fields := map[string]any{}
 	switch result := out.(type) {
 	case drama.StoryboardOutput:
-		if err := saveStoryboardOutput(ctx, tx, p, j, result); err != nil {
+		if err := s.saveStoryboardOutput(ctx, tx, p, j, result); err != nil {
 			return err
 		}
 		p.Status = "ready"

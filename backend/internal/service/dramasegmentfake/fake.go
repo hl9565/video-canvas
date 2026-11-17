@@ -2,9 +2,11 @@
 package dramasegmentfake
 
 import (
+	"cmp"
 	"context"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"video-canvas/internal/drama"
@@ -19,9 +21,15 @@ import (
 type Repo struct {
 	repository.DramaTx
 	Rows            []model.DramaSegment
+	FrameRuns       []model.DramaSegmentFrameRun
+	TakeLinks       []model.DramaSegmentTakeLink
 	Tasks           []model.GenerationTask
 	Messages        []ws.Message
 	ProjectDeleted  bool
+	CanvasDeleted   bool
+	Unlocked        bool
+	InTx            bool
+	JobRows         []model.DramaJob
 	Created         *model.CreateGenerationTaskReq
 	IdempotencyKey  string
 	CreateError     *model.TaskItemError
@@ -43,21 +51,16 @@ func (r *Repo) WithTx(_ context.Context, fn func(repository.DramaTx) error) erro
 	if r.Err != nil {
 		return r.Err
 	}
-	before := slices.Clone(r.Rows)
-	version := r.SegmentVersion
-	schema, revision := r.EditSchema, r.EpisodeRevision
-	ledger := slices.Clone(r.Ledger)
-	var credit *model.UserCredit
-	if r.Credit != nil {
-		copied := *r.Credit
-		credit = &copied
-	}
+	before := *r
+	r.InTx = true
+	defer func() { r.InTx = false }()
+	before.Rows = slices.Clone(r.Rows)
+	before.FrameRuns = selectFakeRows(r.FrameRuns, nil, cloneFrameRun)
+	before.TakeLinks = selectFakeRows(r.TakeLinks, nil, cloneTakeLink)
+	before.Ledger, before.Credit = slices.Clone(r.Ledger), clonePointer(r.Credit)
 	err := fn(r)
 	if err != nil {
-		r.Rows = before
-		r.SegmentVersion = version
-		r.EditSchema, r.EpisodeRevision = schema, revision
-		r.Ledger, r.Credit = ledger, credit
+		*r = before
 	}
 	return err
 }
@@ -78,7 +81,23 @@ func (r *Repo) Episodes(ctx context.Context, userID, id uint64) ([]model.DramaEp
 	if _, err := r.Project(ctx, userID, id, false); err != nil {
 		return nil, err
 	}
-	return []model.DramaEpisode{{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1, LockedAt: func() *time.Time { v := time.Now(); return &v }(), Revision: max(r.EpisodeRevision, 1), EditSchema: r.EditSchema, SegmentVersion: r.SegmentVersion}}, nil
+	var lockedAt *time.Time
+	if !r.Unlocked {
+		v := time.Now()
+		lockedAt = &v
+	}
+	return []model.DramaEpisode{{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1, LockedAt: lockedAt, Revision: max(r.EpisodeRevision, 1), EditSchema: r.EditSchema, SegmentVersion: r.SegmentVersion}}, nil
+}
+
+// GetByID 返回用户 1 的画布 9；模拟软删后来源画布不再可读。
+func (r *Repo) GetByID(_ context.Context, userID, canvasID uint64) (*model.CanvasProject, error) {
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	if userID != 1 || canvasID != 9 || r.CanvasDeleted {
+		return nil, repository.ErrNotFound
+	}
+	return &model.CanvasProject{BaseModel: model.BaseModel{ID: 9}, UserID: 1}, nil
 }
 
 // SegmentEpisode 校验分集ID与父项目归属。
@@ -111,20 +130,11 @@ func (r *Repo) Segments(ctx context.Context, userID, episodeID uint64) ([]model.
 	if _, err := r.SegmentEpisode(ctx, userID, episodeID); err != nil {
 		return nil, err
 	}
-	rows := []model.DramaSegment{}
-	for _, row := range r.Rows {
-		if row.UserID == userID && row.EpisodeID == episodeID && !row.DeletedAt.Valid {
-			rows = append(rows, row)
-		}
-	}
+	rows := selectFakeRows(r.Rows, func(row model.DramaSegment) bool {
+		return row.UserID == userID && row.EpisodeID == episodeID && !row.DeletedAt.Valid
+	}, nil)
 	slices.SortFunc(rows, func(a, b model.DramaSegment) int {
-		if a.Seq < b.Seq || (a.Seq == b.Seq && a.ID < b.ID) {
-			return -1
-		}
-		if a.Seq == b.Seq && a.ID == b.ID {
-			return 0
-		}
-		return 1
+		return cmp.Or(cmp.Compare(a.Seq, b.Seq), cmp.Compare(a.ID, b.ID))
 	})
 	return rows, nil
 }
@@ -149,19 +159,16 @@ func (r *Repo) SaveSegmentNoBump(ctx context.Context, row *model.DramaSegment, r
 		r.Rows = append(r.Rows, *row)
 		return true, nil
 	}
-	for i := range r.Rows {
-		if r.Rows[i].ID == row.ID && r.Rows[i].UserID == row.UserID && !r.Rows[i].DeletedAt.Valid {
-			if r.Rows[i].Revision != revision {
-				return false, repository.ErrStateConflict
-			}
-			old := r.Rows[i]
-			changed := segmentMaterialChanged(old, *row)
-			row.Revision, row.UpdatedAt = revision+1, time.Now()
-			r.Rows[i] = *row
-			return changed, nil
-		}
+	i := slices.IndexFunc(r.Rows, func(old model.DramaSegment) bool {
+		return old.ID == row.ID && old.UserID == row.UserID && !old.DeletedAt.Valid
+	})
+	if i < 0 || r.Rows[i].Revision != revision {
+		return false, repository.ErrStateConflict
 	}
-	return false, repository.ErrStateConflict
+	changed := segmentMaterialChanged(r.Rows[i], *row)
+	row.Revision, row.UpdatedAt = revision+1, time.Now()
+	r.Rows[i] = *row
+	return changed, nil
 }
 
 // DeleteSegment 软删片段，不动Tasks。
@@ -179,13 +186,12 @@ func (r *Repo) DeleteSegmentNoBump(ctx context.Context, userID, sid uint64) (uin
 	if err != nil {
 		return 0, err
 	}
-	for i := range r.Rows {
-		if r.Rows[i].ID == sid {
-			r.Rows[i].DeletedAt.Time, r.Rows[i].DeletedAt.Valid = time.Now(), true
-			return row.EpisodeID, nil
-		}
+	if err := r.CancelSegmentFrameRuns(ctx, userID, sid); err != nil {
+		return 0, err
 	}
-	return 0, repository.ErrNotFound
+	i := slices.IndexFunc(r.Rows, func(old model.DramaSegment) bool { return old.ID == sid && old.UserID == userID })
+	r.Rows[i].DeletedAt.Time, r.Rows[i].DeletedAt.Valid = time.Now(), true
+	return row.EpisodeID, nil
 }
 
 // BumpSegmentVersion 显式递增假仓储的 SegmentVersion。
@@ -199,23 +205,11 @@ func (r *Repo) BumpSegmentVersion(ctx context.Context, userID, episodeID uint64)
 
 // SegmentTasks 按用户、画布、节点过滤正式任务，并稳定按创建时间和ID排序。
 func (r *Repo) SegmentTasks(_ context.Context, userID, canvasID uint64, nodeID string) ([]model.GenerationTask, error) {
-	rows := []model.GenerationTask{}
-	for _, task := range r.Tasks {
-		if task.UserID == userID && task.CanvasProjectID != nil && *task.CanvasProjectID == canvasID && task.NodeID == nodeID && !task.IsTest {
-			rows = append(rows, task)
-		}
-	}
+	rows := selectFakeRows(r.Tasks, func(task model.GenerationTask) bool {
+		return task.UserID == userID && task.CanvasProjectID != nil && *task.CanvasProjectID == canvasID && task.NodeID == nodeID && !task.IsTest
+	}, nil)
 	slices.SortFunc(rows, func(a, b model.GenerationTask) int {
-		if order := a.CreatedAt.Compare(b.CreatedAt); order != 0 {
-			return order
-		}
-		if a.ID < b.ID {
-			return -1
-		}
-		if a.ID > b.ID {
-			return 1
-		}
-		return 0
+		return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), cmp.Compare(a.ID, b.ID))
 	})
 	return rows, nil
 }
@@ -233,7 +227,7 @@ func (r *Repo) Create(_ context.Context, _ uint64, key string, req *model.Create
 
 // View 返回测试素材视图。
 func (r *Repo) View(_ context.Context, _, id uint64) (*model.AssetView, error) {
-	return &model.AssetView{ID: id, URL: "/files/test", Kind: "image"}, nil
+	return &model.AssetView{ID: id, URL: "/files/test", Kind: "video"}, nil
 }
 
 // Publish 记录完整用户事件。
@@ -241,21 +235,48 @@ func (r *Repo) Publish(_ context.Context, _ string, message ws.Message) {
 	r.Messages = append(r.Messages, message)
 }
 
-// HasSegmentTakes 只检查本集现存片段的视频任务。
+// HasSegmentTakes 检查现存片段的有效导入候选、双向匹配流程及原生视频任务，忽略悬空关联与流程孤儿。
 func (r *Repo) HasSegmentTakes(ctx context.Context, userID, episodeID uint64) (bool, error) {
 	rows, err := r.Segments(ctx, userID, episodeID)
 	if err != nil {
 		return false, err
 	}
+	taskByID := make(map[uint64]model.GenerationTask, len(r.Tasks))
+	for _, task := range r.Tasks {
+		taskByID[task.ID] = task
+	}
 	for _, row := range rows {
-		tasks, err := r.SegmentTasks(ctx, userID, 9, "seg:"+idcodec.Encode(row.ID))
-		if err != nil {
-			return false, err
-		}
-		for _, task := range tasks {
-			if task.Kind == model.KindVideo {
+		for _, run := range r.FrameRuns {
+			if run.UserID != userID || run.SegmentID != row.ID {
+				continue
+			}
+			if run.State != model.FrameRunStateFailed && run.State != model.FrameRunStateCancelled && run.State != model.FrameRunStateBound {
 				return true, nil
 			}
+			if run.State == model.FrameRunStateBound && run.VideoTaskID != nil {
+				if task, ok := taskByID[*run.VideoTaskID]; ok && task.UserID == userID && !task.IsTest && task.Kind == model.KindVideo &&
+					task.FrameRunID != nil && *task.FrameRunID == run.ID && task.FrameRunConfirmRev != nil && *task.FrameRunConfirmRev == run.ConfirmedVersion {
+					return true, nil
+				}
+			}
+		}
+		for _, link := range r.TakeLinks {
+			if link.UserID != userID || link.SegmentID != row.ID {
+				continue
+			}
+			task, ok := taskByID[link.TaskID]
+			if !ok || task.UserID != userID || task.IsTest || task.Kind != model.KindVideo || task.FrameRunID != nil || task.CanvasProjectID == nil {
+				continue
+			}
+			if link.Origin == model.TakeOriginCanvasImport && *task.CanvasProjectID == link.SourceCanvasID ||
+				link.Origin == model.TakeOriginNative && *task.CanvasProjectID == 9 {
+				return true, nil
+			}
+		}
+		if slices.ContainsFunc(r.Tasks, func(task model.GenerationTask) bool {
+			return task.UserID == userID && task.CanvasProjectID != nil && *task.CanvasProjectID == 9 && task.NodeID == "seg:"+idcodec.Encode(row.ID) && !task.IsTest && task.Kind == model.KindVideo && task.FrameRunID == nil
+		}) {
+			return true, nil
 		}
 	}
 	return false, nil
@@ -263,15 +284,14 @@ func (r *Repo) HasSegmentTakes(ctx context.Context, userID, episodeID uint64) (b
 
 // sameChosen 比较可空采用ID，让共享fake遵循真实仓储的过期判定。
 func sameChosen(a, b *uint64) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
+	return a == b || a != nil && b != nil && *a == *b
 }
 
-// Jobs 片段测试默认没有短剧媒体任务。
-func (r *Repo) Jobs(context.Context, uint64, uint64, bool) ([]model.DramaJob, error) {
-	return []model.DramaJob{}, nil
+// Jobs 返回用户项目下的可配置任务，默认没有短剧媒体任务。
+func (r *Repo) Jobs(_ context.Context, userID, dramaID uint64, active bool) ([]model.DramaJob, error) {
+	return selectFakeRows(r.JobRows, func(job model.DramaJob) bool {
+		return job.UserID == userID && job.DramaID == dramaID && (!active || job.Status == "queued" || job.Status == "running")
+	}, nil), r.Err
 }
 
 // Adapter 模拟文本模型转写：返回预设的 Out / Err；Gate 非空时阻塞到被关闭，用来测并发。
@@ -318,8 +338,7 @@ func (r *Repo) LockCredit(_ context.Context, userID uint64) (*model.UserCredit, 
 	if r.Credit == nil || r.Credit.UserID != userID {
 		return nil, repository.ErrNotFound
 	}
-	copied := *r.Credit
-	return &copied, nil
+	return clonePointer(r.Credit), nil
 }
 
 // AddCredit 增减余额和冻结额。
@@ -390,5 +409,341 @@ func (r *Repo) SaveEpisode(_ context.Context, ep *model.DramaEpisode, revision i
 // segmentMaterialChanged 判断需要递增集版本的采用、顺序或精裁变更。
 func segmentMaterialChanged(a, b model.DramaSegment) bool {
 	sameOut := a.SourceOutF == nil && b.SourceOutF == nil || a.SourceOutF != nil && b.SourceOutF != nil && *a.SourceOutF == *b.SourceOutF
-	return a.Seq != b.Seq || !sameChosen(a.ChosenTaskID, b.ChosenTaskID) || a.SourceInF != b.SourceInF || !sameOut || a.MuteOriginal != b.MuteOriginal || math.Round(a.AudioGainDB*100) != math.Round(b.AudioGainDB*100) || a.NativeIsDialogue != b.NativeIsDialogue || a.AvPtsOffsetMs != b.AvPtsOffsetMs
+	return a.Seq != b.Seq || a.ChosenCleared != b.ChosenCleared || !sameChosen(a.ChosenTaskID, b.ChosenTaskID) || a.SourceInF != b.SourceInF || !sameOut || a.MuteOriginal != b.MuteOriginal || math.Round(a.AudioGainDB*100) != math.Round(b.AudioGainDB*100) || a.NativeIsDialogue != b.NativeIsDialogue || a.AvPtsOffsetMs != b.AvPtsOffsetMs
+}
+
+func clonePointer[T any](p *T) *T {
+	if p == nil {
+		return nil
+	}
+	return new(*p)
+}
+
+// selectFakeRows 统一复制、筛选假仓储结果，指针快照使用显式复制函数避免写穿。
+func selectFakeRows[T any](rows []T, keep func(T) bool, clone func(T) T) []T {
+	out := append([]T{}, rows...)
+	if keep != nil {
+		out = slices.DeleteFunc(out, func(row T) bool { return !keep(row) })
+	}
+	if clone != nil {
+		for i := range out {
+			out[i] = clone(out[i])
+		}
+	}
+	return out
+}
+
+// cloneTakeLink 隔离候选关联中的可空流程指针。
+func cloneTakeLink(row model.DramaSegmentTakeLink) model.DramaSegmentTakeLink {
+	row.RunID = clonePointer(row.RunID)
+	return row
+}
+
+func cloneFrameRun(row model.DramaSegmentFrameRun) model.DramaSegmentFrameRun {
+	row.OriginCanvasID, row.FrameTaskID = clonePointer(row.OriginCanvasID), clonePointer(row.FrameTaskID)
+	row.FrameAssetID, row.VideoTaskID = clonePointer(row.FrameAssetID), clonePointer(row.VideoTaskID)
+	row.ConfirmedInputHash, row.QuoteToken = clonePointer(row.ConfirmedInputHash), clonePointer(row.QuoteToken)
+	row.SubmittingAt, row.ConfirmedInput = clonePointer(row.SubmittingAt), slices.Clone(row.ConfirmedInput)
+	return row
+}
+
+func activeFrameRun(state model.DramaFrameRunState) bool {
+	return slices.Contains([]model.DramaFrameRunState{model.FrameRunStateDraft, model.FrameRunStateFramePending,
+		model.FrameRunStateFrameReady, model.FrameRunStateConfirmed, model.FrameRunStateSubmitting, model.FrameRunStateVideoPending}, state)
+}
+
+func (r *Repo) findFrameRun(user uint64, match func(model.DramaSegmentFrameRun) bool) (*model.DramaSegmentFrameRun, error) {
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	i := slices.IndexFunc(r.FrameRuns, func(row model.DramaSegmentFrameRun) bool { return row.UserID == user && match(row) })
+	if i >= 0 {
+		return new(cloneFrameRun(r.FrameRuns[i])), nil
+	}
+	return nil, repository.ErrNotFound
+}
+
+// FrameRun 返回用户流程副本，缺失返回 ErrNotFound。
+func (r *Repo) FrameRun(_ context.Context, user, id uint64, _ bool) (*model.DramaSegmentFrameRun, error) {
+	return r.findFrameRun(user, func(row model.DramaSegmentFrameRun) bool { return row.ID == id })
+}
+
+// ActiveFrameRun 返回用户片段的活跃流程，缺失返回 ErrNotFound。
+func (r *Repo) ActiveFrameRun(_ context.Context, user, segment uint64, _ bool) (*model.DramaSegmentFrameRun, error) {
+	return r.findFrameRun(user, func(row model.DramaSegmentFrameRun) bool {
+		return row.SegmentID == segment && activeFrameRun(row.State)
+	})
+}
+
+// FrameRunByRequestKey 按用户和非空请求键查询。
+func (r *Repo) FrameRunByRequestKey(_ context.Context, user uint64, key string) (*model.DramaSegmentFrameRun, error) {
+	return r.findFrameRun(user, func(row model.DramaSegmentFrameRun) bool { return key != "" && row.RequestKey == key })
+}
+
+// FrameRunByFrameTask 按用户和首帧任务查询。
+func (r *Repo) FrameRunByFrameTask(_ context.Context, user, task uint64) (*model.DramaSegmentFrameRun, error) {
+	return r.findFrameRun(user, func(row model.DramaSegmentFrameRun) bool {
+		return task != 0 && row.FrameTaskID != nil && *row.FrameTaskID == task
+	})
+}
+
+// FrameRunByVideoTask 按用户和视频任务查询。
+func (r *Repo) FrameRunByVideoTask(_ context.Context, user, task uint64) (*model.DramaSegmentFrameRun, error) {
+	return r.findFrameRun(user, func(row model.DramaSegmentFrameRun) bool {
+		return task != 0 && row.VideoTaskID != nil && *row.VideoTaskID == task
+	})
+}
+
+// FrameRunByVideoIdempotencyKey 按用户和非空视频幂等键查询。
+func (r *Repo) FrameRunByVideoIdempotencyKey(_ context.Context, user uint64, key string) (*model.DramaSegmentFrameRun, error) {
+	return r.findFrameRun(user, func(row model.DramaSegmentFrameRun) bool { return key != "" && row.VideoIdempotencyKey == key })
+}
+
+func (r *Repo) frameRunUnique(row *model.DramaSegmentFrameRun, except uint64) error {
+	for _, old := range r.FrameRuns {
+		if old.ID != except && (old.ID == row.ID || old.UserID == row.UserID && old.RequestKey == row.RequestKey ||
+			old.SegmentID == row.SegmentID && activeFrameRun(old.State) && activeFrameRun(row.State) ||
+			old.VideoTaskID != nil && row.VideoTaskID != nil && *old.VideoTaskID == *row.VideoTaskID) {
+			return repository.ErrDuplicate
+		}
+	}
+	return r.Err
+}
+
+// CreateFrameRun 插入流程并模拟默认值、请求键及活跃槽位唯一约束。
+func (r *Repo) CreateFrameRun(_ context.Context, row *model.DramaSegmentFrameRun) error {
+	if err := r.frameRunUnique(row, 0); err != nil {
+		return err
+	}
+	if row.ID == 0 {
+		for _, old := range r.FrameRuns {
+			row.ID = max(row.ID, old.ID)
+		}
+		row.ID++
+	}
+	if row.Revision == 0 {
+		row.Revision = 1
+	}
+	if len(row.ConfirmedInput) == 0 {
+		row.ConfirmedInput = []byte(`{}`)
+	}
+	if row.CreatedAt.IsZero() {
+		row.CreatedAt = time.Now()
+	}
+	if row.UpdatedAt.IsZero() {
+		row.UpdatedAt = row.CreatedAt
+	}
+	r.FrameRuns = append(r.FrameRuns, cloneFrameRun(*row))
+	return nil
+}
+
+// SaveFrameRun 按用户、片段、ID 和 revision 执行 CAS，保留不可变的请求身份。
+func (r *Repo) SaveFrameRun(_ context.Context, row *model.DramaSegmentFrameRun, revision int64) error {
+	for i, old := range r.FrameRuns {
+		if old.ID == row.ID && old.UserID == row.UserID && old.SegmentID == row.SegmentID && old.Revision == revision {
+			stored := cloneFrameRun(*row)
+			stored.RequestKey, stored.RequestHash, stored.CreatedAt = old.RequestKey, old.RequestHash, old.CreatedAt
+			if err := r.frameRunUnique(&stored, row.ID); err != nil {
+				return err
+			}
+			row.Revision, row.UpdatedAt = revision+1, time.Now()
+			stored.Revision, stored.UpdatedAt = row.Revision, row.UpdatedAt
+			if len(stored.ConfirmedInput) == 0 {
+				stored.ConfirmedInput = []byte(`{}`)
+			}
+			r.FrameRuns[i] = stored
+			return nil
+		}
+	}
+	return repository.ErrStateConflict
+}
+
+func (r *Repo) cancelFrameRuns(user uint64, match func(model.DramaSegmentFrameRun) bool) error {
+	if r.Err != nil {
+		return r.Err
+	}
+	for i, row := range r.FrameRuns {
+		if row.UserID == user && activeFrameRun(row.State) && match(row) {
+			r.FrameRuns[i].State, r.FrameRuns[i].Revision, r.FrameRuns[i].UpdatedAt = model.FrameRunStateCancelled, row.Revision+1, time.Now()
+		}
+	}
+	return nil
+}
+
+// CancelSegmentFrameRuns 取消指定用户片段的活跃流程。
+func (r *Repo) CancelSegmentFrameRuns(_ context.Context, user, segment uint64) error {
+	return r.cancelFrameRuns(user, func(row model.DramaSegmentFrameRun) bool { return row.SegmentID == segment })
+}
+
+// CancelEpisodeFrameRuns 取消指定用户分集下包括已软删片段的活跃流程。
+func (r *Repo) CancelEpisodeFrameRuns(_ context.Context, user, episode uint64) error {
+	return r.cancelFrameRuns(user, func(run model.DramaSegmentFrameRun) bool {
+		return slices.ContainsFunc(r.Rows, func(row model.DramaSegment) bool {
+			return row.UserID == user && row.EpisodeID == episode && row.ID == run.SegmentID
+		})
+	})
+}
+
+// CancelProjectFrameRuns 取消固定测试项目 7 下的活跃流程。
+func (r *Repo) CancelProjectFrameRuns(ctx context.Context, user, project uint64) error {
+	if project != 7 {
+		return r.Err
+	}
+	return r.CancelEpisodeFrameRuns(ctx, user, 10)
+}
+
+// ListRecoverableFrameRuns 按用户、时间和游标筛选可恢复流程，有界并稳定排序。
+func (r *Repo) ListRecoverableFrameRuns(_ context.Context, filter repository.FrameRunRecoveryFilter, limit int) ([]model.DramaSegmentFrameRun, error) {
+	rows := selectFakeRows(r.FrameRuns, func(row model.DramaSegmentFrameRun) bool {
+		recoverable := row.State == model.FrameRunStateFramePending ||
+			row.State == model.FrameRunStateSubmitting ||
+			row.State == model.FrameRunStateVideoPending ||
+			(row.FrameSource == model.FrameSourceGenerate && row.State == model.FrameRunStateDraft)
+		if !recoverable {
+			return false
+		}
+		if filter.UserID != 0 && row.UserID != filter.UserID {
+			return false
+		}
+		if !filter.UpdatedBefore.IsZero() && row.UpdatedAt.After(filter.UpdatedBefore) {
+			return false
+		}
+		if !filter.AfterUpdatedAt.IsZero() && filter.AfterID > 0 {
+			if row.UpdatedAt.Before(filter.AfterUpdatedAt) || (row.UpdatedAt.Equal(filter.AfterUpdatedAt) && row.ID <= filter.AfterID) {
+				return false
+			}
+		}
+		return true
+	}, cloneFrameRun)
+	slices.SortFunc(rows, func(a, b model.DramaSegmentFrameRun) int {
+		return cmp.Or(a.UpdatedAt.Compare(b.UpdatedAt), cmp.Compare(a.ID, b.ID))
+	})
+	if limit <= 0 {
+		limit = 50
+	}
+	return rows[:min(len(rows), limit, 500)], r.Err
+}
+
+// HasActiveFrameRunForTask 与真实仓储一致，阻止直接取消接口绕过活跃流程取消关联任务。
+func (r *Repo) HasActiveFrameRunForTask(_ context.Context, user uint64, task *model.GenerationTask) (bool, error) {
+	if r.Err != nil {
+		return false, r.Err
+	}
+	if task == nil || task.ID == 0 || user == 0 {
+		return false, nil
+	}
+	var draftSID uint64
+	if task.Kind == model.KindImage && strings.HasPrefix(task.NodeID, "seg-frame:") {
+		if sid, ok := idcodec.Decode(strings.TrimPrefix(task.NodeID, "seg-frame:")); ok {
+			draftSID = sid
+		}
+	}
+	return slices.ContainsFunc(r.FrameRuns, func(run model.DramaSegmentFrameRun) bool {
+		if run.UserID != user || run.State == model.FrameRunStateBound || run.State == model.FrameRunStateFailed || run.State == model.FrameRunStateCancelled {
+			return false
+		}
+		return (task.FrameRunID != nil && *task.FrameRunID == run.ID) ||
+			(run.FrameTaskID != nil && *run.FrameTaskID == task.ID) ||
+			(run.VideoTaskID != nil && *run.VideoTaskID == task.ID) ||
+			(draftSID != 0 && run.SegmentID == draftSID && run.FrameSource == model.FrameSourceGenerate && run.State == model.FrameRunStateDraft && run.FrameTaskID == nil)
+	}), nil
+}
+
+// ListTakeLinks 返回用户片段的候选副本，按任务 ID 排序。
+func (r *Repo) ListTakeLinks(_ context.Context, user, segment uint64) ([]model.DramaSegmentTakeLink, error) {
+	rows := selectFakeRows(r.TakeLinks, func(row model.DramaSegmentTakeLink) bool { return row.UserID == user && row.SegmentID == segment }, cloneTakeLink)
+	slices.SortFunc(rows, func(a, b model.DramaSegmentTakeLink) int { return cmp.Compare(a.TaskID, b.TaskID) })
+	return rows, r.Err
+}
+
+func (r *Repo) findTakeLink(user uint64, match func(model.DramaSegmentTakeLink) bool) (*model.DramaSegmentTakeLink, error) {
+	if r.Err != nil {
+		return nil, r.Err
+	}
+	i := slices.IndexFunc(r.TakeLinks, func(row model.DramaSegmentTakeLink) bool { return row.UserID == user && match(row) })
+	if i >= 0 {
+		return new(cloneTakeLink(r.TakeLinks[i])), nil
+	}
+	return nil, repository.ErrNotFound
+}
+
+// TakeLink 按用户和复合主键查询候选副本。
+func (r *Repo) TakeLink(_ context.Context, user, segment, task uint64) (*model.DramaSegmentTakeLink, error) {
+	return r.findTakeLink(user, func(row model.DramaSegmentTakeLink) bool { return row.SegmentID == segment && row.TaskID == task })
+}
+
+// TakeLinkByRun 按用户和非零 run_id 查询候选副本。
+func (r *Repo) TakeLinkByRun(_ context.Context, user, run uint64) (*model.DramaSegmentTakeLink, error) {
+	return r.findTakeLink(user, func(row model.DramaSegmentTakeLink) bool { return run != 0 && row.RunID != nil && *row.RunID == run })
+}
+
+// CreateTakeLinkIfAbsent 只补缺复合主键，绝不重写来源或质检；run_id 冲突返回 ErrDuplicate。
+func (r *Repo) CreateTakeLinkIfAbsent(_ context.Context, row *model.DramaSegmentTakeLink) (bool, error) {
+	if r.Err != nil {
+		return false, r.Err
+	}
+	if slices.ContainsFunc(r.TakeLinks, func(old model.DramaSegmentTakeLink) bool {
+		return old.SegmentID == row.SegmentID && old.TaskID == row.TaskID
+	}) {
+		return false, nil
+	}
+	if slices.ContainsFunc(r.TakeLinks, func(old model.DramaSegmentTakeLink) bool {
+		return old.RunID != nil && row.RunID != nil && *old.RunID == *row.RunID
+	}) {
+		return false, repository.ErrDuplicate
+	}
+	if row.QC == "" {
+		row.QC = model.TakeQCUnreviewed
+	}
+	if row.CreatedAt.IsZero() {
+		row.CreatedAt = time.Now()
+	}
+	stored := *row
+	stored.RunID = clonePointer(row.RunID)
+	r.TakeLinks = append(r.TakeLinks, stored)
+	return true, nil
+}
+
+// UpdateTakeLinkQC 只更新用户候选的质检结果，不修改来源。
+func (r *Repo) UpdateTakeLinkQC(_ context.Context, user, segment, task uint64, qc model.DramaSegmentTakeQC) error {
+	if r.Err != nil {
+		return r.Err
+	}
+	for i, row := range r.TakeLinks {
+		if row.UserID == user && row.SegmentID == segment && row.TaskID == task {
+			r.TakeLinks[i].QC = qc
+			return nil
+		}
+	}
+	return repository.ErrNotFound
+}
+
+// TasksByIDs 返回用户正式任务，排除他人和试跑。
+func (r *Repo) TasksByIDs(_ context.Context, user uint64, ids []uint64) ([]model.GenerationTask, error) {
+	rows := selectFakeRows(r.Tasks, func(task model.GenerationTask) bool {
+		return task.UserID == user && !task.IsTest && slices.Contains(ids, task.ID)
+	}, nil)
+	slices.SortFunc(rows, func(a, b model.GenerationTask) int { return cmp.Compare(a.ID, b.ID) })
+	return rows, r.Err
+}
+
+// FrameRunsBySegment 按 ID 返回本用户片段的全部历史流程。
+func (r *Repo) FrameRunsBySegment(_ context.Context, user, sid uint64) ([]model.DramaSegmentFrameRun, error) {
+	rows := selectFakeRows(r.FrameRuns, func(run model.DramaSegmentFrameRun) bool { return run.UserID == user && run.SegmentID == sid }, cloneFrameRun)
+	slices.SortFunc(rows, func(a, b model.DramaSegmentFrameRun) int { return cmp.Compare(a.ID, b.ID) })
+	return rows, r.Err
+}
+
+// ActiveFrameRunsBySegments 返回指定存活段的媒体进行态。
+func (r *Repo) ActiveFrameRunsBySegments(_ context.Context, user uint64, ids []uint64) ([]model.DramaSegmentFrameRun, error) {
+	rows := selectFakeRows(r.FrameRuns, func(run model.DramaSegmentFrameRun) bool {
+		return run.UserID == user && slices.Contains(ids, run.SegmentID) && slices.Contains([]model.DramaFrameRunState{model.FrameRunStateFramePending, model.FrameRunStateSubmitting, model.FrameRunStateVideoPending}, run.State)
+	}, cloneFrameRun)
+	return rows, r.Err
+}
+
+// TakeLinksByTask 反查同用户任务被导入的片段。
+func (r *Repo) TakeLinksByTask(_ context.Context, user, task uint64) ([]model.DramaSegmentTakeLink, error) {
+	rows := selectFakeRows(r.TakeLinks, func(row model.DramaSegmentTakeLink) bool { return row.UserID == user && row.TaskID == task }, cloneTakeLink)
+	return rows, r.Err
 }

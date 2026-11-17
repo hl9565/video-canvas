@@ -5,6 +5,17 @@ import { join, relative, sep } from "node:path";
 /** 源码根目录：tests/utils/tasks 往上三级 */
 const SRC = join(import.meta.dir, "..", "..", "..");
 
+/** 会创建或取消生成任务的 API 必须经统一入口调用。 */
+const FORBIDDEN_APIS = [
+  "createGenerationTask",
+  "cancelGenerationTask",
+  "submitConversationRecord",
+  "generateSegment",
+  "createFrameRun",
+  "submitFrameRun",
+  "cancelFrameRun",
+];
+
 const walk = (dir: string): string[] =>
   readdirSync(dir).flatMap((name) => {
     const path = join(dir, name);
@@ -28,12 +39,7 @@ describe("生成任务统一入口（utils/tasks/gateway.ts）", () => {
   });
 
   test("提交和取消任务的接口只有统一入口能调用，其余代码不许绕过它", () => {
-    for (const name of [
-      "createGenerationTask",
-      "cancelGenerationTask",
-      "submitConversationRecord",
-      "generateSegment",
-    ]) {
+    for (const name of FORBIDDEN_APIS) {
       const users = filesUsing(new RegExp(`\\b${name}\\b`)).filter(
         // 定义它们的 api 模块本身不算
         (path) => !path.startsWith("api/") && path !== "utils/tasks/gateway.ts",

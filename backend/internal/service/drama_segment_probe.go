@@ -25,6 +25,15 @@ func (s *DramaSegmentService) resolveSegmentSourceFrames(ctx context.Context, us
 			break
 		}
 	}
+	if task == nil {
+		extra, err := s.repo.TasksByIDs(ctx, userID, []uint64{*taskID})
+		if err != nil {
+			return nil, err
+		}
+		if len(extra) == 1 {
+			task = &extra[0]
+		}
+	}
 	if task == nil || task.Kind != model.KindVideo || task.Status != model.TaskSucceeded {
 		return nil, errcode.ErrDramaTakeInvalid
 	}
@@ -95,6 +104,12 @@ func (s *DramaSegmentService) probeSegmentAsset(ctx context.Context, store provi
 
 // resolveUpdateFrames 将探测绑定到请求版本和拟采用任务，写锁内仍须重验版本及任务归属。
 func (s *DramaSegmentService) resolveUpdateFrames(ctx context.Context, userID, sid uint64, req *model.UpdateDramaSegmentReq) (*int32, error) {
+	if req.ClearChosen {
+		if req.Edit != nil {
+			return nil, errcode.ErrDramaEditInvalid
+		}
+		return nil, nil
+	}
 	needsBounds := req.Edit != nil || (req.ChosenTaskID != nil && req.ResetEditOnTaskChange != nil && !*req.ResetEditOnTaskChange)
 	if !needsBounds {
 		return nil, nil
@@ -111,9 +126,16 @@ func (s *DramaSegmentService) resolveUpdateFrames(ctx context.Context, userID, s
 		id := uint64(*req.ChosenTaskID)
 		taskID = &id
 	}
-	tasks, err := s.repo.SegmentTasks(ctx, userID, p.CanvasID, segmentNode(sid))
+	takes, err := ResolveSegmentTakes(ctx, s.repo, s.assets, p, row)
 	if err != nil {
 		return nil, err
 	}
-	return s.resolveSegmentSourceFrames(ctx, userID, taskID, tasks)
+	if taskID == nil {
+		return nil, errcode.ErrDramaEditInvalid
+	}
+	take, err := findUsableSegmentTake(takes, *taskID, false)
+	if err != nil {
+		return nil, err
+	}
+	return s.resolveSegmentSourceFrames(ctx, userID, taskID, []model.GenerationTask{take.Task})
 }

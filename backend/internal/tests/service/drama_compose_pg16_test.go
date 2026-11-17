@@ -168,9 +168,9 @@ func (q *slice2cQueue) EnqueueDramaTx(context.Context, *sql.Tx, uint64, uint64, 
 	return nil
 }
 
-func TestDramaComposePG16_ConcurrentKeyAndSchema9001Only(t *testing.T) {
+func TestDramaComposePG16_ConcurrentKeyAndSchemaStageBOnly(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
+	migrateCurrentSchemaPG16(t, db)
 	fixture := newComposeMemory()
 	fixture.episodes[0].EditSchema = 1
 	seedComposePGTask(&fixture.tasks[0])
@@ -222,8 +222,8 @@ func TestDramaComposePG16_ConcurrentKeyAndSchema9001Only(t *testing.T) {
 		t.Fatalf("重复入队: %d", q.calls.Load())
 	}
 	var tables int64
-	if err := db.Raw(`SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND column_name IN ('program_json','visual_kind','still_asset_id','fx_json','chosen_cleared')`).Scan(&tables).Error; err != nil || tables != 0 {
-		t.Fatalf("越界 schema: %d %v", tables, err)
+	if err := db.Raw(`SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND column_name IN ('program_json','visual_kind','still_asset_id','fx_json')`).Scan(&tables).Error; err != nil || tables != 0 {
+		t.Fatalf("越界 PR3 schema: %d %v", tables, err)
 	}
 	stored, err := repo.Job(context.Background(), 7, 1, id, false)
 	if err != nil || stored.RequestIntentSig == "" {
@@ -246,7 +246,7 @@ func seedComposePGTask(t *model.GenerationTask) {
 
 func TestDramaComposePG16_ProbeReleasesLocksAndTx2RejectsConcurrentEdit(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
+	migrateCurrentSchemaPG16(t, db)
 	fixture := newComposeMemory()
 	fixture.episodes[0].EditSchema = 1
 	seedComposePGTask(&fixture.tasks[0])
@@ -318,7 +318,7 @@ func TestDramaComposePG16_ProbeReleasesLocksAndTx2RejectsConcurrentEdit(t *testi
 
 func TestDramaComposePG16_RatioChangeInvalidatesAndBlocksStaleSubmit(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
+	migrateCurrentSchemaPG16(t, db)
 
 	fixture := newComposeMemory()
 	fixture.project.Ratio = "16:9"
@@ -533,7 +533,7 @@ func (a *pgUniqueComposeAssets) PrepareDramaVideo(ctx context.Context, user uint
 
 func TestDramaComposePG16_Schema0FrozenManifestRatioInvalidation(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
+	migrateCurrentSchemaPG16(t, db)
 	seedSchema0RatioPG16(t, db)
 
 	repo := repository.NewDramaRepository(db)
@@ -683,7 +683,7 @@ func TestDramaComposePG16_Schema0FrozenManifestRatioInvalidation(t *testing.T) {
 
 func TestDramaComposePG16_HistoricalFrozenJobDoesNotStaleNilManifestExport(t *testing.T) {
 	db := slice2cPG16(t)
-	slice2cMigrate(t, db, slice2cUpstream35WithFork9001)
+	migrateCurrentSchemaPG16(t, db)
 	seedSchema0RatioPG16(t, db)
 
 	repo := repository.NewDramaRepository(db)

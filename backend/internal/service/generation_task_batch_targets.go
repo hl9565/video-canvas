@@ -108,7 +108,10 @@ func preResolveDramaTargets(ctx context.Context, tx repository.GenerationTaskTx,
 	}
 	for _, probe := range probes {
 		target := resolveLockedDramaTarget(probe, ps, es, ss)
-		if target.err == nil {
+		if target.err == nil && b.opts.DramaRunBind != nil {
+			target.err = resolveDramaRunTarget(ctx, tx, dtx, b, &target)
+		}
+		if target.err == nil && target.existingRunTask == nil {
 			target.err = validateDramaBatchTarget(ctx, dtx, b, &target)
 		}
 		if target.err != nil {
@@ -173,6 +176,13 @@ func validateDramaBatchTarget(ctx context.Context, tx repository.DramaTx, b *tas
 	if err != nil {
 		return err
 	}
+	var exclude uint64
+	if b.opts.DramaRunBind != nil {
+		exclude = b.opts.DramaRunBind.RunID
+	}
+	if err := checkActiveSegmentFrameRuns(ctx, tx, b.userID, rows, b.key, exclude); err != nil {
+		return err
+	}
 	for _, segment := range rows {
 		target.mediaNodes = append(target.mediaNodes, segmentNode(segment.ID))
 	}
@@ -215,4 +225,90 @@ func validateBatchMediaTasks(ctx context.Context, tx repository.GenerationTaskTx
 func batchLockIDs(ids []uint64) []uint64 {
 	slices.Sort(ids)
 	return slices.Compact(ids)
+}
+
+// resolveDramaRunTarget 按父链之后的流程锁执行终态优先表；终态绝不进入积分冻结。
+func resolveDramaRunTarget(ctx context.Context, tx repository.GenerationTaskTx, dtx repository.DramaTx, b *taskBatch, target *preResolvedTarget) error {
+	bind := b.opts.DramaRunBind
+	run, err := dtx.FrameRun(ctx, b.userID, bind.RunID, true)
+	if errors.Is(err, repository.ErrNotFound) {
+		return errcode.ErrDramaFrameRunNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if run.SegmentID != target.segment.ID {
+		return errcode.ErrDramaFrameRunInconsistent
+	}
+	target.run = run
+	hit, err := tx.FindByIdempotencyKey(ctx, b.userID, b.key)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return err
+	}
+	if errors.Is(err, repository.ErrNotFound) {
+		hit = nil
+	}
+	switch run.State {
+	case model.FrameRunStateCancelled:
+		return resolveCancelledRunTask(ctx, dtx, b, run, hit)
+	case model.FrameRunStateFailed:
+		return errcode.ErrDramaFrameRunConflict
+	case model.FrameRunStateVideoPending, model.FrameRunStateBound:
+		if run.VideoTaskID == nil || hit == nil || hit.ID != *run.VideoTaskID || !matchesDramaRunBind(hit, bind) || run.ConfirmedVersion != bind.ConfirmRev {
+			return errcode.ErrDramaFrameRunInconsistent
+		}
+		target.existingRunTask = hit
+		return nil
+	case model.FrameRunStateSubmitting:
+		return resolveSubmittingRunTask(ctx, dtx, b, target, hit)
+	default:
+		return errcode.ErrDramaFrameRunConflict
+	}
+}
+
+// resolveSubmittingRunTask 同键只接受本次确认的受信任务，并原子修复正向键；普通任务零冻结拒绝。
+func resolveSubmittingRunTask(ctx context.Context, tx repository.DramaTx, b *taskBatch, target *preResolvedTarget, hit *model.GenerationTask) error {
+	run, bind := target.run, b.opts.DramaRunBind
+	if run.ConfirmedVersion != bind.ConfirmRev || run.VideoIdempotencyKey != b.key || run.ModelKey != b.req.ModelID || run.ConfirmedInputHash == nil {
+		return errcode.ErrDramaFrameRunInconsistent
+	}
+	if hit == nil {
+		return nil
+	}
+	if !matchesDramaRunBind(hit, bind) || run.VideoTaskID != nil && *run.VideoTaskID != hit.ID {
+		return errcode.ErrIdempotencyConflict
+	}
+	run.VideoTaskID, run.State = &hit.ID, model.FrameRunStateVideoPending
+	if err := tx.SaveFrameRun(ctx, run, run.Revision); err != nil {
+		return err
+	}
+	target.existingRunTask = hit
+	return nil
+}
+
+// resolveCancelledRunTask 只有明确归属本 run 的任务可取消，普通占键任务及账本保持原样。
+func resolveCancelledRunTask(ctx context.Context, tx repository.DramaTx, b *taskBatch, run *model.DramaSegmentFrameRun, hit *model.GenerationTask) error {
+	if hit == nil && run.VideoTaskID != nil {
+		tasks, err := tx.TasksByIDs(ctx, b.userID, []uint64{*run.VideoTaskID})
+		if err != nil {
+			return err
+		}
+		if len(tasks) == 1 {
+			hit = &tasks[0]
+		}
+	}
+	if hit == nil {
+		return errcode.ErrDramaFrameRunInconsistent
+	}
+	if run.VideoTaskID != nil {
+		if hit.ID != *run.VideoTaskID {
+			return errcode.ErrDramaFrameRunInconsistent
+		}
+	} else if !matchesDramaRunBind(hit, &DramaFrameRunBind{RunID: run.ID, ConfirmRev: run.ConfirmedVersion}) {
+		return errcode.ErrDramaFrameRunInconsistent
+	}
+	if !model.IsTerminalStatus(hit.Status) && hit.Status != model.TaskFinalizing {
+		b.cancelTaskID = hit.ID
+	}
+	return errcode.ErrDramaFrameRunConflict
 }

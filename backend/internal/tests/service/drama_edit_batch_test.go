@@ -45,7 +45,7 @@ func TestGenerationTaskService_V21_ReservedPrefixAndSourceIsolation(t *testing.T
 	_, err = env.svc.SubmitTest(testCtx, 1, env.registry.snap, map[string]any{"prompt": "猫"})
 	assertTaskCode(t, err, errcode.ErrInvalidParams.Code)
 
-	// 受信 DramaRunBind 可提交
+	// 缺少流程身份和片段目标的 bind 不是有效受信提交。
 	now := time.Now()
 	boundResp, err := env.svc.CreateWithOptions(ctx, 1, service.InternalDramaFrameRunKeyPrefix+"r1", validCreateReq(), service.CreateTaskOptions{
 		DramaRunBind: &service.DramaFrameRunBind{
@@ -56,8 +56,9 @@ func TestGenerationTaskService_V21_ReservedPrefixAndSourceIsolation(t *testing.T
 			},
 		},
 	})
-	if err != nil || len(boundResp.Items) != 1 || boundResp.Items[0].Task == nil {
-		t.Fatalf("受信 DramaRunBind 应成功创建：err=%v resp=%+v", err, boundResp)
+	assertTaskCode(t, err, errcode.ErrInvalidParams.Code)
+	if boundResp != nil {
+		t.Fatal("不完整 bind 不得创建任务")
 	}
 
 	// 2. 三来源（normal / agent / is_test）新旧记录互斥
@@ -470,7 +471,7 @@ func TestGenerationTaskService_V21_PG_BatchAtomicityConcurrencyAndSQLInjections(
 	t.Run("并发批拼单_预锁空隙与营销带键无键竞态", func(t *testing.T) {
 		env := newGTIEnv(t, taskLimitsFunc{initial: 500, maxActive: 50, mult: 1})
 		env.registry.snap = v21MultiRegistry(10).snap
-		_ = env.db.AutoMigrate(&model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.DramaJob{}, &model.MarketingProject{}, &model.MarketingRound{}, &model.MarketingScript{})
+		_ = env.db.AutoMigrate(&model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.DramaSegmentFrameRun{}, &model.DramaSegmentTakeLink{}, &model.DramaJob{}, &model.MarketingProject{}, &model.MarketingRound{}, &model.MarketingScript{})
 
 		// 6(a) K+[A,B] vs K#1->C
 		start := make(chan struct{})

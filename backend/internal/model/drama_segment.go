@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"gorm.io/datatypes"
@@ -14,12 +15,13 @@ import (
 // DramaSegment 单集内可独立生成的片段，任务和素材保留各自的生命周期。
 type DramaSegment struct {
 	BaseModel
-	UserID       uint64 `gorm:"not null;index"`
-	EpisodeID    uint64 `gorm:"not null;index:idx_drama_segment_episode_seq,priority:1"`
-	Seq          int    `gorm:"not null;default:0;index:idx_drama_segment_episode_seq,priority:2"`
-	Seconds      int    `gorm:"not null;default:5"`
-	Prompt       string `gorm:"type:text;not null;default:''"`
-	ChosenTaskID *uint64
+	UserID        uint64 `gorm:"not null;index"`
+	EpisodeID     uint64 `gorm:"not null;index:idx_drama_segment_episode_seq,priority:1"`
+	Seq           int    `gorm:"not null;default:0;index:idx_drama_segment_episode_seq,priority:2"`
+	Seconds       int    `gorm:"not null;default:5"`
+	Prompt        string `gorm:"type:text;not null;default:''"`
+	ChosenTaskID  *uint64
+	ChosenCleared bool `gorm:"not null;default:false"`
 	// Adaptations 按格式（h3 / generic）存原稿的转写稿，值为 DramaSegmentAdaptation；原稿就是 Seedance，不存 seedance 键
 	Adaptations      datatypes.JSON `gorm:"type:jsonb;not null;default:'{}'"`
 	SourceInF        int32          `gorm:"type:integer;not null;default:0;check:ck_ds_range,source_in_f >= 0 AND (source_out_f IS NULL OR source_out_f > source_in_f)"`
@@ -46,11 +48,16 @@ func (DramaSegment) TableName() string { return "drama_segments" }
 
 // DramaSegmentTakeView 从生成任务读取的结果，不复制保存任务状态。
 type DramaSegmentTakeView struct {
-	TaskID       idcodec.ID `json:"task_id"`
-	Status       string     `json:"status"`
-	Asset        *AssetView `json:"asset"`
-	ErrorMessage string     `json:"error_message"`
-	CreatedAt    time.Time  `json:"created_at"`
+	TaskID         idcodec.ID  `json:"task_id"`
+	Status         string      `json:"status"`
+	Asset          *AssetView  `json:"asset"`
+	ErrorMessage   string      `json:"error_message"`
+	CreatedAt      time.Time   `json:"created_at"`
+	Origin         string      `json:"origin"`
+	QC             string      `json:"qc"`
+	RunID          *idcodec.ID `json:"run_id,omitempty"`
+	SourceCanvasID *idcodec.ID `json:"source_canvas_id,omitempty"`
+	FrameAssetID   *uint64     `json:"frame_asset_id,omitempty"`
 }
 
 // NullableInt32 区分 PATCH 请求里的“字段缺失”、“显式传 null”和“传入整数”。
@@ -137,6 +144,8 @@ type DramaSegmentView struct {
 	Adaptations      map[string]DramaSegmentAdaptation `json:"adaptations"`
 	Takes            []DramaSegmentTakeView            `json:"takes"`
 	ChosenTaskID     string                            `json:"chosen_task_id"`
+	ChosenCleared    bool                              `json:"chosen_cleared"`
+	FrameRun         *DramaSegmentFrameRunView         `json:"frame_run,omitempty"`
 	SourceFrameCount *int32                            `json:"source_frame_count"`
 	Edit             DramaSegmentEditView              `json:"edit"`
 	Status           string                            `json:"status"`
@@ -158,12 +167,36 @@ type UpdateDramaSegmentReq struct {
 	Prompt                *string     `json:"prompt"`
 	Seconds               *int        `json:"seconds" binding:"omitempty,min=1" label:"片段时长"`
 	ChosenTaskID          *idcodec.ID `json:"chosen_task_id"`
+	ClearChosen           bool        `json:"clear_chosen" binding:"omitempty" label:"清空采用"`
 	ExpectedTaskID        *idcodec.ID `json:"expected_task_id"`
 	ResetEditOnTaskChange *bool       `json:"reset_edit_on_task_change"`
 	// Edit 更新逐镜裁剪和原声设置
 	Edit *DramaSegmentEditPatch `json:"edit"`
 	// Adaptation 手改某个格式的转写稿；该格式必须已经转写过
 	Adaptation *DramaSegmentAdaptationEdit `json:"adaptation"`
+}
+
+// UnmarshalJSON 将显式 null / 空串采用值规范为清空；采用与清空同时出现时留给业务层拒绝。
+func (r *UpdateDramaSegmentReq) UnmarshalJSON(data []byte) error {
+	if r == nil {
+		return errors.New("UpdateDramaSegmentReq: UnmarshalJSON on nil pointer")
+	}
+	type plain UpdateDramaSegmentReq
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	for key := range fields {
+		if strings.EqualFold(key, "chosen_task_id") && (decoded.ChosenTaskID == nil || *decoded.ChosenTaskID == 0) {
+			decoded.ChosenTaskID, decoded.ClearChosen = nil, true
+		}
+	}
+	*r = UpdateDramaSegmentReq(decoded)
+	return nil
 }
 
 // DramaSegmentAdaptationEdit 是对一份转写稿的手改。

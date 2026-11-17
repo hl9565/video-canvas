@@ -1,6 +1,13 @@
 import { submitConversationRecord } from "@/api/conversation";
-import { generateSegment } from "@/api/drama";
-import type { SegmentGenerateBody } from "@/api/drama/type";
+import { cancelFrameRun, createFrameRun, generateSegment, submitFrameRun } from "@/api/drama";
+import type {
+  CancelFrameRunInput,
+  CreateFrameRunInput,
+  SegmentFrameRun,
+  SegmentGenerateBody,
+  SubmitFrameRunInput,
+  SubmitFrameRunResult,
+} from "@/api/drama/type";
 import type {
   SubmitRecordRequest,
   SubmitRecordResultDto,
@@ -82,6 +89,56 @@ export async function submitSegmentTask(
   );
   acceptTasks([task]);
   return task;
+}
+
+/**
+ * 创建首帧流程；重试沿用调用方保存的 requestKey 与完整请求体。
+ * @param sid 片段 ID
+ * @param input 首帧来源和幂等创建参数
+ * @returns 首帧流程快照
+ */
+export async function createSegmentFrameRun(
+  sid: string,
+  input: CreateFrameRunInput,
+): Promise<SegmentFrameRun> {
+  return submitWithRetry(() => createFrameRun(sid, input), input.requestKey);
+}
+
+/**
+ * 提交已确认的首帧版本，并将视频任务合入任务库、刷新余额。
+ * @param sid 片段 ID
+ * @param rid 首帧流程 ID
+ * @param input 流程版本与确认版本；重试保持不变
+ * @returns 流程及任务快照
+ */
+export async function submitSegmentFrameRun(
+  sid: string,
+  rid: string,
+  input: SubmitFrameRunInput,
+): Promise<SubmitFrameRunResult> {
+  const result = await submitWithRetry(
+    () => submitFrameRun(sid, rid, input),
+    `${rid}:${input.confirmedVersion}`,
+  );
+  acceptTasks([result.task]);
+  return result;
+}
+
+/**
+ * 取消首帧流程，刷新可能退还的冻结积分。
+ * @param sid 片段 ID
+ * @param rid 首帧流程 ID
+ * @param input 当前流程版本
+ * @returns 流程快照
+ */
+export async function cancelSegmentFrameRun(
+  sid: string,
+  rid: string,
+  input: CancelFrameRunInput,
+): Promise<SegmentFrameRun> {
+  const result = await cancelFrameRun(sid, rid, input);
+  acceptTasks([]);
+  return result;
 }
 
 /**

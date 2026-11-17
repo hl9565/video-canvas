@@ -58,8 +58,16 @@ function useBlockedReason(): string | null {
  * 生成的是当前选中的片段；积分不够时数字标红，原因写在悬停提示里。
  */
 export function GenerateControls() {
-  const { selected, credits, quoteState, availableCredits, actions, submitting, video } =
-    useStudio();
+  const {
+    selected,
+    credits,
+    quoteState,
+    availableCredits,
+    actions,
+    submitting,
+    video,
+    frameRunDrawer,
+  } = useStudio();
   const blocked = useBlockedReason();
   const busy = !!selected && (submitting.has(selected.id) || selected.status === "running");
   const out = !!selected && hasVideo(selected);
@@ -99,6 +107,15 @@ export function GenerateControls() {
           刷新报价
         </Button>
       )}
+      <Button
+        type="button"
+        size="sm"
+        variant="outline"
+        disabled={!selected || !frameRunDrawer}
+        onClick={() => selected && frameRunDrawer?.open(selected.id)}
+      >
+        首帧控镜
+      </Button>
       <Button
         size="sm"
         disabled={!!blocked}

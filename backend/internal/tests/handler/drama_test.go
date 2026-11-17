@@ -60,6 +60,21 @@ func (r *httpDramaRepo) Jobs(_ context.Context, userID, dramaID uint64, active b
 	}
 	return rows, nil
 }
+func (r *httpDramaRepo) ActiveFrameRunsBySegments(context.Context, uint64, []uint64) ([]model.DramaSegmentFrameRun, error) {
+	return nil, nil
+}
+func (r *httpDramaRepo) FrameRunsBySegment(context.Context, uint64, uint64) ([]model.DramaSegmentFrameRun, error) {
+	return nil, nil
+}
+func (r *httpDramaRepo) TasksByIDs(context.Context, uint64, []uint64) ([]model.GenerationTask, error) {
+	return nil, nil
+}
+func (r *httpDramaRepo) ListTakeLinks(context.Context, uint64, uint64) ([]model.DramaSegmentTakeLink, error) {
+	return nil, nil
+}
+func (r *httpDramaRepo) ComposeAsset(_ context.Context, userID, id uint64) (*model.Asset, error) {
+	return &model.Asset{ID: id, UserID: userID, Kind: model.KindVideo, Sha256: strings.Repeat("a", 64)}, nil
+}
 
 func httpDramaRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)

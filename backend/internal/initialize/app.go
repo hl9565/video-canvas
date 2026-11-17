@@ -52,7 +52,8 @@ type App struct {
 	rdb    *redis.Client
 	server *http.Server
 
-	marketing *service.MarketingService
+	marketing      *service.MarketingService
+	dramaFrameRuns *service.DramaFrameRunService
 
 	hub        *ws.Hub                  // WebSocket 连接管理，退出时需要显式关闭（Shutdown 不会等已劫持的连接）
 	taskQueue  *queue.Runtime           // 生成任务队列（River）：本实例是否执行任务由 ai.worker.enabled 决定，但入队和后台操作总是可用
@@ -185,7 +186,10 @@ func NewApp(cfg *config.Config) (*App, error) {
 	skillSvc := agentsvc.NewSkillService(repository.NewAgentSkillRepository(db), storeRegistry, auditRepo, agentsvc.SkillOptions{})
 	dramaRepo := repository.NewDramaRepository(db)
 	dramaCanvasSvc := service.NewDramaCanvasService(repository.NewDramaCanvasRepository(db), hub)
-	dramaSegments := service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: dramaRepo, Tasks: taskSvc, Assets: assetSvc, Probes: repository.NewAssetMediaProbeRepository(db), ProbeVideo: newVideoFrames().ProbeNormalized24FPS, Broadcaster: hub})
+	dramaSegments := service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: dramaRepo, Canvases: canvasProjectRepo, Tasks: taskSvc, Assets: assetSvc, Probes: repository.NewAssetMediaProbeRepository(db), ProbeVideo: newVideoFrames().ProbeNormalized24FPS, Broadcaster: hub})
+	dramaFrameRuns := service.NewDramaFrameRunService(service.DramaFrameRunDeps{Repo: dramaRepo, Canvases: canvasProjectRepo, Tasks: taskSvc,
+		Registry: aiCfgSvc, Assets: assetSvc, Segments: dramaSegments, Broadcaster: hub, TicketSecret: cfg.JWT.Secret})
+	dramaSegments.SetFrameRunEnricher(dramaFrameRuns)
 	// 短剧和环节协议层共用同一个 LLM 网关实例，渠道限流（RPS / 并发）才是对两者合计生效。
 	textGateway := llmgateway.New(llmgateway.Options{IPAllowed: outboundIPPolicy(cfg), Observer: llmlog.Observer{}})
 	dramaSvc := service.NewDramaService(service.DramaDeps{
@@ -215,8 +219,9 @@ func NewApp(cfg *config.Config) (*App, error) {
 		Repo: marketingRepo, Steps: stepRegistry, Resolver: stepSvc.Resolver(), Caller: stepCaller, Models: aiCfgSvc,
 		Assets: assetSvc, Tasks: taskSvc, Canvases: canvasProjectSvc, Frames: newVideoFrames(), Credits: settingsSvc, Broadcaster: hub,
 	}, service.WithMarketingLegacyNullLeaseDrainCompleted(cfg.Marketing.LegacyDrainCompleted))
-	// 生成任务的关联业务观察者：短剧片段和营销脚本各按节点前缀认领自己的任务。
-	taskSvc.SetTaskObserver(service.TaskObservers{dramaSegments, marketingSvc})
+	// 生成任务的关联业务观察者与首帧取消守卫：短剧片段和营销脚本各按节点前缀认领自己的任务。
+	taskSvc.SetFrameRunCancelGuard(dramaRepo)
+	taskSvc.SetTaskObserver(service.TaskObservers{dramaFrameRuns, dramaSegments, marketingSvc})
 
 	// 配置服务反向依赖插件宿主与任务服务，所以组装完后再注入。
 	aiCfgSvc.SetDryRunner(executor)
@@ -355,6 +360,7 @@ func NewApp(cfg *config.Config) (*App, error) {
 		AdminFormatter:  handler.NewAdminFormatterHandler(),
 		Marketing:       handler.NewMarketingHandler(marketingSvc),
 		DramaSegment:    handler.NewDramaSegmentHandler(dramaSegments),
+		DramaFrameRun:   handler.NewDramaFrameRunHandler(dramaFrameRuns),
 		CanvasTransfer: handler.NewCanvasTransferHandler(service.NewCanvasTransferService(service.CanvasTransferDeps{
 			Canvases: canvasProjectRepo, Assets: assetSvc,
 			Tx: repository.NewCanvasTransferRepository(db), AppVersion: version.Version,
@@ -411,22 +417,23 @@ func NewApp(cfg *config.Config) (*App, error) {
 	})
 
 	return &App{
-		marketing:  marketingSvc,
-		fx:         fx.New(pricingRepo, outboundIPPolicy(cfg)),
-		drama:      dramaSvc,
-		cfg:        cfg,
-		db:         db,
-		rdb:        rdb,
-		hub:        hub,
-		agent:      agentRT,
-		skills:     skillSvc,
-		taskQueue:  taskQueue,
-		queueConn:  queueConn,
-		runnerStop: runnerStop,
-		assets:     assetSvc,
-		loginLogs:  service.NewLoginLogCleaner(userRepo),
-		observe:    observeSvc,
-		payment:    pay.svc,
+		dramaFrameRuns: dramaFrameRuns,
+		marketing:      marketingSvc,
+		fx:             fx.New(pricingRepo, outboundIPPolicy(cfg)),
+		drama:          dramaSvc,
+		cfg:            cfg,
+		db:             db,
+		rdb:            rdb,
+		hub:            hub,
+		agent:          agentRT,
+		skills:         skillSvc,
+		taskQueue:      taskQueue,
+		queueConn:      queueConn,
+		runnerStop:     runnerStop,
+		assets:         assetSvc,
+		loginLogs:      service.NewLoginLogCleaner(userRepo),
+		observe:        observeSvc,
+		payment:        pay.svc,
 		server: &http.Server{
 			Addr:         cfg.Server.Addr(),
 			Handler:      engineHTTP,
@@ -551,6 +558,12 @@ func (a *App) Run(ctx context.Context) error {
 	marketingDone := make(chan struct{})
 	go func() { defer close(marketingDone); a.maintainMarketing(marketingCtx) }()
 	defer func() { marketingCancel(); <-marketingDone }()
+
+	// 首帧流程恢复与营销扫描共用启动、取消和退出等待约定。
+	dramaFrameCtx, dramaFrameCancel := context.WithCancel(ctx)
+	dramaFrameDone := make(chan struct{})
+	go func() { defer close(dramaFrameDone); a.maintainDramaFrameRuns(dramaFrameCtx) }()
+	defer func() { dramaFrameCancel(); <-dramaFrameDone }()
 
 	// 生成任务队列：状态全在 DB 里，重启后自然接着处理（对账会把没有 job 的任务补上）；退出时先停 HTTP 再等在途任务处理完，最后才关库
 	queueCtx, queueCancel := context.WithCancel(context.Background())

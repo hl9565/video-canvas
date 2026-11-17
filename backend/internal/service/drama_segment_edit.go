@@ -39,7 +39,7 @@ func (s *DramaSegmentService) Create(ctx context.Context, userID, dramaID uint64
 // Update 按版本更新片段，事务外探测源帧数，锁内校验采用与编辑并单次递增集版本。
 func (s *DramaSegmentService) Update(ctx context.Context, userID, sid uint64, req *model.UpdateDramaSegmentReq) (*model.DramaSegmentView, error) {
 	// 1. 先解析媒体缓存；探测不得占用项目、集或片段的数据库锁。
-	if req == nil || req.Revision < 1 || (req.Seconds != nil && *req.Seconds < 1) {
+	if req == nil || req.Revision < 1 || (req.Seconds != nil && *req.Seconds < 1) || req.ClearChosen && req.ChosenTaskID != nil {
 		return nil, errcode.ErrInvalidParams
 	}
 	frames, err := s.resolveUpdateFrames(ctx, userID, sid, req)
@@ -55,31 +55,13 @@ func (s *DramaSegmentService) Update(ctx context.Context, userID, sid uint64, re
 		if row.Revision != req.Revision || !matchesExpectedTask(row, req) {
 			return errcode.ErrCanvasConflict
 		}
-		if err := updateSegmentTake(ctx, tx, p, row, req); err != nil {
+		if err := s.updateSegmentTake(ctx, tx, p, row, req); err != nil {
 			return err
 		}
 		if err := applySegmentUpdate(row, req, frames); err != nil {
 			return err
 		}
-		flippedSchema := req.Edit != nil && ep.EditSchema == 0
-		if flippedSchema {
-			rev := ep.Revision
-			ep.EditSchema = 1
-			if err := tx.SaveEpisode(ctx, ep, rev); err != nil {
-				return err
-			}
-		}
-		if bt, ok := tx.(segmentBatchVersionTx); ok {
-			changed, err := bt.SaveSegmentNoBump(ctx, row, req.Revision)
-			if err != nil {
-				return err
-			}
-			if changed || flippedSchema {
-				return bt.BumpSegmentVersion(ctx, row.UserID, row.EpisodeID)
-			}
-			return nil
-		}
-		return tx.SaveSegment(ctx, row, req.Revision)
+		return saveSegmentUpdate(ctx, tx, row, ep, req)
 	})
 	if err != nil {
 		return nil, segmentError(err)
@@ -173,16 +155,6 @@ func (s *DramaSegmentService) Order(ctx context.Context, userID, dramaID uint64,
 	return views, nil
 }
 
-// validSegmentTake 只允许本次归属查询得到的成功视频任务，失败、其他片段或空ID均不接受。
-func validSegmentTake(tasks []model.GenerationTask, id uint64) bool {
-	for i := range tasks {
-		if tasks[i].ID == id && tasks[i].Status == model.TaskSucceeded && tasks[i].Kind == model.KindVideo {
-			return true
-		}
-	}
-	return false
-}
-
 // segmentBatchVersionTx 允许事务内多片段操作只在提交前递增一次 episode.segment_version。
 type segmentBatchVersionTx interface {
 	SaveSegmentNoBump(context.Context, *model.DramaSegment, int64) (bool, error)
@@ -259,6 +231,30 @@ func saveDramaSegmentOrder(ctx context.Context, tx repository.DramaTx, rows []mo
 	}
 	if hasBatch && reordered && len(rows) > 0 {
 		return bt.BumpSegmentVersion(ctx, rows[0].UserID, rows[0].EpisodeID)
+	}
+	return nil
+}
+
+// saveSegmentUpdate 将精裁 schema 升级与段 CAS 一并保存，媒体变更时集版本只递增一次。
+func saveSegmentUpdate(ctx context.Context, tx repository.DramaTx, row *model.DramaSegment, ep *model.DramaEpisode, req *model.UpdateDramaSegmentReq) error {
+	flippedSchema := req.Edit != nil && ep.EditSchema == 0
+	if flippedSchema {
+		rev := ep.Revision
+		ep.EditSchema = 1
+		if err := tx.SaveEpisode(ctx, ep, rev); err != nil {
+			return err
+		}
+	}
+	bt, ok := tx.(segmentBatchVersionTx)
+	if !ok {
+		return tx.SaveSegment(ctx, row, req.Revision)
+	}
+	changed, err := bt.SaveSegmentNoBump(ctx, row, req.Revision)
+	if err != nil {
+		return err
+	}
+	if changed || flippedSchema {
+		return bt.BumpSegmentVersion(ctx, row.UserID, row.EpisodeID)
 	}
 	return nil
 }

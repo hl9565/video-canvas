@@ -15,6 +15,7 @@ import { useAgentHost } from "./agent-host";
 import { AgentLauncher } from "./chrome/agent-launcher";
 import { BottomToolbar } from "./chrome/bottom-toolbar";
 import { EmptyState } from "./chrome/empty-state";
+import { DramaFrameBridge } from "./chrome/drama-frame-bridge";
 import { PetLayer } from "./pet/pet-layer";
 import { ShortcutsDialog } from "./chrome/shortcuts-dialog";
 import { StatsBar } from "./chrome/stats-bar";
@@ -45,6 +46,7 @@ export function CanvasChrome() {
 
   return (
     <>
+      <DramaFrameBridge />
       {editor.nodes.length === 0 && (
         <EmptyState onAdd={editor.addAtCenter} onUpload={editor.uploadAtCenter} />
       )}

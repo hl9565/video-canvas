@@ -61,9 +61,16 @@ export function useWorkspaceNav(
       // 总览也保留集号：从总览再点回别的工序时，还停在刚才那一集
       next.set("ep", String(nextEp));
       if (nextDoc) next.set("doc", nextDoc);
+      /** 保留画布返回的定位上下文；主动切集或离开片场时清除。 */
+      if (nextStage === "studio" && nextEp === ep) {
+        for (const name of ["segment", "frame_run"]) {
+          const value = params.get(name);
+          if (value) next.set(name, value);
+        }
+      }
       setParams(next, { replace: true });
     },
-    [setParams],
+    [ep, params, setParams],
   );
 
   const go = useCallback<WorkspaceNav["go"]>(
@@ -93,8 +100,13 @@ export function useWorkspaceNav(
 
   const loaded = drama !== null;
   useEffect(() => {
-    if (loaded && area === null) write(stage, ep);
-  }, [loaded, area, stage, ep, write]);
+    if (!loaded || area !== null) return;
+    /** 首次规范化只补导航字段，画布返回的片段 / 流程上下文不能丢失。 */
+    const next = new URLSearchParams(params);
+    next.set("area", stage);
+    next.set("ep", String(ep));
+    setParams(next, { replace: true });
+  }, [loaded, area, stage, ep, params, setParams]);
 
   return { stage, ep, doc, go, setEp, openDoc };
 }

@@ -491,6 +491,236 @@ export interface BackendSegmentTake {
   asset: BackendAssetDto | null;
   error_message: string;
   created_at: string;
+  /** 候选来源；旧响应缺省为 native */
+  origin?: TakeOrigin;
+  /** 人工质检；旧响应缺省为 unreviewed */
+  qc?: TakeQC;
+  /** 所属首帧流程 */
+  run_id?: string;
+  /** 来源画布 */
+  source_canvas_id?: string;
+  /** 实际首帧素材 */
+  frame_asset_id?: number | string;
+}
+
+/** 候选来源：首帧 I2V、画布导入、直接生成。 */
+export type TakeOrigin = "i2v" | "canvas_import" | "native";
+/** 人工质检结果。 */
+export type TakeQC = "unreviewed" | "accepted" | "rejected";
+/** 首帧来源。 */
+export type FrameSource = "existing" | "generate" | "canvas";
+/** 首帧确认、提交与绑定流程的持久状态。 */
+export type FrameRunState =
+  | "draft"
+  | "frame_pending"
+  | "frame_ready"
+  | "confirmed"
+  | "submitting"
+  | "video_pending"
+  | "bound"
+  | "failed"
+  | "cancelled";
+
+/** 后端首帧控镜快照；不含报价令牌和内部任务幂等键。 */
+export interface BackendSegmentFrameRun {
+  /** 流程 ID */
+  id: string;
+  /** 片段 ID */
+  segment_id: string;
+  /** 客户端幂等键 */
+  request_key: string;
+  /** 首帧来源 */
+  frame_source: FrameSource;
+  /** 流程状态 */
+  state: FrameRunState;
+  /** 确认基线的片段版本 */
+  segment_revision: number;
+  /** 流程 CAS 版本 */
+  revision: number;
+  /** 确认快照版本，0 为未确认 */
+  confirmed_version: number;
+  /** 视频模型 key */
+  model_key: string;
+  /** 来源画布 */
+  origin_canvas_id?: string;
+  /** 首帧生成任务 */
+  frame_task_id?: string;
+  /** 实际送入模型的首帧素材 */
+  frame_asset_id?: number | string;
+  /** 视频生成任务 */
+  video_task_id?: string;
+  /** 当前无采用时自动采用 */
+  adopt_if_empty: boolean;
+  /** 实际首帧内容指纹 */
+  frame_sha256?: string;
+  /** 画布回传授权票据 */
+  canvas_ticket?: string;
+  /** 已冻结的生成输入 */
+  confirmed_input?: Record<string, unknown>;
+  /** 提交开始时间 */
+  submitting_at?: string | null;
+  /** 失败码 */
+  error_code: string;
+  /** 失败原因 */
+  error_message: string;
+  /** 创建时间 */
+  created_at: string;
+  /** 更新时间 */
+  updated_at: string;
+}
+
+/** 前端首帧控镜快照。 */
+export interface SegmentFrameRun {
+  /** 流程 ID */
+  id: string;
+  /** 片段 ID */
+  segmentId: string;
+  /** 客户端幂等键 */
+  requestKey: string;
+  /** 首帧来源 */
+  frameSource: FrameSource;
+  /** 流程状态 */
+  state: FrameRunState;
+  /** 片段版本基线 */
+  segmentRevision: number;
+  /** 流程 CAS 版本 */
+  revision: number;
+  /** 确认版本，0 为未确认 */
+  confirmedVersion: number;
+  /** 视频模型 key */
+  modelKey: string;
+  /** 来源画布 */
+  originCanvasId?: string;
+  /** 首帧生成任务 */
+  frameTaskId?: string;
+  /** 实际 16:9 首帧素材 */
+  frameAssetId?: string;
+  /** 视频生成任务 */
+  videoTaskId?: string;
+  /** 无采用时自动采用 */
+  adoptIfEmpty: boolean;
+  /** 首帧 SHA-256 */
+  frameSha256?: string;
+  /** 画布回传票据 */
+  canvasTicket?: string;
+  /** 已确认的生成输入 */
+  confirmedInput?: Record<string, unknown>;
+  /** 提交开始时间 */
+  submittingAt?: string | null;
+  /** 失败码 */
+  errorCode: string;
+  /** 失败原因 */
+  errorMessage: string;
+  /** 创建时间 */
+  createdAt: string;
+  /** 更新时间 */
+  updatedAt: string;
+}
+
+/** 创建流程；网络重试必须复用 requestKey 和同一请求体。 */
+export interface CreateFrameRunInput {
+  /** 幂等键，最长 96 字符 */
+  requestKey: string;
+  /** 片段版本 */
+  segmentRevision: number;
+  /** 首帧来源 */
+  frameSource: FrameSource;
+  /** 已有素材 */
+  frameAssetId?: string;
+  /** 来源画布 */
+  originCanvasId?: string;
+  /** 生成首帧图片的模型 */
+  modelId?: string;
+  /** 图片生成参数 */
+  input?: Record<string, unknown>;
+  /** 无采用时自动采用 */
+  adoptIfEmpty?: boolean;
+}
+
+/** 设置首帧，服务端裁为 16:9 并作废旧确认。 */
+export interface SetFrameRunFrameInput {
+  /** 流程版本 */
+  revision: number;
+  /** 新素材 ID */
+  frameAssetId: string;
+  /** 来源画布 */
+  originCanvasId?: string;
+  /** 画布回传票据 */
+  canvasTicket?: string;
+}
+
+/** 确认首帧及报价，冻结 I2V 输入。 */
+export interface ConfirmFrameRunInput {
+  /** 流程版本 */
+  revision: number;
+  /** 当前片段版本 */
+  segmentRevision?: number;
+  /** 当前实际首帧素材 */
+  frameAssetId?: string;
+  /** 首帧指纹 */
+  frameSha256: string;
+  /** 无采用时自动采用 */
+  adoptIfEmpty?: boolean;
+  /** 固定视频模型 */
+  modelId?: string;
+  /** I2V 输入 */
+  input: Record<string, unknown>;
+  /** 服务端报价令牌 */
+  quoteToken: string;
+}
+
+/** 提交只接受已确认版本，禁止携带新输入。 */
+export interface SubmitFrameRunInput {
+  /** 流程版本 */
+  revision: number;
+  /** 确认版本 */
+  confirmedVersion: number;
+}
+
+/** 取消流程的 CAS 基线。 */
+export interface CancelFrameRunInput {
+  /** 流程版本 */
+  revision: number;
+}
+
+/** 视频提交结果。 */
+export interface SubmitFrameRunResult {
+  /** 更新后的流程 */
+  run: SegmentFrameRun;
+  /** 任务快照，交给 gateway 入库 */
+  task: TaskView;
+}
+
+/** 从用户画布补入成功视频候选。 */
+export interface ImportSegmentTakesInput {
+  /** 片段版本 */
+  revision: number;
+  /** 来源画布 */
+  sourceCanvasId: string;
+  /** 单个任务 ID */
+  taskId?: string;
+  /** 多个任务 ID */
+  taskIds?: string[];
+  /** 导入并采用，仅限单条 */
+  adopt?: boolean;
+  /** 换镜时是否重置剪辑 */
+  resetEditOnTaskChange?: boolean;
+}
+
+/** 候选质检与当前采用项处置。 */
+export interface PatchTakeQCInput {
+  /** 片段版本 */
+  revision: number;
+  /** 质检结果 */
+  qc: TakeQC;
+  /** 集级内容版本 */
+  expectedSegmentVersion?: number;
+  /** 显式替换采用 */
+  replacementTaskId?: string;
+  /** 显式清空采用 */
+  clearChosen?: boolean;
+  /** 换镜时是否重置剪辑 */
+  resetEditOnTaskChange?: boolean;
 }
 
 export interface BackendSegmentEdit {
@@ -527,6 +757,10 @@ export interface BackendSegmentView {
   prompt: string;
   takes: BackendSegmentTake[] | null;
   chosen_task_id: string;
+  /** 用户显式清空了采用 */
+  chosen_cleared?: boolean;
+  /** 活跃或最近一轮首帧流程 */
+  frame_run?: BackendSegmentFrameRun | null;
   /** 规范化 24fps 源视频帧数；尚未探测或无视频时为 null */
   source_frame_count?: number | null;
   /** 采用视频是否含音轨 */
@@ -574,6 +808,16 @@ export interface SegmentTake {
   asset: AssetDto | null;
   errorMessage: string;
   createdAt: string;
+  /** 来源，省略视为直接生成 */
+  origin?: TakeOrigin;
+  /** 质检，省略视为待质检 */
+  qc?: TakeQC;
+  /** 所属首帧流程 */
+  runId?: string;
+  /** 来源画布 */
+  sourceCanvasId?: string;
+  /** 实际首帧素材 */
+  frameAssetId?: string;
 }
 
 export interface Segment {
@@ -590,6 +834,10 @@ export interface Segment {
   takes: SegmentTake[];
   /** 采用的那一条；空串 = 没有 */
   chosenTaskId: string;
+  /** 用户显式清空了采用 */
+  chosenCleared?: boolean;
+  /** 活跃或最近一轮首帧流程 */
+  frameRun?: SegmentFrameRun | null;
   /** 规范化 24fps 源视频总帧数（未探测 / 无视频为 null；旧测试夹具可省略） */
   sourceFrameCount?: number | null;
   /** 源视频是否含音轨；未知为 undefined，明确 false 时提示无原声 */
@@ -610,7 +858,9 @@ export interface UpdateSegmentInput {
   revision: number;
   prompt?: string;
   seconds?: number;
-  chosenTaskId?: string;
+  chosenTaskId?: string | null;
+  /** 显式清空当前采用 */
+  clearChosen?: boolean;
   /** 期望当前采用的任务 id（"" 或 null 表示尚未采用）；不匹配时后端返回 409 */
   expectedTaskId?: string | null;
   /** 切换采用任务时是否重置剪辑字段（默认 true，显式传 false 可保留当前剪辑） */

@@ -161,9 +161,10 @@ func TestDramaSegmentService_ManualChoiceSurvivesLaterSuccess(t *testing.T) {
 	}
 	canvas := uint64(9)
 	node := "seg:" + idcodec.Encode(uint64(v.ID))
+	output, _ := json.Marshal([]model.TaskOutput{{AssetID: 41, MediaType: "video"}})
 	r.Tasks = []model.GenerationTask{
-		{ID: 21, UserID: 1, CanvasProjectID: &canvas, NodeID: node, Kind: "video", Status: "succeeded", CreatedAt: time.Unix(1, 0)},
-		{ID: 22, UserID: 1, CanvasProjectID: &canvas, NodeID: node, Kind: "video", Status: "succeeded", CreatedAt: time.Unix(2, 0)},
+		{ID: 21, UserID: 1, CanvasProjectID: &canvas, NodeID: node, Kind: "video", Status: "succeeded", OutputJSON: output, CreatedAt: time.Unix(1, 0)},
+		{ID: 22, UserID: 1, CanvasProjectID: &canvas, NodeID: node, Kind: "video", Status: "succeeded", OutputJSON: output, CreatedAt: time.Unix(2, 0)},
 	}
 	views, err := s.List(ctx, 1, 7, 1)
 	if err != nil {
@@ -174,7 +175,7 @@ func TestDramaSegmentService_ManualChoiceSurvivesLaterSuccess(t *testing.T) {
 	if err != nil || selected.ChosenTaskID != idcodec.Encode(22) {
 		t.Fatalf("手动采用成功结果：%+v %v", selected, err)
 	}
-	r.Tasks = append(r.Tasks, model.GenerationTask{ID: 23, UserID: 1, CanvasProjectID: &canvas, NodeID: node, Kind: "video", Status: "succeeded", CreatedAt: time.Unix(3, 0)})
+	r.Tasks = append(r.Tasks, model.GenerationTask{ID: 23, UserID: 1, CanvasProjectID: &canvas, NodeID: node, Kind: "video", Status: "succeeded", OutputJSON: output, CreatedAt: time.Unix(3, 0)})
 	if err := s.OnTaskChanged(ctx, &r.Tasks[2]); err != nil {
 		t.Fatal(err)
 	}

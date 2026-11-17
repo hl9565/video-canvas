@@ -19,6 +19,15 @@ import {
   toJobBody,
   toSegmentUpdateBody,
   updateSegment,
+  getSegment,
+  createFrameRun,
+  getFrameRun,
+  setFrameRunFrame,
+  confirmFrameRun,
+  submitFrameRun,
+  cancelFrameRun,
+  importSegmentTakes,
+  patchTakeQC,
 } from "@/api/drama";
 import {
   DRAMA_ERR,
@@ -30,7 +39,7 @@ import {
   isQuoteExpiredError,
   isRevisionConflict,
 } from "@/api/drama/errors";
-import type { BackendSegmentView } from "@/api/drama/type";
+import type { BackendSegmentFrameRun, BackendSegmentView } from "@/api/drama/type";
 import { ApiError } from "@/utils/requests/request";
 import service from "@/utils/requests/service";
 import { submitSegmentTask } from "@/utils/tasks/gateway";
@@ -74,6 +83,244 @@ const rawSegment = (patch: Partial<BackendSegmentView> = {}): BackendSegmentView
   revision: 1,
   updated_at: "2026-10-28T10:05:00Z",
   ...patch,
+});
+
+const rawRun = (patch: Partial<BackendSegmentFrameRun> = {}): BackendSegmentFrameRun => ({
+  id: "r1",
+  segment_id: "5d2a",
+  request_key: "req-1",
+  frame_source: "canvas",
+  state: "frame_ready",
+  segment_revision: 2,
+  revision: 3,
+  confirmed_version: 0,
+  model_key: "m-1c89decdf8fd",
+  origin_canvas_id: "c1",
+  frame_asset_id: "f1",
+  frame_sha256: "a".repeat(64),
+  adopt_if_empty: true,
+  canvas_ticket: "ticket&1",
+  error_code: "",
+  error_message: "",
+  created_at: "t1",
+  updated_at: "t2",
+  ...patch,
+});
+
+describe("Stage B 首帧控镜 API 契约", () => {
+  test("映射来源、质检、清空采用与完整首帧快照，旧响应兼容", () => {
+    const raw = rawSegment({ chosen_cleared: true, frame_run: rawRun() });
+    raw.takes![0] = {
+      ...raw.takes![0]!,
+      origin: "i2v",
+      qc: "rejected",
+      run_id: "r1",
+      source_canvas_id: "c1",
+      frame_asset_id: "f1",
+    };
+    const seg = mapSegment(raw);
+    expect(seg.chosenCleared).toBe(true);
+    expect(seg.takes[0]).toMatchObject({
+      origin: "i2v",
+      qc: "rejected",
+      runId: "r1",
+      sourceCanvasId: "c1",
+      frameAssetId: "f1",
+    });
+    expect(seg.frameRun).toMatchObject({
+      id: "r1",
+      segmentId: "5d2a",
+      requestKey: "req-1",
+      frameSource: "canvas",
+      state: "frame_ready",
+      segmentRevision: 2,
+      revision: 3,
+      confirmedVersion: 0,
+      modelKey: "m-1c89decdf8fd",
+      originCanvasId: "c1",
+      frameAssetId: "f1",
+      frameSha256: "a".repeat(64),
+      canvasTicket: "ticket&1",
+      adoptIfEmpty: true,
+    });
+    expect(mapSegment(rawSegment()).frameRun).toBeNull();
+    expect(mapSegment(rawSegment()).takes[0]).toMatchObject({ origin: "native", qc: "unreviewed" });
+    expect(toSegmentUpdateBody({ revision: 2, clearChosen: true, expectedTaskId: "t1" })).toEqual({
+      revision: 2,
+      clear_chosen: true,
+      expected_task_id: "t1",
+    });
+    expect(toSegmentUpdateBody({ revision: 2, clearChosen: false })).toEqual({ revision: 2 });
+  });
+
+  test("所有首帧路由映射 camelCase 请求，提交仅发送确认版本", async () => {
+    const get = spyOn(service, "get").mockResolvedValue(rawSegment());
+    const post = spyOn(service, "post").mockResolvedValue(rawRun());
+    try {
+      expect((await getSegment("5d2a")).id).toBe("5d2a");
+      expect(get.mock.calls[0][0]).toBe("/drama-segments/5d2a");
+      const created = await createFrameRun("5d2a", {
+        requestKey: "req-1",
+        segmentRevision: 2,
+        frameSource: "generate",
+        frameAssetId: "f1",
+        originCanvasId: "c1",
+        modelId: "image-1",
+        input: { prompt: "图" },
+        adoptIfEmpty: false,
+      });
+      expect(created.frameSha256).toBe("a".repeat(64));
+      expect(post.mock.calls[0]).toEqual([
+        "/drama-segments/5d2a/frame-runs",
+        {
+          request_key: "req-1",
+          segment_revision: 2,
+          frame_source: "generate",
+          frame_asset_id: "f1",
+          origin_canvas_id: "c1",
+          model_id: "image-1",
+          input: { prompt: "图" },
+          adopt_if_empty: false,
+        },
+        { silent: true },
+      ]);
+      get.mockResolvedValue(rawRun());
+      expect((await getFrameRun("5d2a", "r1")).revision).toBe(3);
+      expect(get.mock.calls[1][0]).toBe("/drama-segments/5d2a/frame-runs/r1");
+      await setFrameRunFrame("5d2a", "r1", {
+        revision: 3,
+        frameAssetId: "f2",
+        originCanvasId: "c1",
+        canvasTicket: "ticket&1",
+      });
+      expect(post.mock.calls[1][0]).toBe("/drama-segments/5d2a/frame-runs/r1/frame");
+      expect(post.mock.calls[1][1]).toEqual({
+        revision: 3,
+        frame_asset_id: "f2",
+        origin_canvas_id: "c1",
+        canvas_ticket: "ticket&1",
+      });
+      const input = {
+        op: "i2v",
+        aspect_ratio: "16:9",
+        count: 1,
+        images: ["f2"],
+        prompt: "推镜",
+        duration: 5,
+        resolution: "720P",
+      };
+      await confirmFrameRun("5d2a", "r1", {
+        revision: 4,
+        segmentRevision: 2,
+        frameAssetId: "f2",
+        frameSha256: "b".repeat(64),
+        adoptIfEmpty: true,
+        modelId: "m-1c89decdf8fd",
+        input,
+        quoteToken: "qt",
+      });
+      expect(post.mock.calls[2][0]).toBe("/drama-segments/5d2a/frame-runs/r1/confirm");
+      expect(post.mock.calls[2][1]).toEqual({
+        revision: 4,
+        segment_revision: 2,
+        frame_asset_id: "f2",
+        frame_sha256: "b".repeat(64),
+        adopt_if_empty: true,
+        model_id: "m-1c89decdf8fd",
+        input,
+        quote_token: "qt",
+      });
+      post.mockResolvedValueOnce({
+        run: rawRun({ state: "video_pending", confirmed_version: 1 }),
+        task: { id: "t1" },
+      });
+      expect(
+        (await submitFrameRun("5d2a", "r1", { revision: 5, confirmedVersion: 1 })).run
+          .confirmedVersion,
+      ).toBe(1);
+      expect(post.mock.calls[3]).toEqual([
+        "/drama-segments/5d2a/frame-runs/r1/submit",
+        { revision: 5, confirmed_version: 1 },
+        { silent: true },
+      ]);
+      await cancelFrameRun("5d2a", "r1", { revision: 6 });
+      expect(post.mock.calls[4]).toEqual([
+        "/drama-segments/5d2a/frame-runs/r1/cancel",
+        { revision: 6 },
+        { silent: true },
+      ]);
+    } finally {
+      get.mockRestore();
+      post.mockRestore();
+    }
+  });
+
+  test("导入与质检保留 CAS、显式清空和保留剪辑选项", async () => {
+    const post = spyOn(service, "post").mockResolvedValue(rawSegment({ segment_version: 8 }));
+    const patch = spyOn(service, "patch").mockResolvedValue(rawSegment({ chosen_cleared: true }));
+    try {
+      expect(
+        (
+          await importSegmentTakes("5d2a", {
+            revision: 2,
+            sourceCanvasId: "c2",
+            taskId: "t1",
+            taskIds: ["t1", "t2"],
+            adopt: false,
+            resetEditOnTaskChange: false,
+          })
+        ).segmentVersion,
+      ).toBe(8);
+      expect(post.mock.calls[0]).toEqual([
+        "/drama-segments/5d2a/takes/import",
+        {
+          revision: 2,
+          source_canvas_id: "c2",
+          task_id: "t1",
+          task_ids: ["t1", "t2"],
+          adopt: false,
+          reset_edit_on_task_change: false,
+        },
+        { silent: true },
+      ]);
+      await patchTakeQC("5d2a", "t1", {
+        revision: 3,
+        qc: "rejected",
+        expectedSegmentVersion: 8,
+        replacementTaskId: "t2",
+        clearChosen: true,
+        resetEditOnTaskChange: false,
+      });
+      expect(patch.mock.calls[0]).toEqual([
+        "/drama-segments/5d2a/takes/t1",
+        {
+          revision: 3,
+          qc: "rejected",
+          expected_segment_version: 8,
+          replacement_task_id: "t2",
+          clear_chosen: true,
+          reset_edit_on_task_change: false,
+        },
+        { silent: true },
+      ]);
+    } finally {
+      post.mockRestore();
+      patch.mockRestore();
+    }
+  });
+
+  test("91004–91008 使用约定错误码和准确文案", () => {
+    for (const [name, code, message] of [
+      ["frameRunNotFound", 91004, "首帧控镜流程不存在"],
+      ["frameRunConflict", 91005, "首帧控镜状态已变更或存在进行中流程"],
+      ["frameRunInconsistent", 91006, "首帧控镜任务归属或确认快照不一致"],
+      ["takeQcRejected", 91007, "该候选已被驳回，无法直接采用"],
+      ["frameInvalid", 91008, "首帧素材无效或尚未就绪"],
+    ] as const) {
+      expect(DRAMA_ERR[name]).toBe(code);
+      expect(dramaErrorMessage(new ApiError("", code, 409))).toBe(message);
+    }
+  });
 });
 
 describe("api/drama：片段 mapper（契约 §9）", () => {

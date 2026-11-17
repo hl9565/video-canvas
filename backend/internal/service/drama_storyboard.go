@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -41,10 +42,11 @@ func checkStoryboardRequest(req *model.DramaJobReq) error {
 	return nil
 }
 
-// checkStoryboardTakes 与片段生成共用project行锁，阻止提交与最终替换覆盖并发产生的take。
-func checkStoryboardTakes(ctx context.Context, tx repository.DramaTx, userID uint64, selected []model.DramaEpisode) error {
+// checkStoryboardTakes 与片段生成共用project行锁，在具备素材读取依赖时复用 ResolveSegmentTakes 统一准入，保留活跃流程占位并忽略悬空孤儿。
+func (s *DramaService) checkStoryboardTakes(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, selected []model.DramaEpisode) error {
+	assets, hasAssets := s.assets.(DramaSegmentAssetReader)
 	for _, ep := range selected {
-		has, err := tx.HasSegmentTakes(ctx, userID, ep.ID)
+		has, err := episodeHasStoryboardTakes(ctx, tx, p, assets, hasAssets, ep.ID)
 		if err != nil {
 			return err
 		}
@@ -53,6 +55,32 @@ func checkStoryboardTakes(ctx context.Context, tx repository.DramaTx, userID uin
 		}
 	}
 	return nil
+}
+
+// episodeHasStoryboardTakes 在持有项目锁的事务内复用 ResolveSegmentTakes 核验单集是否存在有效候选或活跃流程。
+func episodeHasStoryboardTakes(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, assets DramaSegmentAssetReader, hasAssets bool, epID uint64) (bool, error) {
+	if !hasAssets {
+		return tx.HasSegmentTakes(ctx, p.UserID, epID)
+	}
+	segs, err := tx.Segments(ctx, p.UserID, epID)
+	if err != nil {
+		return false, err
+	}
+	for i := range segs {
+		if _, err := tx.ActiveFrameRun(ctx, p.UserID, segs[i].ID, false); err == nil {
+			return true, nil
+		} else if !errors.Is(err, repository.ErrNotFound) {
+			return false, err
+		}
+		takes, err := ResolveSegmentTakes(ctx, tx, assets, p, &segs[i])
+		if err != nil {
+			return false, err
+		}
+		if slices.ContainsFunc(takes, func(take resolvedSegmentTake) bool { return take.SourceEligible }) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // estimateStoryboard 在项目锁下使用与提交一致的前置与take校验，不冻结积分。
@@ -73,7 +101,7 @@ func (s *DramaService) estimateStoryboard(ctx context.Context, userID, id uint64
 		if err != nil {
 			return err
 		}
-		return checkStoryboardTakes(ctx, tx, userID, selected)
+		return s.checkStoryboardTakes(ctx, tx, project, selected)
 	})
 	if err != nil {
 		return 0, dramaError(err)
@@ -193,7 +221,7 @@ func (s *DramaService) storyboardAssets(ctx context.Context, p *model.DramaProje
 }
 
 // saveStoryboardOutput 在project锁内再次校验take，再原子替换全部片段和集状态。
-func saveStoryboardOutput(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, j *model.DramaJob, output drama.StoryboardOutput) error {
+func (s *DramaService) saveStoryboardOutput(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, j *model.DramaJob, output drama.StoryboardOutput) error {
 	eps, err := tx.Episodes(ctx, p.UserID, p.ID)
 	if err != nil {
 		return err
@@ -206,7 +234,7 @@ func saveStoryboardOutput(ctx context.Context, tx repository.DramaTx, p *model.D
 	if err = checkDramaEpisodeStep(ep, "storyboard"); err != nil {
 		return err
 	}
-	if err = checkStoryboardTakes(ctx, tx, p.UserID, selected); err != nil {
+	if err = s.checkStoryboardTakes(ctx, tx, p, selected); err != nil {
 		return err
 	}
 	segments := make([]model.DramaSegment, 0, len(output.Segments))

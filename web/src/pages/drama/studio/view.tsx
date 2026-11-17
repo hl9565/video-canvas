@@ -2,6 +2,8 @@ import { useEffect } from "react";
 import { useDefaultLayout } from "react-resizable-panels";
 
 import type { Drama } from "@/api/drama/type";
+import { FrameRunDrawer } from "@/components/drama/frame-run-drawer";
+import { ImportTakesDialog } from "@/components/drama/import-takes-dialog";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { useMediaQuery } from "@/hooks/use-media-query";
 import { studioColumns } from "@/utils/drama/studio-layout";
@@ -48,7 +50,24 @@ const HANDLE =
  * 上下两块（三栏区 / 时间线）、三栏之间（资产库 / 预览 / 编辑区）都能拖动调整大小，拖好的尺寸记在本机。
  */
 function Shell() {
-  const { segments, select } = useStudio();
+  const {
+    drama,
+    no,
+    segments,
+    selected,
+    select,
+    assets,
+    actions,
+    frameRunDrawer,
+    importTakesModal,
+    frameRunActions,
+  } = useStudio();
+  const frameSegment = frameRunDrawer?.openSegmentId
+    ? (segments.find((segment) => segment.id === frameRunDrawer.openSegmentId) ?? null)
+    : selected;
+  const importSegment = importTakesModal?.openSegmentId
+    ? (segments.find((segment) => segment.id === importTakesModal.openSegmentId) ?? null)
+    : selected;
   const playback = usePlayback(segments);
 
   // 连播切到哪个片段，选中（时间线描边、提示词编辑区）就跟到哪个
@@ -106,6 +125,29 @@ function Shell() {
             <ClipBar />
           </ResizablePanel>
         </ResizablePanelGroup>
+        <FrameRunDrawer
+          open={!!frameRunDrawer?.openSegmentId}
+          onOpenChange={(open) => {
+            if (!open) frameRunDrawer?.close();
+          }}
+          segment={frameSegment}
+          dramaId={drama.id}
+          episodeNo={no}
+          canvasId={drama.canvasId}
+          assets={assets}
+          actions={frameRunActions}
+        />
+        <ImportTakesDialog
+          open={!!importTakesModal?.openSegmentId}
+          onOpenChange={(open) => {
+            if (!open) importTakesModal?.close();
+          }}
+          segment={importSegment}
+          defaultCanvasId={drama.canvasId}
+          onImport={async (input) => {
+            if (importSegment) await actions.importTakes(importSegment, input);
+          }}
+        />
       </div>
     </PlaybackContext.Provider>
   );

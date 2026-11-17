@@ -16,7 +16,7 @@ import (
 // TestDramaMediaIntegration_ConcurrentSegments 验证片段任务插入和项目互斥在同一真实事务，两个并发请求只能接受一个。
 func TestDramaMediaIntegration_ConcurrentSegments(t *testing.T) {
 	e := newGTIEnv(t, defaultTaskLimits())
-	if err := e.db.AutoMigrate(&model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.DramaJob{}); err != nil {
+	if err := e.db.AutoMigrate(&model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.DramaSegmentFrameRun{}, &model.DramaSegmentTakeLink{}, &model.DramaJob{}); err != nil {
 		t.Fatal(err)
 	}
 	p := model.DramaProject{UserID: e.user, CanvasID: 7, Title: "并行测试", SourceText: "原文", StyleKey: "custom"}

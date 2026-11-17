@@ -14,6 +14,9 @@ import (
 
 // DramaTx 短剧业务事务使用的数据库原语。
 type DramaTx interface {
+	DramaFrameRunTx
+	// TasksByIDs 只读取当前用户的正式任务，排除试跑与他人任务。
+	TasksByIDs(context.Context, uint64, []uint64) ([]model.GenerationTask, error)
 	// ComposeAsset 按用户读取事务内合成素材元数据，缺失返回 ErrNotFound。
 	ComposeAsset(context.Context, uint64, uint64) (*model.Asset, error)
 	// RecentDramaBatches 读取最近三次成功规划或拆解的范围，不加载原文及快照。
@@ -185,8 +188,15 @@ func (r *DramaRepository) UpdateProject(ctx context.Context, userID, id uint64, 
 	return nil
 }
 
-// DeleteProject 软删同一用户的项目、画布与各集。角色数据内嵌在画布 payload 里，随画布一起软删，没有需要另行清理的角色卡。
+// DeleteProject 同一事务内停用活跃首帧流程并软删用户项目、画布与各集；没有匹配项目也成功。
 func (r *DramaRepository) DeleteProject(ctx context.Context, userID, id uint64) error {
+	return r.withDramaWriteTx(ctx, func(tx *DramaRepository) error { return tx.deleteProject(ctx, userID, id) })
+}
+
+func (r *DramaRepository) deleteProject(ctx context.Context, userID, id uint64) error {
+	if err := r.CancelProjectFrameRuns(ctx, userID, id); err != nil {
+		return err
+	}
 	if err := r.db.WithContext(ctx).Where("user_id = ? AND drama_id = ?", userID, id).Delete(&model.CanvasProject{}).Error; err != nil {
 		return err
 	}

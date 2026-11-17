@@ -577,7 +577,7 @@ function fieldValueKey(field: ParamEntry): string {
 const NO_JOBS: never[] = [];
 
 /**
- * 片场顶部条：集名、保存状态，右边是当前片段时长、分辨率、seed、比例、「重新生成分镜脚本」，最右是视频模型和「立即生成」。
+ * 片场顶部条：集名、保存状态、规格、重新生成分镜脚本，以及 GenerateControls 内并列的首帧控镜与立即生成。
  * 合成整集挪到了「成片」页；这里只管把片段做出来。
  */
 export function StudioBar() {

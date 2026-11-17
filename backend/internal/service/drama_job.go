@@ -176,7 +176,7 @@ func (s *DramaService) prepareDramaJob(ctx context.Context, tx repository.DramaT
 		return nil, e
 	}
 	if req.Step == "storyboard" {
-		if e := checkStoryboardTakes(ctx, tx, p.UserID, selected); e != nil {
+		if e := s.checkStoryboardTakes(ctx, tx, p, selected); e != nil {
 			return nil, e
 		}
 	}

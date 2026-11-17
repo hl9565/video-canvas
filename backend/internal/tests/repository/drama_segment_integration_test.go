@@ -13,7 +13,7 @@ import (
 )
 
 func TestDramaSegmentRepository_IsolationTakesAndRevision(t *testing.T) {
-	db := isolatedDB(t, &model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.GenerationTask{})
+	db := isolatedDB(t, &model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.DramaSegmentFrameRun{}, &model.DramaSegmentTakeLink{}, &model.GenerationTask{})
 	ctx := context.Background()
 	p := model.DramaProject{UserID: 1, CanvasID: 9, Title: "剧", SourceText: "文", StyleKey: "real_city_film"}
 	if err := db.Create(&p).Error; err != nil {

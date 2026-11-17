@@ -35,6 +35,7 @@ type Handlers struct {
 	AssetLibrary   *handler.AssetLibraryHandler        // 资产库：文件夹、库归属、生成历史
 	Drama          *handler.DramaHandler               // 短剧项目、分集剧本、资产流水线
 	DramaSegment   *handler.DramaSegmentHandler        // 分集片段编辑、排序与视频/首帧生成
+	DramaFrameRun  *handler.DramaFrameRunHandler       // 首帧确认与可恢复视频提交
 	Files          gin.HandlerFunc                     // 素材稳定地址 /files/*：本地存储直出，对象存储签名后 302
 	AIModel        *handler.AIModelHandler             // 面向画布的模型清单
 	AdminAI        *handler.AdminAIHandler             // AI 模型配置管理
@@ -256,11 +257,20 @@ func New(mode, jwtSecret string, h Handlers) *gin.Engine {
 		dramas.POST("/:id/episodes/:no/segments", h.DramaSegment.Create)
 		dramas.PUT("/:id/episodes/:no/segments/order", h.DramaSegment.Order)
 		segments := auth.Group("/drama-segments")
+		segments.GET("/:sid", h.DramaSegment.Get)
 		segments.PATCH("/:sid", h.DramaSegment.Update)
 		segments.DELETE("/:sid", h.DramaSegment.Delete)
 		segments.POST("/:sid/generate", h.DramaSegment.Generate)
 		segments.POST("/:sid/quote", h.DramaSegment.Quote)
 		segments.POST("/:sid/adapt", h.DramaSegment.Adapt)
+		segments.POST("/:sid/frame-runs", h.DramaFrameRun.Create)
+		segments.GET("/:sid/frame-runs/:rid", h.DramaFrameRun.Get)
+		segments.POST("/:sid/frame-runs/:rid/frame", h.DramaFrameRun.SetFrame)
+		segments.POST("/:sid/frame-runs/:rid/confirm", h.DramaFrameRun.Confirm)
+		segments.POST("/:sid/frame-runs/:rid/submit", h.DramaFrameRun.Submit)
+		segments.POST("/:sid/frame-runs/:rid/cancel", h.DramaFrameRun.Cancel)
+		segments.POST("/:sid/takes/import", h.DramaSegment.ImportTakes)
+		segments.PATCH("/:sid/takes/:tid", h.DramaSegment.PatchTakeQC)
 
 		// 管理员后台接口：读与模型相关的写 = admin 或 super_admin；插件与渠道的写 = 仅 super_admin。
 		// 凭证不再有独立接口，渠道 Key 统一走 PUT /channels/:key/secret。

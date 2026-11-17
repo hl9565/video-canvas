@@ -15,6 +15,7 @@ import (
 
 // DramaSegmentRepo 片段归属查询和事务边界。
 type DramaSegmentRepo interface {
+	DramaTakeReader
 	// WithTx 原子执行片段变更，锁顺序为项目后片段。
 	WithTx(context.Context, func(repository.DramaTx) error) error
 	// Project 校验项目归属和存活状态。
@@ -47,6 +48,12 @@ type DramaSegmentAssetReader interface {
 	View(context.Context, uint64, uint64) (*model.AssetView, error)
 }
 
+// DramaFrameRunEnricher 在事务外补齐首帧内容指纹和短期画布票据。
+type DramaFrameRunEnricher interface {
+	// EnrichFrameRunView 为 HTTP、片段列表及 WS 使用同一套流程视图。
+	EnrichFrameRunView(context.Context, uint64, *model.DramaSegmentFrameRun, *model.DramaSegmentFrameRunView) error
+}
+
 // DramaSegmentProbeStore 读写按素材内容指纹标识的媒体探测缓存。
 type DramaSegmentProbeStore interface {
 	// Get 按素材、哈希和版本精确读取缓存，缺失返回 repository.ErrNotFound。
@@ -57,7 +64,8 @@ type DramaSegmentProbeStore interface {
 
 // DramaSegmentDeps 提供片段的持久化、生成、素材与用户事件依赖。
 type DramaSegmentDeps struct {
-	Probes DramaSegmentProbeStore
+	Canvases DramaStoryboardCanvasReader
+	Probes   DramaSegmentProbeStore
 	// ProbeVideo 在事务外探测本地视频的规范帧数；未注入时使用默认探测器。
 	ProbeVideo  func(context.Context, string) (videoframe.NormalizedProbe, error)
 	Repo        DramaSegmentRepo
@@ -72,13 +80,20 @@ type DramaSegmentDeps struct {
 type DramaSegmentService struct {
 	probes     DramaSegmentProbeStore
 	probeVideo func(context.Context, string) (videoframe.NormalizedProbe, error)
+	canvases   DramaStoryboardCanvasReader
 	repo       DramaSegmentRepo
 	tasks      DramaSegmentTaskCreator
 	assets     DramaSegmentAssetReader
 	bc         ws.Broadcaster
 	adapter    DramaSegmentAdapter
+	frameRuns  DramaFrameRunEnricher
 	// adapting 是进程内的转写锁，键为「片段:格式」
 	adapting sync.Map
+}
+
+// SetFrameRunEnricher 注入首帧视图补全器，只在初始化时调用。
+func (s *DramaSegmentService) SetFrameRunEnricher(enricher DramaFrameRunEnricher) {
+	s.frameRuns = enricher
 }
 
 // NewDramaSegmentService 创建独立片段服务，任务状态观察者由initialize组装。
@@ -91,7 +106,7 @@ func NewDramaSegmentService(d DramaSegmentDeps) *DramaSegmentService {
 	if probe == nil {
 		probe = videoframe.New(videoframe.Options{}).ProbeNormalized24FPS
 	}
-	return &DramaSegmentService{probes: d.Probes, probeVideo: probe, repo: d.Repo, tasks: d.Tasks, assets: d.Assets, bc: bc, adapter: d.Adapter}
+	return &DramaSegmentService{probes: d.Probes, probeVideo: probe, repo: d.Repo, canvases: d.Canvases, tasks: d.Tasks, assets: d.Assets, bc: bc, adapter: d.Adapter}
 }
 
 // List 校验用户项目后按顺序返回片段，并恢复漏处理的成功任务写回。
@@ -204,7 +219,12 @@ func segmentError(err error) error {
 
 // publishSegment 在事务提交后推送完整视图，前端与HTTP共用相同字段。
 func (s *DramaSegmentService) publishSegment(ctx context.Context, p *model.DramaProject, ep *model.DramaEpisode, v *model.DramaSegmentView) {
-	s.bc.Publish(ctx, ws.UserChannel(p.UserID), ws.Message{Type: ws.TypeDramaSegment, Data: struct {
+	publishDramaSegment(ctx, s.bc, p, ep, v)
+}
+
+// publishDramaSegment 使片段和首帧服务共用用户事件契约。
+func publishDramaSegment(ctx context.Context, bc ws.Broadcaster, p *model.DramaProject, ep *model.DramaEpisode, v *model.DramaSegmentView) {
+	bc.Publish(ctx, ws.UserChannel(p.UserID), ws.Message{Type: ws.TypeDramaSegment, Data: struct {
 		DramaID   idcodec.ID              `json:"drama_id"`
 		EpisodeNo int                     `json:"episode_no"`
 		Segment   *model.DramaSegmentView `json:"segment"`
@@ -218,4 +238,69 @@ func (s *DramaSegmentService) changedView(ctx context.Context, userID, sid uint6
 		s.publishSegment(ctx, p, ep, v)
 	}
 	return v, err
+}
+
+// EnrichFrameRunView 在事务外补齐内容指纹和非终态画布票据，历史素材缺失不阻止取消与查看。
+func (s *DramaFrameRunService) EnrichFrameRunView(ctx context.Context, userID uint64, run *model.DramaSegmentFrameRun, view *model.DramaSegmentFrameRunView) error {
+	// 1. 指纹来自实际素材行，不使用客户端或生成任务的缓存信息。
+	if run == nil || view == nil || run.UserID != userID {
+		return errcode.ErrDramaFrameRunNotFound
+	}
+	view.FrameSHA256, view.CanvasTicket = "", ""
+	if run.FrameAssetID != nil {
+		asset, err := s.assets.Get(ctx, userID, *run.FrameAssetID)
+		if err != nil && !isFrameInvalid(frameAssetError(err)) {
+			return err
+		}
+		if err == nil && asset != nil && asset.ID == *run.FrameAssetID && asset.UserID == userID && asset.Kind == model.KindImage {
+			view.FrameSHA256 = asset.Sha256
+		}
+	}
+	// 2. 终态不再签发可写票据；票据本身仍需 SetFrame 校验实时来源画布。
+	if run.FrameSource == model.FrameSourceCanvas && run.OriginCanvasID != nil && !terminalFrameRun(run.State) {
+		view.CanvasTicket = s.signFrameCanvasTicket(run)
+	}
+	return nil
+}
+
+// terminalFrameRun 终态释放唯一活跃槽位，并禁止继续更新首帧。
+func terminalFrameRun(state model.DramaFrameRunState) bool {
+	return state == model.FrameRunStateBound || state == model.FrameRunStateFailed || state == model.FrameRunStateCancelled
+}
+
+// isFrameInvalid 只将素材缺失、类型和内容错误视为可展示的历史失效。
+func isFrameInvalid(err error) bool {
+	var business *errcode.Error
+	return errors.As(err, &business) && business.Code == errcode.ErrDramaFrameInvalid.Code
+}
+
+// reloadFrameRunView 从最终持久化状态生成视图，避免任务观察者已推进状态时返回旧版本。
+func (s *DramaFrameRunService) reloadFrameRunView(ctx context.Context, userID, sid, rid uint64) (*model.DramaSegmentFrameRunView, error) {
+	run, err := s.loadFrameRun(ctx, userID, sid, rid)
+	if err != nil {
+		return nil, err
+	}
+	view := frameRunView(run)
+	if err := s.EnrichFrameRunView(ctx, userID, run, view); err != nil {
+		return nil, err
+	}
+	return view, nil
+}
+
+// publishFrameRun 在提交后发布完整片段；广播失败不改变已提交的流程状态。
+func (s *DramaFrameRunService) publishFrameRun(ctx context.Context, run *model.DramaSegmentFrameRun) error {
+	view, p, ep, _, err := s.segments.readView(ctx, run.UserID, run.SegmentID)
+	if err != nil {
+		return err
+	}
+	publishDramaSegment(ctx, s.bc, p, ep, view)
+	return nil
+}
+
+// changedFrameRunView 通知后重新读取，包含统一候选对账可能产生的 bound 状态。
+func (s *DramaFrameRunService) changedFrameRunView(ctx context.Context, run *model.DramaSegmentFrameRun) (*model.DramaSegmentFrameRunView, error) {
+	if err := s.publishFrameRun(ctx, run); err != nil {
+		return nil, err
+	}
+	return s.reloadFrameRunView(ctx, run.UserID, run.SegmentID, run.ID)
 }

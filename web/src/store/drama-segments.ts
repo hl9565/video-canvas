@@ -1,7 +1,12 @@
 import { create } from "zustand";
 
 import type { Segment } from "@/api/drama/type";
-import { mergeSegment, removeSegmentFrom, sortSegments } from "@/utils/drama/segments";
+import {
+  mergeSegment,
+  preserveNewerFrameRun,
+  removeSegmentFrom,
+  sortSegments,
+} from "@/utils/drama/segments";
 
 /** 一部短剧的一集：片段列表的键 */
 export const segmentKey = (dramaId: string, no: number) => `${dramaId}:${no}`;
@@ -17,8 +22,17 @@ type DramaSegmentsState = {
   byEpisode: Record<string, Segment[]>;
   /** 正在打开的片段工作区（引用计数）：WebSocket 重连 / 回到前台时只对账这些 */
   watching: Record<string, number>;
-  /** 整体替换一集的片段（HTTP 读取 / 重排返回） */
-  setList: (dramaId: string, no: number, list: readonly Segment[]) => void;
+  /** 单片段首帧本地更新纪元，防止发起较早的整集拉取写回旧流程快照 */
+  runFloors: Record<string, number>;
+  /** 标记某片段发生了本地首帧流程状态推进 */
+  bumpRunFloor: (segmentId: string) => void;
+  /** 整体替换一集的片段（HTTP 读取 / 重排返回），按片段保留更新的首帧快照 */
+  setList: (
+    dramaId: string,
+    no: number,
+    list: readonly Segment[],
+    startFloors?: Readonly<Record<string, number>>,
+  ) => void;
   /** 并入一条片段快照（WebSocket 推送 / 接口返回） */
   apply: (dramaId: string, no: number, segment: Segment) => void;
   /** 删掉一个片段 */
@@ -32,11 +46,32 @@ type DramaSegmentsState = {
 export const useDramaSegmentsStore = create<DramaSegmentsState>((set) => ({
   byEpisode: {},
   watching: {},
+  runFloors: {},
 
-  setList: (dramaId, no, list) =>
+  bumpRunFloor: (segmentId) =>
     set((state) => ({
-      byEpisode: { ...state.byEpisode, [segmentKey(dramaId, no)]: sortSegments(list) },
+      runFloors: { ...state.runFloors, [segmentId]: (state.runFloors[segmentId] ?? 0) + 1 },
     })),
+
+  setList: (dramaId, no, list, startFloors) =>
+    set((state) => {
+      const key = segmentKey(dramaId, no);
+      const existingById = new Map((state.byEpisode[key] ?? []).map((item) => [item.id, item]));
+      const reconciled = list.map((incoming) => {
+        const existing = existingById.get(incoming.id);
+        if (
+          existing &&
+          startFloors &&
+          (state.runFloors[incoming.id] ?? 0) > (startFloors[incoming.id] ?? 0)
+        ) {
+          return { ...incoming, frameRun: existing.frameRun };
+        }
+        return preserveNewerFrameRun(existing, incoming);
+      });
+      return {
+        byEpisode: { ...state.byEpisode, [key]: sortSegments(reconciled) },
+      };
+    }),
 
   apply: (dramaId, no, segment) =>
     set((state) => {

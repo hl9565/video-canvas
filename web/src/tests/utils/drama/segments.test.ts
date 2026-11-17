@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import type { Segment, SegmentTake } from "@/api/drama/type";
+import { mapSegment } from "@/api/drama";
+import { useDramaSegmentsStore } from "@/store/drama-segments";
 import {
   applyOrder,
   batchTargets,
@@ -11,6 +13,7 @@ import {
   mergeSegment,
   orderIds,
   playableTake,
+  preserveNewerFrameRun,
   removeSegmentFrom,
   sameOrder,
   totalSeconds,
@@ -48,6 +51,116 @@ const seg = (id: string, seq: number, patch: Partial<Segment> = {}): Segment => 
   revision: 1,
   updatedAt: "x",
   ...patch,
+});
+
+test("已驳回候选即便成功且有素材也不能采用，撤销质检后恢复", () => {
+  const rejected = { ...take("t1", "succeeded", "/1.mp4"), qc: "rejected" as const };
+  expect(chooseCheck(seg("s1", 0, { takes: [rejected] }), "t1")).toBe("invalid");
+  expect(chooseCheck(seg("s1", 0, { takes: [rejected], chosenTaskId: "t1" }), "t1")).toBe(
+    "invalid",
+  );
+  expect(chooseCheck(seg("s1", 0, { takes: [{ ...rejected, qc: "unreviewed" }] }), "t1")).toBe(
+    "ok",
+  );
+});
+
+test("片段快照映射导入来源、QC、显式清空及缺省流程", () => {
+  const segment = mapSegment({
+    id: "s1",
+    episode_no: 1,
+    seq: 0,
+    seconds: 5,
+    prompt: "p",
+    takes: [
+      {
+        task_id: "t1",
+        status: "succeeded",
+        asset: null,
+        error_message: "",
+        created_at: "",
+        origin: "canvas_import",
+        qc: "accepted",
+        source_canvas_id: "c2",
+      },
+    ],
+    chosen_task_id: "",
+    chosen_cleared: true,
+    frame_run: null,
+    status: "idle",
+    revision: 2,
+    updated_at: "",
+  });
+  expect(segment.takes[0]).toMatchObject({
+    origin: "canvas_import",
+    qc: "accepted",
+    sourceCanvasId: "c2",
+  });
+  expect(segment.chosenCleared).toBe(true);
+  expect(segment.frameRun).toBeNull();
+});
+
+test("mergeSegment 与 preserveNewerFrameRun 在同段版本下不回退更新的首帧流程", () => {
+  const baseRun = {
+    id: "r1",
+    segmentId: "s1",
+    requestKey: "req",
+    frameSource: "existing" as const,
+    state: "confirmed" as const,
+    segmentRevision: 2,
+    revision: 4,
+    confirmedVersion: 1,
+    modelKey: "m-1c89decdf8fd",
+    adoptIfEmpty: true,
+    errorCode: "",
+    errorMessage: "",
+    createdAt: "2026-11-16T10:00:00Z",
+    updatedAt: "2026-11-16T10:02:00Z",
+  };
+  const current = seg("s1", 0, {
+    revision: 2,
+    frameRun: baseRun,
+    updatedAt: "2026-11-16T10:02:00Z",
+  });
+  const staleWs = seg("s1", 0, {
+    revision: 2,
+    frameRun: { ...baseRun, state: "frame_ready", revision: 3, updatedAt: "2026-11-16T10:01:00Z" },
+    updatedAt: "2026-11-16T10:01:00Z",
+  });
+  expect(mergeSegment([current], staleWs)[0]?.frameRun?.revision).toBe(4);
+  const oldRun = seg("s1", 0, {
+    revision: 2,
+    frameRun: {
+      ...baseRun,
+      id: "r0",
+      state: "cancelled",
+      revision: 9,
+      updatedAt: "2026-11-16T09:59:00Z",
+    },
+    updatedAt: "2026-11-16T09:59:00Z",
+  });
+  expect(preserveNewerFrameRun(current, oldRun).frameRun?.id).toBe("r1");
+  for (const terminalState of ["cancelled", "failed", "bound"] as const) {
+    const terminalSeg = seg("s1", 0, {
+      revision: 2,
+      frameRun: { ...baseRun, id: `r-${terminalState}`, state: terminalState, revision: 6 },
+      updatedAt: "2026-11-16T10:02:00Z",
+    });
+    const staleNull = seg("s1", 0, {
+      revision: 2,
+      frameRun: null,
+      updatedAt: "2026-11-16T09:58:00Z",
+    });
+    expect(mergeSegment([terminalSeg], staleNull)[0]?.frameRun?.id).toBe(`r-${terminalState}`);
+    useDramaSegmentsStore.setState({
+      byEpisode: { "d1:1": [terminalSeg] },
+      watching: {},
+      runFloors: {},
+    });
+    useDramaSegmentsStore.getState().setList("d1", 1, [staleNull]);
+    expect(useDramaSegmentsStore.getState().byEpisode["d1:1"]?.[0]?.frameRun?.id).toBe(
+      `r-${terminalState}`,
+    );
+  }
 });
 
 describe("片段条重排（契约 §10 PUT order）", () => {

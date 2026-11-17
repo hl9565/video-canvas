@@ -81,6 +81,9 @@ type GenerationTask struct {
 	FinishedAt        *time.Time     `json:"finished_at"`                                                                                                                                                                                                          // 进入终态的时间
 	CreatedAt         time.Time      `gorm:"index:idx_task_user_created,priority:2;index:idx_task_created" json:"created_at"`                                                                                                                                      // 创建时间（与 user_id 组成热力图 / 近 7 天统计用的索引；单列索引 idx_task_created 给后台总览的全站按时间聚合用）
 	UpdatedAt         time.Time      `json:"updated_at"`                                                                                                                                                                                                           // 更新时间
+
+	FrameRunID         *uint64 `gorm:"index:idx_task_frame_run,where:frame_run_id IS NOT NULL" json:"-"` // 首帧流程归属，与 run.video_task_id 双向核验
+	FrameRunConfirmRev *int64  `json:"-"`                                                                // 提交所用确认快照版本
 }
 
 func (GenerationTask) TableName() string { return "generation_tasks" }

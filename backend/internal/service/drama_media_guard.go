@@ -26,16 +26,11 @@ func checkDramaMediaTasks(ctx context.Context, tx repository.DramaTx, p *model.D
 		if err != nil {
 			return err
 		}
-		for _, row := range rows {
-			tasks, err := tx.SegmentTasks(ctx, p.UserID, p.CanvasID, segmentNode(row.ID))
-			if err != nil {
-				return err
-			}
-			for _, task := range tasks {
-				if slices.Contains(model.ActiveTaskStatuses, task.Status) && (key == "" || task.IdempotencyKey != key) {
-					return errcode.ErrDramaJobBusy
-				}
-			}
+		if err := checkActiveSegmentFrameRuns(ctx, tx, p.UserID, rows, key, 0); err != nil {
+			return err
+		}
+		if err := checkSegmentMediaTaskRows(ctx, tx, p, rows, key); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -90,4 +85,38 @@ func inputDurationSeconds(input map[string]any) int {
 		}
 	}
 	return 0
+}
+
+// checkActiveSegmentFrameRuns 只检查存活段的媒体进行态，忽略本 run 和同键重入，孤儿流程不占互斥。
+func checkActiveSegmentFrameRuns(ctx context.Context, tx repository.DramaTx, user uint64, rows []model.DramaSegment, key string, excludeRunID uint64) error {
+	ids := make([]uint64, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	runs, err := tx.ActiveFrameRunsBySegments(ctx, user, ids)
+	if err != nil {
+		return err
+	}
+	for _, run := range runs {
+		if run.ID != excludeRunID && (key == "" || run.VideoIdempotencyKey != key) {
+			return errcode.ErrDramaJobBusy
+		}
+	}
+	return nil
+}
+
+// checkSegmentMediaTaskRows 与流程互斥分开检查正式 seg 任务，保持按集的存活段边界。
+func checkSegmentMediaTaskRows(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, rows []model.DramaSegment, key string) error {
+	for _, row := range rows {
+		tasks, err := tx.SegmentTasks(ctx, p.UserID, p.CanvasID, segmentNode(row.ID))
+		if err != nil {
+			return err
+		}
+		for _, task := range tasks {
+			if slices.Contains(model.ActiveTaskStatuses, task.Status) && (key == "" || task.IdempotencyKey != key) {
+				return errcode.ErrDramaJobBusy
+			}
+		}
+	}
+	return nil
 }

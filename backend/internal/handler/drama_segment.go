@@ -32,6 +32,61 @@ func (h *DramaSegmentHandler) List(c *gin.Context) {
 	response.OK(c, gin.H{"items": items})
 }
 
+// Get 返回单段完整视图及最新首帧流程。
+func (h *DramaSegmentHandler) Get(c *gin.Context) {
+	sid, ok := dramaSegmentPath(c)
+	if !ok {
+		return
+	}
+	view, err := h.svc.Get(c.Request.Context(), currentUserID(c), sid)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, view)
+}
+
+// ImportTakes 将来源画布的成功视频补入片段候选。
+func (h *DramaSegmentHandler) ImportTakes(c *gin.Context) {
+	sid, ok := dramaSegmentPath(c)
+	if !ok {
+		return
+	}
+	var req model.ImportDramaTakesReq
+	if !BindJSON(c, &req) {
+		return
+	}
+	view, err := h.svc.ImportTakes(c.Request.Context(), currentUserID(c), sid, &req)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, view)
+}
+
+// PatchTakeQC 带版本更新候选人工质检结果。
+func (h *DramaSegmentHandler) PatchTakeQC(c *gin.Context) {
+	sid, ok := dramaSegmentPath(c)
+	if !ok {
+		return
+	}
+	tid, ok := idcodec.Decode(c.Param("tid"))
+	if !ok {
+		response.Fail(c, errcode.ErrInvalidParams.WithMsg("候选任务id格式错误"))
+		return
+	}
+	var req model.PatchDramaTakeQCReq
+	if !BindJSON(c, &req) {
+		return
+	}
+	view, err := h.svc.PatchTakeQC(c.Request.Context(), currentUserID(c), sid, tid, &req)
+	if err != nil {
+		response.Fail(c, err)
+		return
+	}
+	response.OK(c, view)
+}
+
 // Create 在分集指定位置新增片段，返回201。
 func (h *DramaSegmentHandler) Create(c *gin.Context) {
 	id, no, ok := dramaEpisodePath(c)

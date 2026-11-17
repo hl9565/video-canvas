@@ -11,9 +11,13 @@ import (
 	"video-canvas/internal/repository"
 )
 
-var errBatchReadOnly = errors.New("batch has no new tasks")
+var (
+	errBatchReadOnly    = errors.New("batch has no new tasks")
+	errBatchRunSnapshot = errors.New("submitting run needs live snapshot")
+)
 
 type taskBatch struct {
+	cancelTaskID         uint64
 	userID               uint64
 	key, sig             string
 	nodes                []string
@@ -32,24 +36,36 @@ type taskBatch struct {
 
 // preResolvedTarget 在积分锁之前冻结目标归属、业务错误及允许查询的媒体节点集合。
 type preResolvedTarget struct {
-	err        error
-	segment    *model.DramaSegment
-	episode    *model.DramaEpisode
-	project    *model.DramaProject
-	script     *model.MarketingScript
-	marketing  *marketingLockedRender
-	mediaNodes []string
+	err             error
+	segment         *model.DramaSegment
+	episode         *model.DramaEpisode
+	project         *model.DramaProject
+	script          *model.MarketingScript
+	marketing       *marketingLockedRender
+	mediaNodes      []string
+	run             *model.DramaSegmentFrameRun
+	existingRunTask *model.GenerationTask
 }
 
 // createAllAtomic 全批共用一个事务，业务失败回滚单项，系统失败回滚全批；提交后才广播。
 func (s *GenerationTaskService) createAllAtomic(ctx context.Context, b *taskBatch) ([]error, error) {
-	if err := s.prepareBatchLimits(ctx, b); err != nil {
-		return nil, err
+	if b.snap != nil || b.opts.DramaRunBind == nil {
+		if err := s.prepareBatchLimits(ctx, b); err != nil {
+			return nil, err
+		}
 	}
 	b.errs = make([]error, len(b.nodes))
 	err := s.repo.WithTx(ctx, func(tx repository.GenerationTaskTx) error {
 		return s.createBatchTx(ctx, tx, b)
 	})
+	// 取消任务复用已有积分语义；必须在父链/流程事务解锁后执行，防止观察者重入死锁。
+	if b.cancelTaskID != 0 {
+		_, cancelErr := s.cancel(ctx, b.userID, b.cancelTaskID, false)
+		var business *errcode.Error
+		if cancelErr != nil && !errors.As(cancelErr, &business) {
+			return nil, cancelErr
+		}
+	}
 	if errors.Is(err, errBatchReadOnly) {
 		return b.errs, nil
 	}
@@ -78,6 +94,12 @@ func (s *GenerationTaskService) createBatchTx(ctx context.Context, tx repository
 	if err != nil {
 		return err
 	}
+	if b.opts.DramaRunBind != nil {
+		done, err := s.resolveBoundBatchLocked(b, preResolvedTargets[b.nodes[0]])
+		if done || err != nil {
+			return err
+		}
+	}
 	if err := tx.TxEnsureCredit(ctx, b.userID, b.initial); err != nil {
 		return err
 	}
@@ -89,7 +111,7 @@ func (s *GenerationTaskService) createBatchTx(ctx context.Context, tx repository
 	if err != nil {
 		return err
 	}
-	all, err := s.validateBatchReplayHits(b.userID, b.sig, b.nodes, b.req, hits)
+	all, err := s.validateBatchReplayHits(b.userID, b.sig, b.nodes, b.req, hits, b.opts.DramaRunBind)
 	if err != nil {
 		return err
 	}
@@ -137,7 +159,7 @@ func (s *GenerationTaskService) resolveBatchWinner(ctx context.Context, b *taskB
 	if err != nil {
 		return nil, err
 	}
-	all, err := s.validateBatchReplayHits(b.userID, b.sig, b.nodes, b.req, hits)
+	all, err := s.validateBatchReplayHits(b.userID, b.sig, b.nodes, b.req, hits, b.opts.DramaRunBind)
 	if err != nil {
 		return nil, err
 	}
@@ -207,6 +229,10 @@ func (s *GenerationTaskService) freezeBatchItem(ctx context.Context, tx reposito
 	if err := s.fillTask(task, snap, taskInput(itemInput, snap.Model.Capabilities, b.count), b.queueWait); err != nil {
 		return nil, err
 	}
+	if bind := b.opts.DramaRunBind; bind != nil {
+		task.FrameRunID = &bind.RunID
+		task.FrameRunConfirmRev = &bind.ConfirmRev
+	}
 	inserted, err := tx.TxInsertTask(ctx, task)
 	if err != nil {
 		return nil, err
@@ -222,6 +248,14 @@ func (s *GenerationTaskService) freezeBatchItem(ctx context.Context, tx reposito
 	}
 	if err := enqueueTaskAndNotify(ctx, tx, task); err != nil {
 		return nil, err
+	}
+	if target.run != nil {
+		dtx := tx.(interface{ DramaTx() repository.DramaTx }).DramaTx()
+		target.run.VideoTaskID = &task.ID
+		target.run.State = model.FrameRunStateVideoPending
+		if err := dtx.SaveFrameRun(ctx, target.run, target.run.Revision); err != nil {
+			return nil, err
+		}
 	}
 	return task, nil
 }
@@ -263,4 +297,35 @@ func enqueueTaskAndNotify(ctx context.Context, tx repository.GenerationTaskTx, t
 		return tx.EnqueueAgentNotify(ctx, task)
 	}
 	return nil
+}
+
+// tryDramaRunReplay 先在父链→流程锁中处理终态和受信重入，只有新建态才请求实时模型快照。
+func (s *GenerationTaskService) tryDramaRunReplay(ctx context.Context, b *taskBatch) (*model.CreateGenerationTaskResp, error) {
+	errs, err := s.createAllAtomic(ctx, b)
+	if errors.Is(err, errBatchRunSnapshot) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return taskItems(b.nodes, b.existing, errs), nil
+}
+
+// resolveBoundBatchLocked 在账户锁之前结束终态/重放；新建只允许具备实时快照的 submitting 流程继续。
+func (s *GenerationTaskService) resolveBoundBatchLocked(b *taskBatch, target preResolvedTarget) (bool, error) {
+	if target.err != nil {
+		return true, target.err
+	}
+	if target.existingRunTask != nil {
+		hits := []*model.GenerationTask{target.existingRunTask}
+		if _, err := s.validateBatchReplayHits(b.userID, b.sig, b.nodes, b.req, hits, b.opts.DramaRunBind); err != nil {
+			return true, err
+		}
+		b.existing = hits
+		return true, nil
+	}
+	if b.snap == nil {
+		return true, errBatchRunSnapshot
+	}
+	return false, nil
 }

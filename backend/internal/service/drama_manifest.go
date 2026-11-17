@@ -17,6 +17,8 @@ import (
 )
 
 type dramaManifestReader interface {
+	DramaTakeReader
+	ComposeAsset(context.Context, uint64, uint64) (*model.Asset, error)
 	Segments(context.Context, uint64, uint64) ([]model.DramaSegment, error)
 	SegmentTasks(context.Context, uint64, uint64, string) ([]model.GenerationTask, error)
 }
@@ -74,7 +76,7 @@ func (s *DramaService) PrepareOrResolveEpisodeManifest(ctx context.Context, user
 }
 
 func (s *DramaService) loadDramaManifestSource(ctx context.Context, user, id uint64, no int) (*dramaManifestSource, error) {
-	// 1. 校验项目与集归属；PR1 只读 0036，不读取后续 program 或候选关系表。
+	// 1. 校验项目与集归属，采用准入与片段视图共享来源、绑定与 QC 规则。
 	p, err := s.repo.Project(ctx, user, id, false)
 	if err != nil {
 		return nil, dramaError(err)
@@ -253,11 +255,15 @@ func readDramaManifestSource(ctx context.Context, reader dramaManifestReader, p 
 			source.input.SkippedSeqs = append(source.input.SkippedSeqs, row.Seq)
 			continue
 		}
-		tasks, err := reader.SegmentTasks(ctx, p.UserID, p.CanvasID, segmentNode(row.ID))
+		takes, err := ResolveSegmentTakes(ctx, reader, manifestTakeAssets{reader}, p, &row)
 		if err != nil {
 			return nil, err
 		}
-		id, err := composeChosenAsset(tasks, *row.ChosenTaskID)
+		take, err := findUsableSegmentTake(takes, *row.ChosenTaskID, false)
+		if err != nil {
+			return nil, err
+		}
+		id, err := composeChosenAsset([]model.GenerationTask{take.Task}, *row.ChosenTaskID)
 		if err != nil {
 			return nil, err
 		}
@@ -409,4 +415,19 @@ func (s *DramaService) dramaManifestProbe(ctx context.Context, user, id uint64) 
 		return nil, nil, err
 	}
 	return asset, probe, nil
+}
+
+// manifestTakeAssets 只在当前 reader 的数据库边界内核验用户视频，不在合成事务内下载素材。
+type manifestTakeAssets struct{ reader dramaManifestReader }
+
+// View 复用合成素材元数据读取，避免采用准入依赖源画布当前是否仍存活。
+func (a manifestTakeAssets) View(ctx context.Context, user, id uint64) (*model.AssetView, error) {
+	asset, err := a.reader.ComposeAsset(ctx, user, id)
+	if err != nil || asset == nil {
+		return nil, err
+	}
+	if asset.UserID != user {
+		return nil, nil
+	}
+	return &model.AssetView{ID: asset.ID, Kind: asset.Kind}, nil
 }

@@ -14,7 +14,7 @@ import (
 
 // 真实数据库上删中间一集：集号往前补位不撞 (drama_id, no) 唯一索引，片段软删，画布出现集数一起改。
 func TestDramaDeleteEpisodeRenumbersOnRealDB(t *testing.T) {
-	db := isolatedDB(t, &model.CanvasProject{}, &model.DramaProject{}, &model.DramaEpisode{}, &model.DramaJob{}, &model.DramaSegment{})
+	db := isolatedDB(t, &model.CanvasProject{}, &model.DramaProject{}, &model.DramaEpisode{}, &model.DramaJob{}, &model.DramaSegment{}, &model.DramaSegmentFrameRun{})
 	ctx := context.Background()
 	canvas := model.CanvasProject{UserID: 11, Title: "短剧画布", Revision: 1, PayloadJSON: datatypes.JSON(`{"nodes":[
 		{"id":"a","type":"canvas","position":{"x":0,"y":0},"data":{"kind":"image","drama":{"type":"scene","name":"街道","episodes":[2,4]}}},

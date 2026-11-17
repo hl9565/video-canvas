@@ -132,7 +132,7 @@ func TestDramaMediaIntegration_RejectsTimelineOverrunWithModelCap(t *testing.T) 
 	setupSeg := func(t *testing.T, segSeconds int) (*gtiEnv, string) {
 		t.Helper()
 		e := newGTIEnv(t, defaultTaskLimits())
-		if err := e.db.AutoMigrate(&model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.DramaJob{}); err != nil {
+		if err := e.db.AutoMigrate(&model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.DramaSegmentFrameRun{}, &model.DramaSegmentTakeLink{}, &model.DramaJob{}); err != nil {
 			t.Fatal(err)
 		}
 		p := model.DramaProject{UserID: e.user, CanvasID: 7, Title: "越界测试", SourceText: "原文", StyleKey: "custom"}

@@ -40,8 +40,8 @@ func (r *previewHTTPRepo) Segments(context.Context, uint64, uint64) ([]model.Dra
 	chosen := uint64(20)
 	return []model.DramaSegment{{BaseModel: model.BaseModel{ID: 5}, UserID: 1, EpisodeID: 10, ChosenTaskID: &chosen}}, nil
 }
-func (r *previewHTTPRepo) SegmentTasks(context.Context, uint64, uint64, string) ([]model.GenerationTask, error) {
-	return []model.GenerationTask{{ID: 20, Kind: model.KindVideo, Status: model.TaskSucceeded, OutputJSON: []byte(`[{"asset_id":30,"media_type":"video"}]`)}}, nil
+func (r *previewHTTPRepo) SegmentTasks(_ context.Context, user, canvas uint64, node string) ([]model.GenerationTask, error) {
+	return []model.GenerationTask{{ID: 20, UserID: user, CanvasProjectID: &canvas, NodeID: node, Kind: model.KindVideo, Status: model.TaskSucceeded, OutputJSON: []byte(`[{"asset_id":30,"media_type":"video"}]`)}}, nil
 }
 
 type previewHTTPAssets struct{ service.DramaComposeAssets }

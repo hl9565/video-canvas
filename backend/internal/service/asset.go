@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -109,6 +110,16 @@ func (s *AssetService) MaxUpload() int64 {
 		return s.cfg.MaxUpload
 	}
 	return defaultMaxUpload
+}
+
+// SaveDerivedImage 将服务端派生图作为用户图片入库，复用上传限额、内容指纹和尺寸探测。
+func (s *AssetService) SaveDerivedImage(ctx context.Context, userID uint64, fileName, mimeType string, data []byte) (*model.Asset, error) {
+	// 1. 派生图与上传共用存储和元数据流程，调用方必须在业务事务外执行。
+	asset, _, err := s.ingest(ctx, assetIngest{
+		UserID: userID, Source: model.AssetSourceUpload, KeyPrefix: "u", Kind: model.KindImage,
+		FileName: sanitizeAssetFileName(fileName), FallbackMime: mimeType, Body: bytes.NewReader(data), MaxBytes: s.MaxUpload(),
+	})
+	return asset, err
 }
 
 // Upload 保存用户上传的素材并返回视图。

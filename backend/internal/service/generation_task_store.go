@@ -365,6 +365,15 @@ func (s *GenerationTaskService) cancel(ctx context.Context, userID, id uint64, f
 	if model.IsTerminalStatus(t.Status) {
 		return nil, errcode.ErrTaskNotCancelable
 	}
+	if !force && s.frameRunGuard != nil {
+		guarded, err := s.frameRunGuard.HasActiveFrameRunForTask(ctx, userID, t)
+		if err != nil {
+			return nil, err
+		}
+		if guarded {
+			return nil, errcode.ErrDramaFrameRunConflict
+		}
+	}
 	// 用户取消：转存中不放行；还没提交给平台的退回积分，已进入生成的扣除冻结积分。
 	// 状态迁移的前置条件按读到的情况收紧：读到之后任务状态又变了（如进入转存），这次取消不会生效
 	from := model.ActiveTaskStatuses

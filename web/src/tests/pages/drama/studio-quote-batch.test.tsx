@@ -284,6 +284,100 @@ beforeEach(() => {
 });
 
 describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版本切换安全", () => {
+  test("清空采用、质检和导入使用最新 revision，同步集级版本并在冲突后重载", async () => {
+    let current = { ...toBackendSegment(makeSegment("s1", 0)), segment_version: 1 };
+    const patches: unknown[] = [];
+    const imports: unknown[] = [];
+    const synced: number[] = [];
+    let listReads = 0;
+    spies.push(
+      spyOn(service, "get").mockImplementation(async (url: string) => {
+        if (url.endsWith("/segments")) {
+          listReads++;
+          return { items: [current] } as never;
+        }
+        return { id: "c-studio", payload_json: { nodes: [], edges: [] } } as never;
+      }),
+      spyOn(service, "patch").mockImplementation(async (url: string, body?: unknown) => {
+        patches.push(body);
+        if (url.endsWith("/takes/conflict")) throw new ApiError("冲突", 91005, 409);
+        current = {
+          ...current,
+          revision: current.revision + 1,
+          segment_version: current.segment_version + 1,
+        };
+        return current as never;
+      }),
+      spyOn(service, "post").mockImplementation(async (url: string, body?: unknown) => {
+        if (url.endsWith("/takes/import")) {
+          imports.push(body);
+          current = {
+            ...current,
+            revision: current.revision + 1,
+            segment_version: current.segment_version + 1,
+          };
+          return current as never;
+        }
+        return {} as never;
+      }),
+    );
+    let studio!: Studio;
+    const mounted = await dom.mount(
+      <StudioTestHarness
+        drama={makeDrama()}
+        onStudio={(s) => (studio = s)}
+        renderControls={false}
+        applyEpisode={(_, fields) => {
+          if (fields.segmentVersion) synced.push(fields.segmentVersion);
+        }}
+      />,
+    );
+    try {
+      await dom.flush(30);
+      await dom.act(async () => {
+        await studio.actions.clearChosen(studio.segments[0]!);
+      });
+      expect(patches[0]).toMatchObject({
+        revision: 1,
+        clear_chosen: true,
+        expected_task_id: "t-s1-1",
+      });
+      await dom.act(async () => {
+        await studio.actions.patchTakeQc(studio.segments[0]!, "t-s1-1", {
+          qc: "accepted",
+          expectedSegmentVersion: 2,
+        });
+      });
+      expect(patches[1]).toMatchObject({
+        revision: 2,
+        qc: "accepted",
+        expected_segment_version: 2,
+      });
+      await dom.act(async () => {
+        await studio.actions.importTakes(studio.segments[0]!, {
+          sourceCanvasId: "c2",
+          taskIds: ["t2"],
+          adopt: true,
+        });
+      });
+      expect(imports[0]).toMatchObject({
+        revision: 3,
+        source_canvas_id: "c2",
+        task_ids: ["t2"],
+        adopt: true,
+      });
+      expect(synced).toContain(4);
+      await dom.act(async () => {
+        await expect(
+          studio.actions.patchTakeQc(studio.segments[0]!, "conflict", { qc: "rejected" }),
+        ).rejects.toBeInstanceOf(ApiError);
+      });
+      await dom.flush(30);
+      expect(listReads).toBeGreaterThan(1);
+    } finally {
+      await mounted.unmount();
+    }
+  });
   test("resolution 与 count 仅按片段保存，batch() 逐段调用 overridesForModel + quoteSegment 并透传 quoteToken", async () => {
     const s1 = makeSegment("s1", 0, { chosenTaskId: "", takes: [], status: "idle" });
     const s2 = makeSegment("s2", 1, { chosenTaskId: "", takes: [], status: "idle" });

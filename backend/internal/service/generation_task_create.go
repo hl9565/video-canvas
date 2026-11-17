@@ -30,12 +30,9 @@ func (s *GenerationTaskService) Create(ctx context.Context, userID uint64, key s
 // CreateWithOptions 校验原始意图后冻结实时快照，在单个事务内隔离逐项业务失败。
 func (s *GenerationTaskService) CreateWithOptions(ctx context.Context, userID uint64, key string, req *model.CreateGenerationTaskReq, opts CreateTaskOptions) (*model.CreateGenerationTaskResp, error) {
 	// 1. 内部键只允许受信调用者使用；重放核验必须先于实时模型读取。
-	if req == nil || (opts.DramaRunBind == nil && strings.HasPrefix(key, InternalDramaFrameRunKeyPrefix)) {
-		return nil, errcode.ErrInvalidParams
-	}
-	nodes := reqNodes(req.NodeID, req.NodeIDs)
-	if len(key) > maxIdempotencyKeyLen-len("#9") {
-		return nil, errcode.ErrInvalidParams.WithMsg("Idempotency-Key 过长")
+	nodes, err := validateCreateOptions(key, req, opts)
+	if err != nil {
+		return nil, err
 	}
 	sig, err := computeCreateIntentSig(userID, key, req, nodes)
 	if opts.MarketingRender != nil {
@@ -48,12 +45,20 @@ func (s *GenerationTaskService) CreateWithOptions(ctx context.Context, userID ui
 	if err != nil {
 		return nil, err
 	}
-	all, err := s.validateBatchReplayHits(userID, sig, nodes, req, existing)
+	all, err := s.validateBatchReplayHits(userID, sig, nodes, req, existing, opts.DramaRunBind)
 	if err != nil {
 		return nil, err
 	}
-	if all {
+	if all && opts.DramaRunBind == nil {
 		return taskItems(nodes, existing, nil), nil
+	}
+	// 受信请求先执行无冻结的状态锁检；终态及重放不能依赖实时模型或报价是否仍可用。
+	if opts.DramaRunBind != nil {
+		batch := &taskBatch{userID: userID, key: key, sig: sig, nodes: nodes, req: req, opts: opts, existing: existing}
+		replay, err := s.tryDramaRunReplay(ctx, batch)
+		if replay != nil || err != nil {
+			return replay, err
+		}
 	}
 	// 2. 缺失项只能使用实时快照，绝不借历史快照补单。
 	snap, err := s.snapshotFor(ctx, req)
@@ -390,4 +395,25 @@ func checkAssetWith(ctx context.Context, assets provider.AssetStore, userID uint
 		return &modelcfg.FieldError{Field: ref.Key, Message: fmt.Sprintf("单个素材不能超过 %d MB", mb)}, nil
 	}
 	return nil, nil
+}
+
+// validDramaRunCreate 受信绑定只允许单个正式片段视频；Create 不提供 is_test 入口，试跑独立走 SubmitTest。
+func validDramaRunCreate(req *model.CreateGenerationTaskReq, opts CreateTaskOptions, nodes []string) bool {
+	bind := opts.DramaRunBind
+	return bind == nil || bind.RunID != 0 && bind.ConfirmRev > 0 && req.AgentRunID == 0 && len(nodes) == 1 && hasSegmentNode(nodes) && req.Kind == model.KindVideo && opts.MarketingRender == nil
+}
+
+// validateCreateOptions 统一拒绝公共保留键、非法受信目标和超长幂等键，先于任何数据库读取。
+func validateCreateOptions(key string, req *model.CreateGenerationTaskReq, opts CreateTaskOptions) ([]string, error) {
+	if req == nil || opts.DramaRunBind == nil && strings.HasPrefix(key, InternalDramaFrameRunKeyPrefix) {
+		return nil, errcode.ErrInvalidParams
+	}
+	nodes := reqNodes(req.NodeID, req.NodeIDs)
+	if !validDramaRunCreate(req, opts, nodes) {
+		return nil, errcode.ErrInvalidParams
+	}
+	if len(key) > maxIdempotencyKeyLen-len("#9") {
+		return nil, errcode.ErrInvalidParams.WithMsg("Idempotency-Key 过长")
+	}
+	return nodes, nil
 }

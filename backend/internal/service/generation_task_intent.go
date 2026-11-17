@@ -109,10 +109,7 @@ func (s *GenerationTaskService) Quote(ctx context.Context, userID uint64, req *m
 		return nil, errcode.ErrInvalidParams.WithMsg("node_ids 的数量必须等于生成数量")
 	}
 	effective := cloneMap(normalized)
-	perTaskInput := cloneMap(normalized)
-	if name := modelcfg.FanoutParam(caps); name != "" {
-		delete(perTaskInput, name)
-	}
+	perTaskInput := quotePerTaskInput(caps, normalized)
 	storedHash, err := jsonhash.CanonicalSHA256(s.storedInput(perTaskInput))
 	if err != nil {
 		return nil, err
@@ -134,14 +131,7 @@ func (s *GenerationTaskService) Quote(ctx context.Context, userID uint64, req *m
 	if err != nil {
 		return nil, err
 	}
-	return &model.TaskQuoteView{
-		EffectiveInput:   effective,
-		RawSize:          resolvePluginRawSize(snap, effective),
-		Credits:          assertion.TotalCredits,
-		PriceFingerprint: priceFP,
-		QuoteToken:       token,
-		ExpiresAt:        exp,
-	}, nil
+	return taskQuoteView(snap, effective, assertion, token), nil
 }
 
 // CheckIdempotentReplay 供外层单镜生成在检查锁定/繁忙/片长前预判幂等命中或冲突。
@@ -206,7 +196,7 @@ func computeTestRunIntentSig(userID uint64, rootKey string, kind, modelKey strin
 	})
 }
 
-func (s *GenerationTaskService) validateBatchReplayHits(userID uint64, rawSig string, nodes []string, req *model.CreateGenerationTaskReq, existing []*model.GenerationTask) (bool, error) {
+func (s *GenerationTaskService) validateBatchReplayHits(userID uint64, rawSig string, nodes []string, req *model.CreateGenerationTaskReq, existing []*model.GenerationTask, binds ...*DramaFrameRunBind) (bool, error) {
 	all := true
 	var cid *uint64
 	if req.CanvasID != 0 {
@@ -217,6 +207,9 @@ func (s *GenerationTaskService) validateBatchReplayHits(userID uint64, rawSig st
 		if hit == nil {
 			all = false
 			continue
+		}
+		if len(binds) > 0 && binds[0] != nil && !matchesDramaRunBind(hit, binds[0]) {
+			return false, errcode.ErrIdempotencyConflict
 		}
 		exp := taskReplayExpectation{
 			RawIntentSig: rawSig, BatchSize: len(nodes), BatchIndex: i,
@@ -362,24 +355,91 @@ func (s *GenerationTaskService) verifyQuoteAssertionLocked(ctx context.Context, 
 		}
 		q = parsed
 	}
-	if q.UserID != userID || !q.ExpiresAt.After(s.now()) || count != 1 || q.Count != 1 {
-		return nil, nil, 0, errcode.ErrDramaQuoteExpired
-	}
-	if editSchema == 1 && bind == nil && (q.SegmentID != segID || q.SegmentRevision != segRev) {
-		return nil, nil, 0, errcode.ErrDramaQuoteExpired
+	if err := s.assertQuoteScope(q, userID, count, segID, segRev, editSchema == 1 || bind != nil && q.SegmentID != 0, bind == nil && editSchema == 1); err != nil {
+		return nil, nil, 0, err
 	}
 	freshSnap, err := s.snapshotForTx(ctx, tx, req)
 	if err != nil {
-		if errors.Is(err, errcode.ErrModelUnavailable) {
-			return nil, nil, 0, errcode.ErrDramaQuoteExpired
-		}
-		return nil, nil, 0, err
+		return nil, nil, 0, quoteSnapshotError(err)
 	}
 	freshInput, err := assertQuoteMatchesLiveSnapshot(ctx, s, assets, userID, freshSnap, req.Input, fallbackInput, q)
 	if err != nil {
 		return nil, nil, 0, err
 	}
 	return freshSnap, freshInput, q.UnitCredits, nil
+}
+
+// VerifyQuoteToken 在确认首帧前验证单镜报价及实时模型快照，不创建任务或冻结积分。
+func (s *GenerationTaskService) VerifyQuoteToken(ctx context.Context, userID uint64, req *model.QuoteGenerationTaskReq, token string, opts ...QuoteTaskOptions) (*model.TaskQuoteView, error) {
+	// 1. 身份、有效期和片段上下界先校验，伪造令牌不能驱动后续素材访问。
+	if req == nil || req.ModelID == "" || req.Input == nil {
+		return nil, errcode.ErrDramaQuoteExpired
+	}
+	q, err := s.parseAndVerifyQuoteToken(token)
+	if err != nil {
+		return nil, err
+	}
+	var opt QuoteTaskOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if err := s.assertQuoteScope(q, userID, len(reqNodes(req.NodeID, req.NodeIDs)), opt.SegmentID, opt.SegmentRevision, true, true); err != nil {
+		return nil, err
+	}
+	// 2. 与最终提交共用规范化及价格断言；fanout 只用于计数，不进入逐任务哈希。
+	snap, err := s.snapshotFor(ctx, &model.CreateGenerationTaskReq{Kind: req.Kind, ModelID: req.ModelID})
+	if err != nil {
+		return nil, quoteSnapshotError(err)
+	}
+	norm, err := s.prepareInput(ctx, userID, snap, req.Input)
+	if err != nil || modelcfg.FanoutCount(snap.Model.Capabilities, norm) != 1 {
+		return nil, errcode.ErrDramaQuoteExpired
+	}
+	perTask := quotePerTaskInput(snap.Model.Capabilities, norm)
+	if _, err := assertQuoteMatchesLiveSnapshot(ctx, s, s.assets, userID, snap, req.Input, perTask, q); err != nil {
+		return nil, err
+	}
+	return taskQuoteView(snap, norm, q, token), nil
+}
+
+// quotePerTaskInput 报价与验价统一剥离生成数量，避免数量参数改变逐任务的持久化哈希。
+func quotePerTaskInput(caps modelcfg.Capabilities, normalized map[string]any) map[string]any {
+	input := cloneMap(normalized)
+	if name := modelcfg.FanoutParam(caps); name != "" {
+		delete(input, name)
+	}
+	return input
+}
+
+// taskQuoteView 初次报价和验证返回相同的有效输入、价格与有效期契约。
+func taskQuoteView(snap *provider.Snapshot, input map[string]any, q *model.TaskQuoteAssertion, token string) *model.TaskQuoteView {
+	return &model.TaskQuoteView{EffectiveInput: input, RawSize: resolvePluginRawSize(snap, input), Credits: q.TotalCredits,
+		PriceFingerprint: q.PriceFingerprint, QuoteToken: token, ExpiresAt: q.ExpiresAt}
+}
+
+// assertQuoteScope 统一确认与锁内提交的身份、单镜及可选片段版本断言。
+func (s *GenerationTaskService) assertQuoteScope(q *model.TaskQuoteAssertion, user uint64, count int, sid uint64, rev int64, checkSegment, checkRevision bool) error {
+	if q.UserID != user || !q.ExpiresAt.After(s.now()) || count != 1 || q.Count != 1 || q.TotalCredits != q.UnitCredits ||
+		checkSegment && q.SegmentID != sid || checkRevision && q.SegmentRevision != rev {
+		return errcode.ErrDramaQuoteExpired
+	}
+	return nil
+}
+
+// quoteSnapshotError 下架模型等业务漂移要求重新报价，基础设施故障保留原错误。
+func quoteSnapshotError(err error) error {
+	var business *errcode.Error
+	if errors.Is(err, provider.ErrModelUnavailable) || errors.As(err, &business) &&
+		(business.Code == errcode.ErrModelUnavailable.Code || business.Code == errcode.ErrTaskInput.Code) {
+		return errcode.ErrDramaQuoteExpired
+	}
+	return err
+}
+
+// FindByIdempotencyKey 按用户读取任务证据；缺失返回 repository.ErrNotFound，不触发任务创建。
+func (s *GenerationTaskService) FindByIdempotencyKey(ctx context.Context, userID uint64, key string) (*model.GenerationTask, error) {
+	// 1. 恢复与取消必须核对流程双向归属，不能将同键本身当作授权。
+	return s.repo.FindByIdempotencyKey(ctx, userID, key)
 }
 
 func assertQuoteMatchesLiveSnapshot(ctx context.Context, s *GenerationTaskService, assets provider.AssetStore, userID uint64, snap *provider.Snapshot, rawReqInput, fallbackStored map[string]any, q *model.TaskQuoteAssertion) (map[string]any, error) {
@@ -402,10 +462,7 @@ func assertQuoteMatchesLiveSnapshot(ctx context.Context, s *GenerationTaskServic
 	if freshUnit != q.UnitCredits {
 		return nil, errcode.ErrDramaQuoteExpired
 	}
-	perTask := cloneMap(freshNorm)
-	if fp := modelcfg.FanoutParam(snap.Model.Capabilities); fp != "" {
-		delete(perTask, fp)
-	}
+	perTask := quotePerTaskInput(snap.Model.Capabilities, freshNorm)
 	freshHash, err := jsonhash.CanonicalSHA256(s.storedInput(perTask))
 	fbHash, err2 := jsonhash.CanonicalSHA256(s.storedInput(fallbackStored))
 	if err != nil || err2 != nil || freshHash != fbHash || (q.InputHash != "" && freshHash != q.InputHash) {
@@ -428,4 +485,9 @@ func priceFingerprint(snap *provider.Snapshot) (string, error) {
 		PluginKey: snap.Plugin.Key, PluginVer: snap.Plugin.Version, PluginSHA: snap.Plugin.SHA256,
 		Caps: snap.Model.Capabilities, Pricing: snap.Model.Pricing,
 	})
+}
+
+// matchesDramaRunBind 受信重放必须同时匹配流程与确认版本，普通任务不能冒领内部键。
+func matchesDramaRunBind(task *model.GenerationTask, bind *DramaFrameRunBind) bool {
+	return task != nil && task.FrameRunID != nil && *task.FrameRunID == bind.RunID && task.FrameRunConfirmRev != nil && *task.FrameRunConfirmRev == bind.ConfirmRev
 }

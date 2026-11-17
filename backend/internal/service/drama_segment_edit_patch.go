@@ -20,25 +20,40 @@ func matchesExpectedTask(row *model.DramaSegment, req *model.UpdateDramaSegmentR
 	return *row.ChosenTaskID == uint64(*req.ExpectedTaskID)
 }
 
-// updateSegmentTake 在锁内校验同画布本段成功任务，默认换镜时清空六个精裁字段。
-func updateSegmentTake(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, row *model.DramaSegment, req *model.UpdateDramaSegmentReq) error {
+// updateSegmentTake 在锁内复用统一准入；显式清空持久化阻止以后自动采用。
+func (s *DramaSegmentService) updateSegmentTake(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, row *model.DramaSegment, req *model.UpdateDramaSegmentReq) error {
+	if req.ClearChosen {
+		if row.ChosenTaskID != nil {
+			repository.ResetSegmentEdit(row)
+		}
+		row.ChosenTaskID, row.ChosenCleared = nil, true
+		return nil
+	}
 	if req.ChosenTaskID == nil {
 		return nil
 	}
-	tasks, err := tx.SegmentTasks(ctx, row.UserID, p.CanvasID, segmentNode(row.ID))
+	takes, err := ResolveSegmentTakes(ctx, tx, s.assets, p, row)
 	if err != nil {
 		return err
 	}
-	id := uint64(*req.ChosenTaskID)
-	if !validSegmentTake(tasks, id) {
-		return errcode.ErrDramaTakeInvalid
+	take, err := findUsableSegmentTake(takes, uint64(*req.ChosenTaskID), false)
+	if err != nil {
+		return err
 	}
+	if _, err := PromoteSegmentVideoPendingRun(ctx, tx, p, row, take); err != nil {
+		return err
+	}
+	adoptSegmentTake(row, take.Task.ID, req.ResetEditOnTaskChange)
+	return nil
+}
+
+// adoptSegmentTake 默认换镜清空六个精裁字段，人工采用不受自动采用条件限制。
+func adoptSegmentTake(row *model.DramaSegment, id uint64, reset *bool) {
 	changed := row.ChosenTaskID == nil || *row.ChosenTaskID != id
-	if changed && (req.ResetEditOnTaskChange == nil || *req.ResetEditOnTaskChange) {
+	if changed && (reset == nil || *reset) {
 		repository.ResetSegmentEdit(row)
 	}
-	row.ChosenTaskID = &id
-	return nil
+	row.ChosenTaskID, row.ChosenCleared = &id, false
 }
 
 // applySegmentUpdate 合并部分更新；编辑边界统一使用目标素材规范化后的精确帧数。

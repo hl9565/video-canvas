@@ -59,9 +59,10 @@ func segEditPGEnv(t *testing.T, clock *time.Time) (*gorm.DB, uint64, *fakeTaskRe
 	t.Helper()
 	db := gtiTestDB(t)
 	if err := db.AutoMigrate(
+		&model.CanvasProject{},
 		&model.DramaProject{},
 		&model.DramaEpisode{},
-		&model.DramaSegment{},
+		&model.DramaSegment{}, &model.DramaSegmentFrameRun{}, &model.DramaSegmentTakeLink{},
 		&model.DramaJob{},
 		&model.Asset{},
 		&model.AssetMediaProbe{},
@@ -97,6 +98,7 @@ func segEditPGEnv(t *testing.T, clock *time.Time) (*gorm.DB, uint64, *fakeTaskRe
 
 	segSvc := service.NewDramaSegmentService(service.DramaSegmentDeps{
 		Repo:        dramaRepo,
+		Canvases:    repository.NewCanvasProjectRepository(db),
 		Tasks:       taskSvc,
 		Assets:      assets,
 		Probes:      probeRepo,

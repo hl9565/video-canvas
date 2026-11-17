@@ -119,6 +119,27 @@ function StudioBarHarness({ patch }: { patch?: Partial<Studio> }) {
 }
 
 describe("StudioBar：seed 胶囊、不合档位警示与窄屏收纳", () => {
+  test("首帧控镜与立即生成并列，打开当前片段的流程抽屉", async () => {
+    const opened: string[] = [];
+    const mounted = await dom.mount(
+      <StudioBarHarness
+        patch={{
+          frameRunDrawer: { openSegmentId: null, open: (id) => opened.push(id), close: () => {} },
+        }}
+      />,
+    );
+    try {
+      const button = Array.from(mounted.container.querySelectorAll("button")).find(
+        (b) => b.textContent === "首帧控镜",
+      );
+      expect(button).toBeDefined();
+      await dom.click(button);
+      expect(opened).toEqual(["s1"]);
+      expect(mounted.container.textContent).toContain("立即生成");
+    } finally {
+      await mounted.unmount();
+    }
+  });
   test("宽栏展示 seed 胶囊（可切换随机/恢复默认）、历史时长不合档位警示，窄屏展示「规格与参数」入口", async () => {
     const mounted = await dom.mount(<StudioBarHarness />);
 

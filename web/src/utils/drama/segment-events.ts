@@ -39,11 +39,12 @@ export function handleDramaSegmentEvent(event: DramaSegmentEvent) {
 /** 重新拉一集的片段（对账 / 首次载入）；失败不抛，返回是否成功 */
 export async function reloadSegments(dramaId: string, no: number): Promise<boolean> {
   try {
+    const startFloors = { ...useDramaSegmentsStore.getState().runFloors };
     const list = await listSegments(dramaId, no);
     const store = useDramaSegmentsStore.getState();
     const key = segmentKey(dramaId, no);
     const before = store.byEpisode[key];
-    store.setList(dramaId, no, list);
+    store.setList(dramaId, no, list, startFloors);
     refreshSummary(dramaId, before, useDramaSegmentsStore.getState().byEpisode[key]);
     return true;
   } catch {

@@ -78,6 +78,11 @@ type CanvasCoverSetter interface {
 	SetCoverIfEmpty(ctx context.Context, userID, canvasID, assetID uint64) error
 }
 
+// FrameRunCancelGuard 阻止普通任务取消绕过活跃的首帧流程直接中断关联生成任务。
+type FrameRunCancelGuard interface {
+	HasActiveFrameRunForTask(ctx context.Context, userID uint64, task *model.GenerationTask) (bool, error)
+}
+
 // GenerationTaskObserver 在任务提交后更新关联业务投影，不参与任务积分结算。
 type GenerationTaskObserver interface {
 	// OnTaskChanged 根据已持久化的任务更新关联业务数据。
@@ -86,15 +91,16 @@ type GenerationTaskObserver interface {
 
 // GenerationTaskDeps 是任务服务的依赖，全部以接口注入。
 type GenerationTaskDeps struct {
-	Repo        GenerationTaskRepo
-	Registry    provider.Registry
-	Executor    provider.Executor
-	Assets      provider.AssetStore
-	Broadcaster ws.Broadcaster // 为 nil 时不推送
-	Config      config.AI
-	Limits      TaskLimits        // 初始积分与并发上限的运行时来源（系统设置 + 单用户覆盖）；为 nil 时只用 Config
-	Covers      CanvasCoverSetter // 任务成功时把第一张生成的图写成画布封面；为 nil 时不写
-	QuoteSecret string            // 报价令牌签名密钥；为空时依次回落 Config.SecretKey 与进程随机密钥
+	Repo          GenerationTaskRepo
+	Registry      provider.Registry
+	Executor      provider.Executor
+	Assets        provider.AssetStore
+	Broadcaster   ws.Broadcaster // 为 nil 时不推送
+	Config        config.AI
+	Limits        TaskLimits          // 初始积分与并发上限的运行时来源（系统设置 + 单用户覆盖）；为 nil 时只用 Config
+	Covers        CanvasCoverSetter   // 任务成功时把第一张生成的图写成画布封面；为 nil 时不写
+	QuoteSecret   string              // 报价令牌签名密钥；为空时依次回落 Config.SecretKey 与进程随机密钥
+	FrameRunGuard FrameRunCancelGuard // 可选首帧活跃流程守卫；普通取消不得越过流程 状态机
 }
 
 // GenerationTaskOption 用于替换可注入的部分（主要给测试用）。
@@ -118,15 +124,16 @@ func WithQuoteTTL(ttl time.Duration) GenerationTaskOption {
 // GenerationTaskService 负责任务的提交、取消、查询、状态迁移与积分事务，并实现 provider.TaskStore。
 // worker（internal/provider/worker）只通过本服务导出的迁移方法改变任务状态，自己不碰事务和积分。
 type GenerationTaskService struct {
-	repo        GenerationTaskRepo
-	registry    provider.Registry
-	executor    provider.Executor
-	assets      provider.AssetStore
-	broadcaster ws.Broadcaster
-	cfg         config.AI
-	limits      TaskLimits
-	covers      CanvasCoverSetter
-	observer    GenerationTaskObserver
+	repo          GenerationTaskRepo
+	registry      provider.Registry
+	executor      provider.Executor
+	assets        provider.AssetStore
+	broadcaster   ws.Broadcaster
+	cfg           config.AI
+	limits        TaskLimits
+	covers        CanvasCoverSetter
+	observer      GenerationTaskObserver
+	frameRunGuard FrameRunCancelGuard
 
 	validateInput func(kind string, caps modelcfg.Capabilities, input map[string]any) (map[string]any, []modelcfg.FieldError)
 	now           func() time.Time
@@ -152,6 +159,7 @@ func NewGenerationTaskService(deps GenerationTaskDeps, opts ...GenerationTaskOpt
 		cfg:           deps.Config,
 		limits:        deps.Limits,
 		covers:        deps.Covers,
+		frameRunGuard: deps.FrameRunGuard,
 		validateInput: modelcfg.ValidateInput,
 		now:           time.Now,
 		quoteSecret:   resolveQuoteSecret(deps.QuoteSecret, deps.Config.SecretKey),
@@ -170,6 +178,11 @@ func NewGenerationTaskService(deps GenerationTaskDeps, opts ...GenerationTaskOpt
 func (s *GenerationTaskService) SetTaskObserver(observer GenerationTaskObserver) {
 	// 1. 关联业务依赖任务服务，通过初始化后注入解除构造顺序的循环。
 	s.observer = observer
+}
+
+// SetFrameRunCancelGuard 在初始化时绑定首帧活跃流程守卫，禁止普通取消接口绕过流程撤销任务。
+func (s *GenerationTaskService) SetFrameRunCancelGuard(guard FrameRunCancelGuard) {
+	s.frameRunGuard = guard
 }
 
 // maxActiveTasks 返回用户进行中任务的上限：单用户覆盖 > 系统设置默认 > DefaultMaxActiveTasks。

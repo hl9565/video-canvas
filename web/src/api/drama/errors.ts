@@ -62,6 +62,16 @@ export const DRAMA_ERR = {
   quoteExpired: FORK_ERR.quoteExpired,
   /** 分镜剪辑参数不合法（400，Msg 写具体原因） */
   editInvalid: FORK_ERR.editInvalid,
+  /** 首帧流程不存在 */
+  frameRunNotFound: FORK_ERR.frameRunNotFound,
+  /** 首帧状态或活跃流程冲突 */
+  frameRunConflict: FORK_ERR.frameRunConflict,
+  /** 任务归属或确认快照不一致 */
+  frameRunInconsistent: FORK_ERR.frameRunInconsistent,
+  /** 已驳回的候选不能采用 */
+  takeQcRejected: FORK_ERR.takeQcRejected,
+  /** 首帧无效或未就绪 */
+  frameInvalid: FORK_ERR.frameInvalid,
   /** 内容触发了模型的安全过滤（Msg 可点名被过滤的资产） */
   contentFiltered: 67029,
 } as const;

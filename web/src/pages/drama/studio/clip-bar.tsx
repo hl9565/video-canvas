@@ -103,7 +103,8 @@ function Clip({
  * 连播：按 seq 依次播采用的视频，播放头随时间移动，点片段跳到该段开头。
  */
 export function ClipBar() {
-  const { segments, selected, select, actions, trimDrawer } = useStudio();
+  const { segments, selected, select, actions, trimDrawer, frameRunDrawer, importTakesModal } =
+    useStudio();
   const playback = usePlaybackContext();
   const { bindPlayhead } = playback;
   // 拖动过程中只改本地顺序，松手再提交；store 里的片段一变（推送、服务端确认）就回到 store 的版本
@@ -190,12 +191,29 @@ export function ClipBar() {
         <Button
           variant="ghost"
           size="sm"
+          disabled={!selected || !importTakesModal}
+          onClick={() => selected && importTakesModal?.open(selected.id)}
+        >
+          导入画布视频
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
           disabled={!canTrim}
           title={canTrim ? "精裁当前选中片段与原声" : "先生成或采用视频后才能修剪"}
           onClick={openSelectedTrim}
         >
           <Scissors />
           修剪
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={!selected || !frameRunDrawer}
+          onClick={() => selected && frameRunDrawer?.open(selected.id)}
+        >
+          <Film />
+          首帧控镜
         </Button>
         <Button variant="ghost" size="sm" onClick={() => void actions.batch()}>
           <Layers />

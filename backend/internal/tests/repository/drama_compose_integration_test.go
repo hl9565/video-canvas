@@ -9,7 +9,7 @@ import (
 )
 
 func TestDramaComposeRepository_SegmentVersions(t *testing.T) {
-	db := isolatedDB(t, &model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{})
+	db := isolatedDB(t, &model.DramaProject{}, &model.DramaEpisode{}, &model.DramaSegment{}, &model.DramaSegmentFrameRun{}, &model.DramaSegmentTakeLink{})
 	p := model.DramaProject{UserID: 1, CanvasID: 9, Title: "剧", SourceText: "文", StyleKey: "real_city_film"}
 	if err := db.Create(&p).Error; err != nil {
 		t.Fatal(err)

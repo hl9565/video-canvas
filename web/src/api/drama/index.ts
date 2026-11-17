@@ -18,6 +18,16 @@ import type {
   BackendSegmentEdit,
   BackendSegmentGenerateBody,
   BackendSegmentView,
+  BackendSegmentFrameRun,
+  SegmentFrameRun,
+  CreateFrameRunInput,
+  SetFrameRunFrameInput,
+  ConfirmFrameRunInput,
+  SubmitFrameRunInput,
+  SubmitFrameRunResult,
+  CancelFrameRunInput,
+  ImportSegmentTakesInput,
+  PatchTakeQCInput,
   BackendSourcePreflight,
   BackendTaskQuote,
   CreateDramaInput,
@@ -237,8 +247,15 @@ export const mapSegment = (raw: BackendSegmentView): Segment => ({
     asset: take.asset ? mapAsset(take.asset) : null,
     errorMessage: take.error_message ?? "",
     createdAt: take.created_at,
+    origin: take.origin ?? "native",
+    qc: take.qc ?? "unreviewed",
+    ...(take.run_id ? { runId: String(take.run_id) } : {}),
+    ...(take.source_canvas_id ? { sourceCanvasId: String(take.source_canvas_id) } : {}),
+    ...(take.frame_asset_id ? { frameAssetId: String(take.frame_asset_id) } : {}),
   })),
   chosenTaskId: raw.chosen_task_id ? String(raw.chosen_task_id) : "",
+  chosenCleared: raw.chosen_cleared ?? false,
+  frameRun: raw.frame_run ? mapFrameRun(raw.frame_run) : null,
   sourceFrameCount: typeof raw.source_frame_count === "number" ? raw.source_frame_count : null,
   ...(typeof raw.has_audio === "boolean" ? { hasAudio: raw.has_audio } : {}),
   edit: mapSegmentEdit(raw.edit),
@@ -378,6 +395,7 @@ export const toSegmentUpdateBody = (input: UpdateSegmentInput) =>
     prompt: input.prompt,
     seconds: input.seconds,
     chosen_task_id: input.chosenTaskId,
+    clear_chosen: input.clearChosen === true ? true : undefined,
     // expected_task_id === null 转为 ""，因为后端 *idcodec.ID 只有 "" 会解码成 0
     expected_task_id:
       input.expectedTaskId === undefined
@@ -623,6 +641,232 @@ export const addSegment = async (
       seconds: body.seconds,
       after_seq: body.afterSeq,
     }),
+  );
+
+/**
+ * 获取单片段及当前首帧流程。
+ * @param sid 片段 ID
+ * @returns 片段快照
+ */
+export const getSegment = async (sid: string): Promise<Segment> =>
+  mapSegment(
+    await service.get<BackendSegmentView>(`/drama-segments/${sid}`, undefined, { silent: true }),
+  );
+
+/** 首帧流程 snake→camel；可选归属字段不虚构 ID。 */
+export const mapFrameRun = (raw: BackendSegmentFrameRun): SegmentFrameRun => ({
+  id: String(raw.id),
+  segmentId: String(raw.segment_id),
+  requestKey: raw.request_key,
+  frameSource: raw.frame_source,
+  state: raw.state,
+  segmentRevision: raw.segment_revision,
+  revision: raw.revision,
+  confirmedVersion: raw.confirmed_version ?? 0,
+  modelKey: raw.model_key ?? "",
+  ...(raw.origin_canvas_id ? { originCanvasId: String(raw.origin_canvas_id) } : {}),
+  ...(raw.frame_task_id ? { frameTaskId: String(raw.frame_task_id) } : {}),
+  ...(raw.frame_asset_id ? { frameAssetId: String(raw.frame_asset_id) } : {}),
+  ...(raw.video_task_id ? { videoTaskId: String(raw.video_task_id) } : {}),
+  adoptIfEmpty: raw.adopt_if_empty ?? false,
+  frameSha256: raw.frame_sha256 ?? "",
+  canvasTicket: raw.canvas_ticket,
+  confirmedInput: raw.confirmed_input,
+  submittingAt: raw.submitting_at,
+  errorCode: raw.error_code ?? "",
+  errorMessage: raw.error_message ?? "",
+  createdAt: raw.created_at,
+  updatedAt: raw.updated_at,
+});
+
+const frameRunPath = (sid: string, rid?: string) =>
+  `/drama-segments/${sid}/frame-runs${rid ? `/${rid}` : ""}`;
+
+/**
+ * 创建首帧流程（201 或幂等重放 200）；仅由任务 gateway 调用。
+ * @param sid 片段 ID
+ * @param input 同次重试复用请求键及请求体
+ * @returns 流程快照
+ */
+export const createFrameRun = async (
+  sid: string,
+  input: CreateFrameRunInput,
+): Promise<SegmentFrameRun> =>
+  mapFrameRun(
+    await service.post<BackendSegmentFrameRun>(
+      frameRunPath(sid),
+      compact({
+        request_key: input.requestKey,
+        segment_revision: input.segmentRevision,
+        frame_source: input.frameSource,
+        frame_asset_id: input.frameAssetId,
+        origin_canvas_id: input.originCanvasId,
+        model_id: input.modelId,
+        input: input.input,
+        adopt_if_empty: input.adoptIfEmpty,
+      }),
+      { silent: true },
+    ),
+  );
+
+/**
+ * 读取首帧流程，含画布回传后的最新版本。
+ * @param sid 片段 ID
+ * @param rid 流程 ID
+ * @returns 流程快照
+ */
+export const getFrameRun = async (sid: string, rid: string): Promise<SegmentFrameRun> =>
+  mapFrameRun(
+    await service.get<BackendSegmentFrameRun>(frameRunPath(sid, rid), undefined, { silent: true }),
+  );
+
+/**
+ * 替换首帧，服务端裁切并撤销旧确认。
+ * @param sid 片段 ID
+ * @param rid 流程 ID
+ * @param input 版本、素材及可选画布票据
+ * @returns 带实际 16:9 素材和指纹的快照
+ */
+export const setFrameRunFrame = async (
+  sid: string,
+  rid: string,
+  input: SetFrameRunFrameInput,
+): Promise<SegmentFrameRun> =>
+  mapFrameRun(
+    await service.post<BackendSegmentFrameRun>(
+      `${frameRunPath(sid, rid)}/frame`,
+      compact({
+        revision: input.revision,
+        frame_asset_id: input.frameAssetId,
+        origin_canvas_id: input.originCanvasId,
+        canvas_ticket: input.canvasTicket,
+      }),
+      { silent: true },
+    ),
+  );
+
+/**
+ * 冻结首帧指纹、模型输入和服务端报价。
+ * @param sid 片段 ID
+ * @param rid 流程 ID
+ * @param input 确认快照
+ * @returns 已确认的流程
+ */
+export const confirmFrameRun = async (
+  sid: string,
+  rid: string,
+  input: ConfirmFrameRunInput,
+): Promise<SegmentFrameRun> =>
+  mapFrameRun(
+    await service.post<BackendSegmentFrameRun>(
+      `${frameRunPath(sid, rid)}/confirm`,
+      compact({
+        revision: input.revision,
+        segment_revision: input.segmentRevision,
+        frame_asset_id: input.frameAssetId,
+        frame_sha256: input.frameSha256,
+        adopt_if_empty: input.adoptIfEmpty,
+        model_id: input.modelId,
+        input: input.input,
+        quote_token: input.quoteToken,
+      }),
+      { silent: true },
+    ),
+  );
+
+/**
+ * 提交已确认版本（202）；仅由 gateway 接受任务快照。
+ * @param sid 片段 ID
+ * @param rid 流程 ID
+ * @param input 流程版本和确认版本
+ * @returns 流程及任务快照
+ */
+export const submitFrameRun = async (
+  sid: string,
+  rid: string,
+  input: SubmitFrameRunInput,
+): Promise<SubmitFrameRunResult> => {
+  const res = await service.post<{
+    run: BackendSegmentFrameRun;
+    task: SubmitFrameRunResult["task"];
+  }>(
+    `${frameRunPath(sid, rid)}/submit`,
+    { revision: input.revision, confirmed_version: input.confirmedVersion },
+    { silent: true },
+  );
+  return { run: mapFrameRun(res.run), task: res.task };
+};
+
+/**
+ * 取消首帧流程；仅经任务 gateway 调用。
+ * @param sid 片段 ID
+ * @param rid 流程 ID
+ * @param input 流程 CAS 版本
+ * @returns 最新流程
+ */
+export const cancelFrameRun = async (
+  sid: string,
+  rid: string,
+  input: CancelFrameRunInput,
+): Promise<SegmentFrameRun> =>
+  mapFrameRun(
+    await service.post<BackendSegmentFrameRun>(
+      `${frameRunPath(sid, rid)}/cancel`,
+      { revision: input.revision },
+      { silent: true },
+    ),
+  );
+
+/**
+ * 导入画布视频候选，保留既有来源与质检。
+ * @param sid 片段 ID
+ * @param input 片段版本、来源和所选任务
+ * @returns 更新后的片段及集版本
+ */
+export const importSegmentTakes = async (
+  sid: string,
+  input: ImportSegmentTakesInput,
+): Promise<Segment> =>
+  mapSegment(
+    await service.post<BackendSegmentView>(
+      `/drama-segments/${sid}/takes/import`,
+      compact({
+        revision: input.revision,
+        source_canvas_id: input.sourceCanvasId,
+        task_id: input.taskId,
+        task_ids: input.taskIds,
+        adopt: input.adopt,
+        reset_edit_on_task_change: input.resetEditOnTaskChange,
+      }),
+      { silent: true },
+    ),
+  );
+
+/**
+ * 更新候选质检；驳回当前采用项必须显式替换或清空。
+ * @param sid 片段 ID
+ * @param tid 候选任务 ID
+ * @param input 质检、版本及采用处置
+ * @returns 更新后的片段
+ */
+export const patchTakeQC = async (
+  sid: string,
+  tid: string,
+  input: PatchTakeQCInput,
+): Promise<Segment> =>
+  mapSegment(
+    await service.patch<BackendSegmentView>(
+      `/drama-segments/${sid}/takes/${tid}`,
+      compact({
+        revision: input.revision,
+        qc: input.qc,
+        expected_segment_version: input.expectedSegmentVersion,
+        replacement_task_id: input.replacementTaskId,
+        clear_chosen: input.clearChosen,
+        reset_edit_on_task_change: input.resetEditOnTaskChange,
+      }),
+      { silent: true },
+    ),
   );
 
 /** 改片段；revision 冲突（409）、67011 由调用方处理，不弹全局提示 */

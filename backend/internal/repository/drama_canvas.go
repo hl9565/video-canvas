@@ -135,6 +135,9 @@ func (t *dramaCanvasTx) DeleteEpisode(ctx context.Context, userID, dramaID uint6
 	if err := db.Where("user_id = ? AND drama_id = ? AND no = ?", userID, dramaID, no).First(&ep).Error; err != nil {
 		return translate(err)
 	}
+	if err := (&DramaRepository{db: db}).CancelEpisodeFrameRuns(ctx, userID, ep.ID); err != nil {
+		return err
+	}
 	if err := db.Where("user_id = ? AND episode_id = ?", userID, ep.ID).Delete(&model.DramaSegment{}).Error; err != nil {
 		return err
 	}

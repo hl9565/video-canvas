@@ -64,7 +64,7 @@ func sameNullableInt32(a, b *int32) bool {
 }
 
 func segmentMaterialChanged(prev, cur *model.DramaSegment) bool {
-	if prev.Seq != cur.Seq || !sameChosenTask(prev.ChosenTaskID, cur.ChosenTaskID) {
+	if prev.Seq != cur.Seq || prev.ChosenCleared != cur.ChosenCleared || !sameChosenTask(prev.ChosenTaskID, cur.ChosenTaskID) {
 		return true
 	}
 	return prev.SourceInF != cur.SourceInF ||
@@ -106,7 +106,7 @@ func (r *DramaRepository) SaveSegmentNoBump(ctx context.Context, row *model.Dram
 	}
 	res := r.db.WithContext(ctx).Model(&model.DramaSegment{}).Where("user_id = ? AND episode_id = ? AND id = ? AND revision = ?", row.UserID, row.EpisodeID, row.ID, revision).Updates(map[string]any{
 		"seq": row.Seq, "seconds": row.Seconds, "prompt": row.Prompt,
-		"chosen_task_id": row.ChosenTaskID, "adaptations": segmentAdaptations(row.Adaptations),
+		"chosen_task_id": row.ChosenTaskID, "chosen_cleared": row.ChosenCleared, "adaptations": segmentAdaptations(row.Adaptations),
 		"source_in_f": row.SourceInF, "source_out_f": sourceOutF,
 		"mute_original": row.MuteOriginal, "audio_gain_db": row.AudioGainDB,
 		"native_is_dialogue": row.NativeIsDialogue, "av_pts_offset_ms": row.AvPtsOffsetMs,
@@ -124,17 +124,32 @@ func (r *DramaRepository) SaveSegmentNoBump(ctx context.Context, row *model.Dram
 
 // DeleteSegment 只软删当前用户存活项目下的片段，缺失返回ErrNotFound；任务和素材不受影响。
 func (r *DramaRepository) DeleteSegment(ctx context.Context, userID, id uint64) error {
-	episodeID, err := r.DeleteSegmentNoBump(ctx, userID, id)
-	if err != nil {
-		return err
-	}
-	return r.BumpSegmentVersion(ctx, userID, episodeID)
+	return r.withDramaWriteTx(ctx, func(tx *DramaRepository) error {
+		episodeID, err := tx.DeleteSegmentNoBump(ctx, userID, id)
+		if err != nil {
+			return err
+		}
+		return tx.BumpSegmentVersion(ctx, userID, episodeID)
+	})
 }
 
 // DeleteSegmentNoBump 只软删当前用户存活项目下的片段，返回所属 episodeID 且不递增 segment_version。
 func (r *DramaRepository) DeleteSegmentNoBump(ctx context.Context, userID, id uint64) (uint64, error) {
+	var episodeID uint64
+	err := r.withDramaWriteTx(ctx, func(tx *DramaRepository) error {
+		var err error
+		episodeID, err = tx.deleteSegmentNoBump(ctx, userID, id)
+		return err
+	})
+	return episodeID, err
+}
+
+func (r *DramaRepository) deleteSegmentNoBump(ctx context.Context, userID, id uint64) (uint64, error) {
 	row, err := r.Segment(ctx, userID, id, false)
 	if err != nil {
+		return 0, err
+	}
+	if err := r.CancelSegmentFrameRuns(ctx, userID, id); err != nil {
 		return 0, err
 	}
 	res := r.db.WithContext(ctx).Where("user_id = ? AND id = ? AND episode_id IN (?)", userID, id, r.liveSegmentEpisodes(ctx, userID)).Delete(&model.DramaSegment{})
@@ -178,7 +193,14 @@ func (r *DramaRepository) BumpProjectNewSchemaEpisodeVersions(ctx context.Contex
 
 // ReplaceSegments 在调用方项目锁保护的事务内替换全集片段，不删除历史任务和素材。
 func (r *DramaRepository) ReplaceSegments(ctx context.Context, userID, episodeID uint64, rows []model.DramaSegment) error {
+	return r.withDramaWriteTx(ctx, func(tx *DramaRepository) error { return tx.replaceSegments(ctx, userID, episodeID, rows) })
+}
+
+func (r *DramaRepository) replaceSegments(ctx context.Context, userID, episodeID uint64, rows []model.DramaSegment) error {
 	if _, err := r.SegmentEpisode(ctx, userID, episodeID); err != nil {
+		return err
+	}
+	if err := r.CancelEpisodeFrameRuns(ctx, userID, episodeID); err != nil {
 		return err
 	}
 	if err := r.db.WithContext(ctx).Where("user_id = ? AND episode_id = ?", userID, episodeID).Delete(&model.DramaSegment{}).Error; err != nil {
@@ -203,7 +225,7 @@ func (r *DramaRepository) SegmentTasks(ctx context.Context, userID, canvasID uin
 	return rows, err
 }
 
-// HasSegmentTakes 判断同用户存活项目下该集现有片段是否有任何视频任务，包括失败或进行中的任务。
+// HasSegmentTakes 判断存活片段是否存在有效导入候选、活跃或双向匹配的流程及原生视频任务；悬空关联及归属失效的流程孤儿不计入。
 func (r *DramaRepository) HasSegmentTakes(ctx context.Context, userID, episodeID uint64) (bool, error) {
 	ep, err := r.SegmentEpisode(ctx, userID, episodeID)
 	if err != nil {
@@ -218,11 +240,35 @@ func (r *DramaRepository) HasSegmentTakes(ctx context.Context, userID, episodeID
 		return false, err
 	}
 	nodes := make([]string, len(segments))
+	ids := make([]uint64, len(segments))
 	for i := range segments {
 		nodes[i] = "seg:" + idcodec.Encode(segments[i].ID)
+		ids[i] = segments[i].ID
 	}
 	var count int64
-	err = r.db.WithContext(ctx).Model(&model.GenerationTask{}).Where("user_id = ? AND canvas_project_id = ? AND node_id IN ? AND kind = ? AND is_test = false", userID, project.CanvasID, nodes, model.KindVideo).Count(&count).Error
+	if err := r.db.WithContext(ctx).Model(&model.DramaSegmentFrameRun{}).
+		Where("user_id = ? AND segment_id IN ? AND state IN ?", userID, ids, activeFrameRunStates()).
+		Limit(1).Count(&count).Error; err != nil || count > 0 {
+		return count > 0, err
+	}
+	if err := r.db.WithContext(ctx).Table("drama_segment_frame_runs AS r").
+		Joins("JOIN generation_tasks AS t ON t.id = r.video_task_id AND t.user_id = r.user_id AND t.frame_run_id = r.id AND t.frame_run_confirm_rev = r.confirmed_version").
+		Where("r.user_id = ? AND r.segment_id IN ? AND r.state = ? AND t.kind = ? AND t.is_test = false", userID, ids, model.FrameRunStateBound, model.KindVideo).
+		Limit(1).Count(&count).Error; err != nil || count > 0 {
+		return count > 0, err
+	}
+	if err := r.db.WithContext(ctx).Table("drama_segment_take_links AS l").
+		Joins("JOIN generation_tasks AS t ON t.id = l.task_id AND t.user_id = l.user_id").
+		Where("l.user_id = ? AND l.segment_id IN ? AND t.kind = ? AND t.is_test = false AND t.frame_run_id IS NULL", userID, ids, model.KindVideo).
+		Where("((l.origin = ? AND t.canvas_project_id = l.source_canvas_id) OR (l.origin = ? AND t.canvas_project_id = ?))",
+			model.TakeOriginCanvasImport, model.TakeOriginNative, project.CanvasID).
+		Limit(1).Count(&count).Error; err != nil || count > 0 {
+		return count > 0, err
+	}
+	// 有效 I2V 已由流程计入；旧任务分支只统计无流程标记的原生任务，避免孤儿任务绕过取消和归属校验。
+	err = r.db.WithContext(ctx).Model(&model.GenerationTask{}).
+		Where("user_id = ? AND canvas_project_id = ? AND node_id IN ? AND kind = ? AND is_test = false AND frame_run_id IS NULL", userID, project.CanvasID, nodes, model.KindVideo).
+		Limit(1).Count(&count).Error
 	return count > 0, err
 }
 
