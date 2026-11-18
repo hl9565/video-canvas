@@ -139,6 +139,10 @@ export type DramaComposeSize = "720p" | "1080p";
 export type DramaComposeVariant = "clean" | "packaged";
 
 export interface BackendComposeExport {
+  audio_sha256?: string;
+  lufs?: number | null;
+  true_peak?: number | null;
+  loudness_status?: string;
   sha256: string;
   variant: DramaComposeVariant;
   size: DramaComposeSize;
@@ -311,6 +315,10 @@ export interface DramaJob {
 }
 
 export interface DramaComposeExport {
+  audioSha256?: string;
+  lufs?: number | null;
+  truePeak?: number | null;
+  loudnessStatus?: string;
   sha256: string;
   variant: DramaComposeVariant;
   size: DramaComposeSize;
@@ -466,6 +474,12 @@ export interface DramaJobInput {
   compose?: DramaComposeInput;
   /** compose：客户端幂等键（最长 96 字符） */
   composeRequestKey?: string;
+  /** compose / storyboard：当前集号对应的稳定分集 ID；不匹配时后端返回 91001 */
+  expectedEpisodeId?: string;
+  /** storyboard：在入队事务中清空旧片段 */
+  confirmClear?: boolean;
+  /** storyboard：确认清空时看到的集片段版本 */
+  expectedSegmentVersion?: number;
 }
 
 /** WebSocket drama.episode 事件载荷：该集剧本状态已保存，需重新读取短剧详情。 */
@@ -747,6 +761,104 @@ export interface SegmentEdit {
 
 export type SegmentEditPatch = Partial<SegmentEdit>;
 
+/** Stage C 分镜画面来源，旧分镜默认为 video。 */
+export type VisualKind = "video" | "still" | "black";
+
+/** 24fps 整数帧特效与静帧预设，空对象表示无特效。 */
+export interface SegmentFx {
+  fade_in_f?: number;
+  fade_out_f?: number;
+  flash_in_f?: number;
+  flash_out_f?: number;
+  native_fade_in_f?: number;
+  native_fade_out_f?: number;
+  zoom_start?: number;
+  zoom_end?: number;
+  shake_px?: number;
+  crop_y?: number;
+  seed?: number;
+}
+
+/** 构造请求时，十进制字符串只在 Number.isSafeInteger(Number(id)) 时转成数字；大 ID 直接传原字符串。 */
+export type DramaAssetIDInput = number | string;
+
+/** Stage C 的 PATCH 视觉字段，still_asset_id 省略表示不改，null 表示清空，空串无效。 */
+export interface BackendSegmentVisualPatch {
+  visual_kind?: VisualKind;
+  still_asset_id?: DramaAssetIDInput | null;
+  fx?: SegmentFx;
+}
+
+export type ProgramAudioRole = "narration" | "sfx" | "bgm" | "room_tone";
+
+/** 母版绝对帧区间与视频源帧锚点二选一，只有背景音乐和环境底噪可闪避。 */
+type ProgramAudioPlacement =
+  | {
+      role: "sfx";
+      anchor: { segment_id: string; source_f: number };
+      length_f: number;
+      start_f?: never;
+      end_f?: never;
+      duck_db?: never;
+    }
+  | ({
+      start_f: number;
+      end_f: number;
+      anchor?: never;
+      length_f?: never;
+    } & (
+      | { role: "bgm" | "room_tone"; duck_db?: -8; loop?: boolean }
+      | { role: Exclude<ProgramAudioRole, "bgm" | "room_tone">; duck_db?: never; loop?: never }
+    ));
+
+interface ProgramAudioParams {
+  src_in_sample: number;
+  /** null 表示读取到源音频末尾。 */
+  src_out_sample: number | null;
+  gain_db: number;
+  av_pts_offset_ms: number;
+  fade_in_f?: number;
+  fade_out_f?: number;
+}
+
+/** 后端音频条目视图，素材 ID 是十进制 JSON 数字。 */
+export type ProgramAudioCue = { id: string; asset_id: number } & ProgramAudioPlacement &
+  ProgramAudioParams;
+
+export type ProgramAudioCueInput = {
+  id: string;
+  asset_id: DramaAssetIDInput;
+} & ProgramAudioPlacement &
+  Partial<ProgramAudioParams>;
+
+/** 公开节目单；本阶段保留空叠层数组。 */
+export interface EpisodeProgram {
+  v: 1;
+  audio: ProgramAudioCue[];
+  overlays: [];
+}
+
+/** 业务错误 data 中的条目诊断，按需定位音频条目或分镜。 */
+export interface ProgramDiagnostic {
+  cue_id?: string;
+  segment_id?: string;
+  field: string;
+  reason: string;
+  severity: string;
+}
+
+/** PUT /program 整体替换请求，重绑须显式提供对应音频条目 ID。 */
+export interface PutEpisodeProgramReq {
+  expected_episode_id: string;
+  expected_segment_version: number;
+  program: {
+    v: 1;
+    audio?: ProgramAudioCueInput[] | null;
+    overlays?: [] | null;
+  };
+  rebind_anchor_cue_ids?: string[];
+}
+
 export interface BackendSegmentView {
   id: string;
   /** 所属分集稳定实体 ID（可选） */
@@ -767,6 +879,10 @@ export interface BackendSegmentView {
   has_audio?: boolean;
   /** 逐镜精裁与原声参数 */
   edit?: Partial<BackendSegmentEdit> | null;
+  visual_kind?: VisualKind;
+  /** 静帧素材 ID 与首帧素材 ID 一样，后端输出十进制数字。 */
+  still_asset_id?: number;
+  fx?: SegmentFx;
   status: SegmentStatus;
   revision: number;
   /** 后端随段视图回传的集级内容版本号（可选） */
@@ -844,6 +960,14 @@ export interface Segment {
   hasAudio?: boolean;
   /** 逐镜精裁与原声参数（旧测试夹具可省略，读取请用 segmentEditOf） */
   edit?: SegmentEdit;
+  /** 替代视频的静帧或黑场。 */
+  visualKind?: VisualKind;
+  /** 静帧素材 ID；未设置时为 null。 */
+  stillAssetId?: number | null;
+  /** 超出 JS 安全整数时，客户端保留响应中的精确十进制 ID。 */
+  stillAssetIdText?: string;
+  /** 逐镜画面与原声特效。 */
+  fx?: SegmentFx;
   status: SegmentStatus;
   revision: number;
   /** 后端回传的集级内容版本号（用于即时同步，避免仅依赖异步详情刷新） */
@@ -867,6 +991,12 @@ export interface UpdateSegmentInput {
   resetEditOnTaskChange?: boolean;
   /** 逐镜精裁与原声局部更新；sourceOutF 显式 null 表示恢复片尾 EOF */
   edit?: SegmentEditPatch;
+  /** 画面模式。 */
+  visualKind?: VisualKind;
+  /** 静帧素材 ID；null 显式清空。 */
+  stillAssetId?: DramaAssetIDInput | null;
+  /** 替换整组特效；空对象清空。 */
+  fx?: SegmentFx;
   /** 手改某个格式的转写稿 */
   adaptation?: { format: AdaptFormat; prompt: string };
 }
@@ -1025,6 +1155,9 @@ export interface BackendEpisodePreviewView {
   status: EpisodePreviewStatus;
   stream_url?: string;
   expires_at: number;
+  error_code?: number | null;
+  error_message?: string | null;
+  program_diagnostics?: ProgramDiagnostic[];
 }
 
 export interface EpisodePreviewView {
@@ -1032,6 +1165,9 @@ export interface EpisodePreviewView {
   status: EpisodePreviewStatus;
   streamUrl: string | null;
   expiresAt: number;
+  errorCode?: number | null;
+  errorMessage?: string | null;
+  programDiagnostics?: ProgramDiagnostic[];
 }
 
 /** WebSocket drama.segment 事件载荷（原样 snake_case） */
@@ -1223,4 +1359,170 @@ export interface BackendSourcePreflight {
     credits: number;
     minutes: number;
   };
+}
+
+/** GET /program 与 PUT /program 的公开节目单及编辑基线。 */
+export interface BackendEpisodeProgramView {
+  /** 编码后的分集主键。 */
+  episode_id: string;
+  /** 同时约束分镜和节目单保存的版本。 */
+  segment_version: number;
+  /** 精裁编辑模式。 */
+  edit_schema: number;
+  /** 公开可编辑节目单。 */
+  program: EpisodeProgram;
+}
+
+/** 客户端使用的节目单和 CAS 基线。 */
+export interface EpisodeProgramView {
+  /** 编码后的分集主键。 */
+  episodeId: string;
+  /** 当前片段内容版本。 */
+  segmentVersion: number;
+  /** 精裁编辑模式。 */
+  editSchema: number;
+  /** 可直接用于构造写入请求的可编辑字段。 */
+  program: EpisodeProgram;
+}
+
+/** 已解析锚点可同时携带母版帧区间；诊断条目保留原坐标。 */
+export type DramaManifestV2AudioCue =
+  | Exclude<ProgramAudioCue, { anchor: { segment_id: string; source_f: number } }>
+  | (Omit<
+      Extract<ProgramAudioCue, { anchor: { segment_id: string; source_f: number } }>,
+      "start_f" | "end_f"
+    > & {
+      /** 已解析的母版起点，单位为帧。 */
+      start_f?: number;
+      /** 已解析的母版排他出点，单位为帧。 */
+      end_f?: number;
+    });
+
+/** V2 清单音频；渲染诊断不会删除条目。 */
+export interface DramaManifestV2Program extends Omit<EpisodeProgram, "audio"> {
+  /** 解析后的音频条目。 */
+  audio: DramaManifestV2AudioCue[];
+}
+
+/** V2 清单片段线协议。静帧和黑场没有 task_id。 */
+export interface BackendDramaManifestV2Clip extends Omit<
+  BackendDramaManifestClip,
+  "segment_id" | "task_id" | "asset_id" | "sha256"
+> {
+  /** 编码后的分镜主键。 */
+  segment_id: string;
+  /** 视频采用任务的编码主键。 */
+  task_id?: string;
+  /** 视频素材 ID，十进制 JSON 数字。 */
+  asset_id?: number;
+  /** 静帧图片素材 ID，十进制 JSON 数字。 */
+  still_asset_id?: number;
+  /** 画面和原声特效。 */
+  fx?: SegmentFx;
+  /** 素材内容哈希。 */
+  sha256?: string;
+  /** 视频、静帧或黑场。 */
+  visual_kind: VisualKind;
+}
+
+/** 客户端使用的 V2 视觉片段。 */
+export interface DramaManifestV2Clip extends Omit<DramaManifestClip, "taskId" | "assetId"> {
+  /** 视频采用任务；非视频为 null。 */
+  taskId: string | null;
+  /** 视频素材 ID；非视频为 null。 */
+  assetId: number | null;
+  /** 超出 JS 安全整数范围时的原始十进制视频素材 ID。 */
+  assetIdText?: string;
+  /** 静帧图片素材 ID。 */
+  stillAssetId: number | null;
+  /** 超出 JS 安全整数范围时的原始十进制静帧素材 ID。 */
+  stillAssetIdText?: string;
+  /** 视频、静帧或黑场。 */
+  visualKind: VisualKind;
+  /** 画面和原声特效。 */
+  fx: SegmentFx | null;
+}
+
+/** V2 清单线协议，帧位置基于 24 fps。 */
+export interface BackendDramaManifestV2View {
+  /** 清单结构版本。 */
+  v: 2;
+  /** 渲染版本。 */
+  render_version: 2;
+  /** 编码后的分集主键。 */
+  episode_id: string;
+  /** 解析时的片段内容版本。 */
+  segment_version: number;
+  /** 母版每秒帧数。 */
+  fps: number;
+  /** 母版每秒采样数。 */
+  sample_rate: number;
+  /** 母版总帧数。 */
+  total_frames: number;
+  /** 未纳入清单的分镜序号。 */
+  skipped_seqs: number[];
+  /** 可用于构建时间轴的片段。 */
+  clips: BackendDramaManifestV2Clip[];
+  /** 已解析节目单，附带诊断的条目仍保留。 */
+  program: DramaManifestV2Program;
+}
+
+/** 客户端使用的 V2 清单。 */
+export interface DramaManifestV2View {
+  /** 清单结构版本。 */
+  v: 2;
+  /** 渲染版本。 */
+  renderVersion: 2;
+  /** 编码后的分集主键。 */
+  episodeId: string;
+  /** 解析时的片段内容版本。 */
+  segmentVersion: number;
+  /** 母版每秒帧数。 */
+  fps: number;
+  /** 母版每秒采样数。 */
+  sampleRate: number;
+  /** 母版总帧数。 */
+  totalFrames: number;
+  /** 未纳入清单的分镜序号。 */
+  skippedSeqs: number[];
+  /** 可用于构建时间轴的片段。 */
+  clips: DramaManifestV2Clip[];
+  /** 已解析节目单。 */
+  program: DramaManifestV2Program;
+}
+
+/** V2 清单的就绪或预热响应。 */
+export interface BackendDramaManifestV2Response {
+  /** 省略时为 ready。 */
+  status?: DramaManifestStatus;
+  /** 预热时没有清单。 */
+  manifest?: BackendDramaManifestV2View | null;
+  /** 有诊断时为空，预热时省略。 */
+  manifest_hash?: string;
+  /** 当前片段内容版本。 */
+  segment_version: number;
+  /** 未纳入清单的分镜序号。 */
+  skipped_seqs: number[];
+  /** 可显示的诊断信息。 */
+  diagnostics: string[];
+  /** 定位到具体条目及字段的诊断。 */
+  program_diagnostics: ProgramDiagnostic[];
+}
+
+/** 客户端使用的 V2 清单响应。 */
+export interface DramaManifestV2Response {
+  /** 就绪或预热中。 */
+  status: DramaManifestStatus;
+  /** 预热时为 null。 */
+  manifest: DramaManifestV2View | null;
+  /** 诊断或预热时不可提交。 */
+  manifestHash: string;
+  /** 当前片段内容版本。 */
+  segmentVersion: number;
+  /** 未纳入清单的分镜序号。 */
+  skippedSeqs: number[];
+  /** 可显示的诊断信息。 */
+  diagnostics: string[];
+  /** 定位到具体条目及字段的诊断。 */
+  programDiagnostics: ProgramDiagnostic[];
 }

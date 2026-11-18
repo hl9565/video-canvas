@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"slices"
 
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
@@ -42,7 +43,7 @@ func (s *DramaSegmentService) Update(ctx context.Context, userID, sid uint64, re
 	if req == nil || req.Revision < 1 || (req.Seconds != nil && *req.Seconds < 1) || req.ClearChosen && req.ChosenTaskID != nil {
 		return nil, errcode.ErrInvalidParams
 	}
-	frames, err := s.resolveUpdateFrames(ctx, userID, sid, req)
+	update, err := s.prepareSegmentVisualUpdate(ctx, userID, sid, req)
 	if err != nil {
 		return nil, err
 	}
@@ -55,10 +56,7 @@ func (s *DramaSegmentService) Update(ctx context.Context, userID, sid uint64, re
 		if row.Revision != req.Revision || !matchesExpectedTask(row, req) {
 			return errcode.ErrCanvasConflict
 		}
-		if err := s.updateSegmentTake(ctx, tx, p, row, req); err != nil {
-			return err
-		}
-		if err := applySegmentUpdate(row, req, frames); err != nil {
+		if err := s.applyLockedSegmentUpdate(ctx, tx, p, row, req, update); err != nil {
 			return err
 		}
 		return saveSegmentUpdate(ctx, tx, row, ep, req)
@@ -74,12 +72,13 @@ func (s *DramaSegmentService) Delete(ctx context.Context, userID, sid uint64) er
 	// 1. 先锁项目再锁片段，避免与分镜替换或并发排序交错。
 	var project *model.DramaProject
 	var episode *model.DramaEpisode
+	var views []model.DramaSegmentView
 	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
-		p, ep, row, err := lockSegment(ctx, tx, userID, sid)
+		p, _, row, err := lockSegment(ctx, tx, userID, sid)
 		if err != nil {
 			return err
 		}
-		project, episode = p, ep
+		project = p
 		bt, hasBatch := tx.(segmentBatchVersionTx)
 		if hasBatch {
 			if _, err := bt.DeleteSegmentNoBump(ctx, userID, sid); err != nil {
@@ -102,18 +101,17 @@ func (s *DramaSegmentService) Delete(ctx context.Context, userID, sid uint64) er
 			}
 		}
 		if hasBatch {
-			return bt.BumpSegmentVersion(ctx, userID, row.EpisodeID)
+			if err := bt.BumpSegmentVersion(ctx, userID, row.EpisodeID); err != nil {
+				return err
+			}
 		}
-		return nil
+		episode, views, err = s.readSegmentBatch(ctx, tx, p, row.EpisodeID)
+		return err
 	})
 	if err != nil {
 		return segmentError(err)
 	}
-	// 2. 删除事件不虚构SegmentView；剩余片段的seq变化通过完整列表和事件同步。
-	views, err := s.List(ctx, userID, project.ID, episode.No)
-	if err != nil {
-		return err
-	}
+	// 2. 仅发布同一事务内组装且已提交的完整视图。
 	for i := range views {
 		s.publishSegment(ctx, project, episode, &views[i])
 	}
@@ -122,35 +120,50 @@ func (s *DramaSegmentService) Delete(ctx context.Context, userID, sid uint64) er
 
 // Order 只接受该集片段的完整不重复集合，在同一事务重排并更新变更片段版本。
 func (s *DramaSegmentService) Order(ctx context.Context, userID, dramaID uint64, no int, req *model.OrderDramaSegmentsReq) ([]model.DramaSegmentView, error) {
-	// 1. 通过用户项目定位集，排序集合在项目锁内重新读取。
-	_, ep, err := s.episode(ctx, userID, dramaID, no)
-	if err != nil {
+	// 1. 通过用户项目定位集，排序集合在项目锁与集锁内重新读取。
+	if _, _, err := s.episode(ctx, userID, dramaID, no); err != nil {
 		return nil, segmentError(err)
 	}
-	err = s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
-		if _, err := tx.Project(ctx, userID, dramaID, true); err != nil {
-			return err
-		}
-		rows, err := tx.Segments(ctx, userID, ep.ID)
+	var project *model.DramaProject
+	var ep *model.DramaEpisode
+	var views []model.DramaSegmentView
+	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
+		p, err := tx.Project(ctx, userID, dramaID, true)
 		if err != nil {
 			return err
 		}
-		return saveDramaSegmentOrder(ctx, tx, rows, req)
+		eps, err := tx.Episodes(ctx, userID, dramaID)
+		if err != nil {
+			return err
+		}
+		idx := slices.IndexFunc(eps, func(item model.DramaEpisode) bool { return item.No == no })
+		if idx < 0 {
+			return repository.ErrNotFound
+		}
+		lockedEps, err := tx.LockEpisodes(ctx, userID, []uint64{eps[idx].ID})
+		if err != nil {
+			return err
+		}
+		if len(lockedEps) != 1 || lockedEps[0].DramaID != p.ID {
+			return repository.ErrNotFound
+		}
+		rows, err := tx.Segments(ctx, userID, lockedEps[0].ID)
+		if err != nil {
+			return err
+		}
+		if err := saveDramaSegmentOrder(ctx, tx, rows, req); err != nil {
+			return err
+		}
+		project = p
+		ep, views, err = s.readSegmentBatch(ctx, tx, p, lockedEps[0].ID)
+		return err
 	})
 	if err != nil {
 		return nil, segmentError(err)
 	}
-	// 2. 提交后读取完整视图，任务或首帧的变化也反映在返回值中。
-	views, err := s.List(ctx, userID, dramaID, no)
-	if err != nil {
-		return nil, err
-	}
-	p, err := s.repo.Project(ctx, userID, dramaID, false)
-	if err != nil {
-		return nil, dramaError(err)
-	}
+	// 2. HTTP 与 WS 复用同一份已提交的顺序、候选和首帧视图。
 	for i := range views {
-		s.publishSegment(ctx, p, ep, &views[i])
+		s.publishSegment(ctx, project, ep, &views[i])
 	}
 	return views, nil
 }
@@ -237,7 +250,7 @@ func saveDramaSegmentOrder(ctx context.Context, tx repository.DramaTx, rows []mo
 
 // saveSegmentUpdate 将精裁 schema 升级与段 CAS 一并保存，媒体变更时集版本只递增一次。
 func saveSegmentUpdate(ctx context.Context, tx repository.DramaTx, row *model.DramaSegment, ep *model.DramaEpisode, req *model.UpdateDramaSegmentReq) error {
-	flippedSchema := req.Edit != nil && ep.EditSchema == 0
+	flippedSchema := ep.EditSchema == 0 && (req.Edit != nil || req.VisualKind != nil || req.StillAssetID.Set || req.FX != nil)
 	if flippedSchema {
 		rev := ep.Revision
 		ep.EditSchema = 1

@@ -213,3 +213,91 @@ func TestDramaJobIntent_LegacyEveryStepUsesOnlyFrozenFields(t *testing.T) {
 		}
 	}
 }
+
+func TestDramaJobIntent_ExpectedEpisodeIDValidationAndSignature(t *testing.T) {
+	ctx := context.Background()
+	r := newComposeMemory()
+	s := composeService(r, &composeFiles{r: r}, &composeProcessor{})
+
+	wrong := uint64(999)
+	_, err := s.CreateJob(ctx, 7, 1, &model.DramaJobReq{Step: "scripts", Episodes: []int{1}, ExpectedEpisodeID: &wrong})
+	dramaCheckCode(t, err, 10001)
+
+	_, err = s.CreateJob(ctx, 7, 1, &model.DramaJobReq{Step: "compose", Episodes: []int{1}, ExpectedEpisodeID: &wrong, ComposeRequestKey: "cmp-wrong-ep"})
+	dramaCheckCode(t, err, 91001)
+
+	right := r.episodes[0].ID
+	reqRight := &model.DramaJobReq{Step: "compose", Episodes: []int{1}, ExpectedEpisodeID: &right, ComposeRequestKey: "cmp-right-ep"}
+	first, err := s.CreateJob(ctx, 7, 1, reqRight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := s.CreateJob(ctx, 7, 1, reqRight)
+	if err != nil || replay.ID != first.ID {
+		t.Fatalf("相同 expected_episode_id 重放应命中幂等任务: %+v err=%v", replay, err)
+	}
+	otherEp := r.episodes[0].ID + 1
+	_, err = s.CreateJob(ctx, 7, 1, &model.DramaJobReq{Step: "compose", Episodes: []int{1}, ExpectedEpisodeID: &otherEp, ComposeRequestKey: "cmp-right-ep"})
+	dramaCheckCode(t, err, 90001)
+}
+
+func TestDramaComposeIntent_StaleIdentityBeforeEligibility(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		episodes               []int
+		replace, busy, missing bool
+		code                   int
+	}{
+		{name: "replacement is unlocked", episodes: []int{1}, replace: true, code: 91001},
+		{name: "replacement has active compose", episodes: []int{1}, replace: true, busy: true, code: 91001},
+		{name: "missing requested number", episodes: []int{2}, code: 91001},
+		{name: "no remaining episodes", episodes: []int{1}, missing: true, code: 91001},
+		{name: "multiple episode numbers", episodes: []int{1, 2}, code: 10001},
+		{name: "invalid episode number", episodes: []int{100001}, code: 10001},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newComposeMemory()
+			expected := r.episodes[0].ID
+			if tc.replace {
+				r.episodes[0].ID++
+				r.episodes[0].LockedAt = nil
+			}
+			if tc.busy {
+				r.jobs = []model.DramaJob{{UserID: 7, DramaID: 1, Step: "compose", Episodes: []int{1}, Status: "running"}}
+			}
+			if tc.missing {
+				r.episodes = nil
+			}
+			s := composeService(r, &composeFiles{r: r}, &composeProcessor{})
+			req := &model.DramaJobReq{Step: "compose", Episodes: tc.episodes, ExpectedEpisodeID: &expected}
+			_, err := s.CreateJob(t.Context(), 7, 1, req)
+			dramaCheckCode(t, err, tc.code)
+			_, err = s.Estimate(t.Context(), 7, 1, req)
+			dramaCheckCode(t, err, tc.code)
+		})
+	}
+}
+
+func TestDramaJobIntent_StoryboardClearCannotReuseAgentApproval(t *testing.T) {
+	r := newDramaMemory()
+	storyboardReady(r)
+	s, _ := dramaTestService(r, &dramaTextStreamer{}, nil)
+	ctx := t.Context()
+	req := storyboardRequest(t, 15, []int{1})
+	normal, err := s.CreateAgentJob(ctx, 7, 1, 101, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmed := *req
+	confirmed.ConfirmClear = true
+	confirmed.ExpectedEpisodeID = new(r.episodes[0].ID)
+	confirmed.ExpectedSegmentVersion = new(int64)
+	for _, approval := range []uint64{101, 102} {
+		_, err := s.CreateAgentJob(ctx, 7, 1, approval, &confirmed)
+		dramaCheckCode(t, err, 10001)
+	}
+	replay, err := s.CreateAgentJob(ctx, 7, 1, 101, req)
+	if err != nil || replay.ID != normal.ID || len(r.jobs) != 1 || len(r.ledger) != 1 {
+		t.Fatalf("清空请求影响普通审批重放: replay=%+v jobs=%+v err=%v", replay, r.jobs, err)
+	}
+}

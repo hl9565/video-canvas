@@ -580,7 +580,13 @@ const NO_JOBS: never[] = [];
  * 片场顶部条：集名、保存状态、规格、重新生成分镜脚本，以及 GenerateControls 内并列的首帧控镜与立即生成。
  * 合成整集挪到了「成片」页；这里只管把片段做出来。
  */
-export function StudioBar() {
+export function StudioBar({
+  programOpen = false,
+  onToggleProgram,
+}: {
+  programOpen?: boolean;
+  onToggleProgram?: () => void;
+} = {}) {
   const { drama, episode, no, save, video } = useStudio();
   const jobs = useDramaJobsStore((state) => state.byDrama[drama.id]) ?? NO_JOBS;
   const starter = useStoryboardStart(video.maxSeconds);
@@ -625,6 +631,17 @@ export function StudioBar() {
       >
         {starter.pending === no ? <Loader2 className="animate-spin" /> : <RotateCw />}
       </Button>
+      {onToggleProgram && (
+        <Button
+          type="button"
+          variant={programOpen ? "secondary" : "ghost"}
+          size="sm"
+          aria-pressed={programOpen}
+          onClick={onToggleProgram}
+        >
+          节目音频
+        </Button>
+      )}
       <GenerateControls />
     </div>
   );

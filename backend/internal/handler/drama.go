@@ -5,6 +5,7 @@ import (
 
 	"video-canvas/internal/drama"
 	"video-canvas/internal/model"
+	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/response"
 	"video-canvas/internal/service"
 	"video-canvas/pkg/pagination"
@@ -181,6 +182,15 @@ func dramaEpisodePath(c *gin.Context) (uint64, int, bool) {
 func (h *DramaHandler) Manifest(c *gin.Context) {
 	id, no, ok := dramaEpisodePath(c)
 	if !ok {
+		return
+	}
+	switch c.Query("v") {
+	case "", "1":
+	case "2":
+		h.manifestV2(c, id, no)
+		return
+	default:
+		response.Fail(c, errcode.ErrInvalidParams)
 		return
 	}
 	view, prep, err := h.svc.PrepareOrResolveEpisodeManifest(c.Request.Context(), currentUserID(c), id, no)

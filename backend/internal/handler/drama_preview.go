@@ -68,8 +68,13 @@ func (h *DramaHandler) StreamPreview(c *gin.Context) {
 	if err != nil {
 		status := http.StatusUnauthorized
 		var business *errcode.Error
-		if errors.As(err, &business) && business.Code == errcode.ErrForbidden.Code {
-			status = http.StatusForbidden
+		if errors.As(err, &business) {
+			switch business.Code {
+			case errcode.ErrForbidden.Code:
+				status = http.StatusForbidden
+			case errcode.ErrDramaManifestStale.Code:
+				status = http.StatusConflict
+			}
 		}
 		c.Status(status)
 		return

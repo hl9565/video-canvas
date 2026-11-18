@@ -11,6 +11,7 @@ import (
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/jsonhash"
 	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/pkg/ws"
 	"video-canvas/internal/provider"
@@ -269,9 +270,10 @@ func TestWaveB_AsyncPreviewAndCloseLifecycle(t *testing.T) {
 		ctxCanceled := make(chan struct{})
 		entered := make(chan struct{})
 		p.duringManifest = func() {}
+		a, probes := verifiedManifestAssets(r)
+		probes.rows[a.sha] = &model.AssetMediaProbe{AssetID: 30, Sha256: a.sha, ProbeVersion: videoframe.NormalizedProbeVersion, NormalizedFrames24: 120}
 		closedSvc := service.NewDramaService(service.DramaDeps{
-			Repo: r, Assets: &manifestFiles{composeFiles: &composeFiles{r: r}, sha: strings.Repeat("a", 64)},
-			Probes:        &manifestProbes{rows: map[string]*model.AssetMediaProbe{strings.Repeat("a", 64): {AssetID: 30, Sha256: strings.Repeat("a", 64), ProbeVersion: 1, NormalizedFrames24: 120}}},
+			Repo: &verifiedComposeMemory{r}, Assets: a, Probes: probes,
 			Compose:       &cancelAwareComposer{entered: entered, done: ctxCanceled},
 			PreviewSecret: "close-test-secret",
 		})
@@ -314,7 +316,7 @@ func TestWaveB_ReadDegradesOnProbeErrorWhileEditAndManifestStrict(t *testing.T) 
 	taskID, canvasID := uint64(31), uint64(9)
 	fakeRepo.Rows = []model.DramaSegment{{BaseModel: model.BaseModel{ID: 11}, UserID: 1, EpisodeID: 10, Seconds: 5, Revision: 1, ChosenTaskID: &taskID}}
 	fakeRepo.Tasks = []model.GenerationTask{{ID: taskID, UserID: 1, CanvasProjectID: &canvasID, NodeID: "seg:" + idcodec.Encode(11), Kind: model.KindVideo, Status: model.TaskSucceeded, OutputJSON: []byte(`[{"asset_id":17,"media_type":"video"}]`)}}
-	assets := &segEditAssets{assets: map[uint64]*model.Asset{17: {ID: 17, UserID: 1, Kind: model.KindVideo, Sha256: strings.Repeat("a", 64), StorageKey: "video.mp4"}}}
+	assets := &segEditAssets{assets: map[uint64]*model.Asset{17: {ID: 17, UserID: 1, Kind: model.KindVideo, Sha256: jsonhash.SHA256Hex([]byte("fake-video")), StorageKey: "video.mp4"}}}
 	probeErr := errors.New("ffmpeg busy")
 	segSvc := service.NewDramaSegmentService(service.DramaSegmentDeps{
 		Repo: fakeRepo, Tasks: fakeRepo, Assets: assets, Probes: &segmentProbeCache{}, Broadcaster: ws.NopBroadcaster{},
@@ -385,13 +387,13 @@ func TestWaveB_ManifestVersionSampleRateAndRenderGuard(t *testing.T) {
 	}
 
 	// 提交冻结任务并分别篡改清单四项不变量：render_version / v / fps / sample_rate，执行渲染必须在下载素材前拒绝且不调用 ComposeManifest。
-	sha := strings.Repeat("a", 64)
-	baseAssets := &manifestFiles{composeFiles: &composeFiles{r: r}, sha: sha}
+	baseAssets, baseProbes := verifiedManifestAssets(r)
+	baseProbes.rows[baseAssets.sha] = &model.AssetMediaProbe{AssetID: 30, Sha256: baseAssets.sha, ProbeVersion: videoframe.NormalizedProbeVersion, NormalizedFrames24: 120}
 	countingAssets := &countingOpenAssets{manifestFiles: baseAssets}
 	guardProc := &manifestProcessor{}
 	guardSvc := service.NewDramaService(service.DramaDeps{
-		Repo: r, Assets: countingAssets,
-		Probes:  &manifestProbes{rows: map[string]*model.AssetMediaProbe{sha: {AssetID: 30, Sha256: sha, ProbeVersion: 1, NormalizedFrames24: 120}}},
+		Repo: &verifiedComposeMemory{r}, Assets: countingAssets,
+		Probes:  baseProbes,
 		Compose: guardProc,
 	})
 	t.Cleanup(guardSvc.ClosePreviews)

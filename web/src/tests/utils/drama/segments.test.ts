@@ -257,8 +257,11 @@ describe("批量生成：对没有采用视频的片段逐个提交", () => {
       seg("empty", 2, { prompt: "  " }),
       seg("idle", 3),
       seg("err", 4, { status: "error", takes: [take("2", "failed")] }),
+      seg("still", 5, { visualKind: "still" }),
+      seg("black", 6, { visualKind: "black" }),
+      seg("video", 7, { visualKind: "video" }),
     ];
-    expect(batchTargets(list).map((s) => s.id)).toEqual(["idle", "err"]);
+    expect(batchTargets(list).map((s) => s.id)).toEqual(["idle", "err", "video"]);
   });
 });
 

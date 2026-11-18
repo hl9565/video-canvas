@@ -281,7 +281,7 @@ describe("Stage B 首帧控镜 API 契约", () => {
           adopt: false,
           reset_edit_on_task_change: false,
         },
-        { silent: true },
+        { silent: true, parseReviver: expect.any(Function) },
       ]);
       await patchTakeQC("5d2a", "t1", {
         revision: 3,
@@ -301,7 +301,7 @@ describe("Stage B 首帧控镜 API 契约", () => {
           clear_chosen: true,
           reset_edit_on_task_change: false,
         },
-        { silent: true },
+        { silent: true, parseReviver: expect.any(Function) },
       ]);
     } finally {
       post.mockRestore();
@@ -810,7 +810,7 @@ describe("api/drama：二期剪辑、报价、清单、预览与 91001-91003 错
           revision: 3,
           seconds: 8,
         },
-        { silent: true },
+        { silent: true, parseReviver: expect.any(Function) },
       );
       expect(updated.revision).toBe(4);
       expect(updated.segmentVersion).toBe(9);
@@ -869,6 +869,7 @@ describe("api/drama：二期剪辑、报价、清单、预览与 91001-91003 错
       expect(get).toHaveBeenLastCalledWith("/dramas/d1/episodes/2/manifest", undefined, {
         silent: true,
         signal: abortController.signal,
+        parseReviver: expect.any(Function),
       });
     } finally {
       get.mockRestore();

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,87 +45,102 @@ func (s *DramaService) CreateEpisodePreview(ctx context.Context, user, id uint64
 	if req.RangeF != nil && (req.RangeF.InF < 0 || req.RangeF.OutF <= req.RangeF.InF) {
 		return nil, "", errcode.ErrDramaEditInvalid
 	}
-	source, cachedView, err := s.previewSourceAndCachedManifest(ctx, user, id, no, req)
+	source, err := s.previewSourceAndCachedManifest(ctx, user, id, no, req)
 	if err != nil {
 		return nil, "", err
 	}
-	key, err := jsonhash.CanonicalSHA256(struct {
-		User, Drama uint64
-		Episode     int
-		Ratio       string
-		Req         model.DramaPreviewReq
-	}{user, id, no, source.project.Ratio, *req})
+	identity := dramaPreviewIdentity{
+		User: user, Drama: id, Episode: no, EpisodeID: source.episode.ID,
+		AspectRatio: source.project.Ratio, RenderVersion: model.CurrentDramaManifestRenderVersion, Req: *req,
+	}
+	if source.stageC != nil {
+		identity.RenderVersion = model.CurrentDramaManifestV2RenderVersion
+	}
+	key, err := jsonhash.CanonicalSHA256(identity)
 	if err != nil {
 		return nil, "", err
 	}
-	ticket, view, fresh, err := s.reservePreview(user, id, no, source.episode.ID, key)
+	ticket, view, fresh, err := s.reservePreview(identity, source, key)
 	if err != nil {
 		return nil, "", err
 	}
 	if fresh {
-		s.startPreviewRender(ticket, source, cachedView, source.project.Ratio, req)
+		s.startPreviewRender(ticket, source, identity)
 	}
 	cookie := s.preview.sign(dramaPreviewClaims{User: user, Expires: s.preview.now().Add(time.Hour).Unix(), Purpose: "session"})
 	return view, cookie, nil
 }
 
-// previewSourceAndCachedManifest 只读取项目/集/片段/探针缓存元数据，不触发任何冷视频下载或 FFmpeg 探测。
-func (s *DramaService) previewSourceAndCachedManifest(ctx context.Context, user, id uint64, no int, req *model.DramaPreviewReq) (*dramaManifestSource, *model.DramaManifestView, error) {
-	p, eps, err := s.loadEpisodeProjectAndEpisodes(ctx, user, id)
+// dramaPreviewSource 保存两版渲染之一的媒体快照，热缓存时同时携带冻结清单。
+type dramaPreviewSource struct {
+	*dramaManifestSource
+	v1 *model.DramaManifestView
+	v2 *dramaV2Resolution
+}
+
+// previewSourceAndCachedManifest 校验项目和集版本，仅检查热探针与不依赖冷素材的错误。
+func (s *DramaService) previewSourceAndCachedManifest(ctx context.Context, user, id uint64, no int, req *model.DramaPreviewReq) (*dramaPreviewSource, error) {
+	p, ep, err := s.readProgramEpisode(ctx, user, id, no)
 	if err != nil {
-		return nil, nil, err
-	}
-	var ep *model.DramaEpisode
-	for i := range eps {
-		if eps[i].No == no {
-			ep = &eps[i]
-			break
-		}
-	}
-	if ep == nil {
-		return nil, nil, errcode.ErrDramaNotFound
+		return nil, err
 	}
 	if req.SegmentVersion != ep.SegmentVersion {
-		return nil, nil, errcode.ErrDramaManifestStale
+		return nil, errcode.ErrDramaManifestStale
 	}
 	reader, ok := s.repo.(dramaManifestReader)
 	if !ok {
-		return nil, nil, errcode.ErrInternal
+		return nil, errcode.ErrInternal
 	}
-	source, err := readDramaManifestSource(ctx, reader, p, *ep)
+	source, err := readDramaRenderSource(ctx, reader, p, *ep)
 	if err != nil {
-		return nil, nil, dramaError(err)
+		return nil, dramaError(err)
 	}
-	cachedView, hit, err := s.resolveCachedDramaManifestSource(ctx, source)
-	if err != nil {
-		return nil, nil, err
+	out := &dramaPreviewSource{dramaManifestSource: source}
+	if source.stageC != nil {
+		out.v2, err = s.cachedProgramPreview(ctx, source.stageC, req)
+		return out, err
 	}
-	if hit {
-		if req.ManifestHash != cachedView.ManifestHash {
-			return nil, nil, errcode.ErrDramaManifestStale
-		}
-		if req.RangeF != nil && req.RangeF.OutF > cachedView.Manifest.TotalFrames {
-			return nil, nil, errcode.ErrDramaEditInvalid
-		}
-		return source, cachedView, nil
+	view, hit, err := s.resolveCachedDramaManifestSource(ctx, source)
+	if err != nil || !hit {
+		return out, err
 	}
-	return source, nil, nil
+	out.v1 = view
+	return out, checkPreviewTimeline(req, view.SegmentVersion, view.ManifestHash, view.Manifest.TotalFrames)
 }
 
-func (s *DramaService) loadEpisodeProjectAndEpisodes(ctx context.Context, user, id uint64) (*model.DramaProject, []model.DramaEpisode, error) {
-	p, err := s.repo.Project(ctx, user, id, false)
-	if err != nil {
-		return nil, nil, dramaError(err)
+// cachedProgramPreview 拒绝已知诊断，即使其余素材仍需后台探测。
+func (s *DramaService) cachedProgramPreview(ctx context.Context, source *dramaManifestV2Source, req *model.DramaPreviewReq) (*dramaV2Resolution, error) {
+	if err := checkDramaV2Ratio(source.project.Ratio); err != nil {
+		return nil, err
 	}
-	eps, err := s.repo.Episodes(ctx, user, id)
-	if err != nil {
-		return nil, nil, err
+	view, err := s.resolveCachedDramaManifestV2Source(ctx, source)
+	if err != nil || view == nil {
+		return nil, err
 	}
-	return p, eps, nil
+	return view, checkProgramPreview(req, view)
+}
+
+// checkProgramPreview 对已有诊断提供可定位的错误，再核对客户端清单与区间。
+func checkProgramPreview(req *model.DramaPreviewReq, view *dramaV2Resolution) error {
+	if err := dramaV2ComposeDiagnostic(view.ProgramDiagnostics); err != nil {
+		return err
+	}
+	return checkPreviewTimeline(req, view.SegmentVersion, view.ManifestHash, view.frozen.TotalFrames)
+}
+
+// checkPreviewTimeline 预览只能渲染请求指向的冻结版本与有效半开区间。
+func checkPreviewTimeline(req *model.DramaPreviewReq, version int64, hash string, total int32) error {
+	if req.SegmentVersion != version || req.ManifestHash != hash {
+		return errcode.ErrDramaManifestStale
+	}
+	if req.RangeF != nil && req.RangeF.OutF > total {
+		return errcode.ErrDramaEditInvalid
+	}
+	return nil
 }
 
 // reservePreview 清理过期票据、取消被覆盖的旧任务，并用同一锁保护初始化 pending 视图。
-func (s *DramaService) reservePreview(user, id uint64, no int, episodeID uint64, key string) (*dramaPreviewTicket, *model.DramaPreviewView, bool, error) {
+func (s *DramaService) reservePreview(identity dramaPreviewIdentity, source *dramaPreviewSource, key string) (*dramaPreviewTicket, *model.DramaPreviewView, bool, error) {
 	p := s.preview
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -134,8 +150,8 @@ func (s *DramaService) reservePreview(user, id uint64, no int, episodeID uint64,
 	now := p.now()
 	pruneExpiredPreviewsLocked(p, now)
 
-	fk := dramaPreviewKey{episodeID: episodeID, key: key}
-	if existing := p.byKey[fk]; existing != nil && existing.episodeID == episodeID && now.Before(existing.expires) {
+	fk := dramaPreviewKey{episodeID: identity.EpisodeID, key: key}
+	if existing := p.byKey[fk]; existing != nil && existing.episodeID == identity.EpisodeID && now.Before(existing.expires) {
 		return existing, s.previewViewLocked(existing, now), false, nil
 	}
 	if len(p.tickets) >= 128 {
@@ -152,7 +168,9 @@ func (s *DramaService) reservePreview(user, id uint64, no int, episodeID uint64,
 	deadline := now.Add(p.execTimeout)
 	tCtx, tCancel := context.WithTimeout(p.ctx, p.execTimeout)
 	t := &dramaPreviewTicket{
-		user: user, drama: id, episode: no, episodeID: episodeID, key: key,
+		user: identity.User, drama: identity.Drama, episode: identity.Episode, episodeID: identity.EpisodeID, key: key,
+		segmentVersion: identity.Req.SegmentVersion, manifestHash: identity.Req.ManifestHash, aspectRatio: identity.AspectRatio, renderVersion: identity.RenderVersion,
+		stageC: source.stageC, v2: source.v2,
 		id: hex.EncodeToString(random), path: filepath.Join(dir, "preview.mp4"),
 		status: "pending", expires: deadline, ctx: tCtx, cancel: tCancel,
 	}
@@ -183,11 +201,11 @@ func pruneExpiredPreviewsLocked(p *dramaPreviewStore, now time.Time) {
 }
 
 // startPreviewRender 在受控并发池中执行冷探测与片段渲染，队列等待与执行共用票据的统一截止时间。
-func (s *DramaService) startPreviewRender(t *dramaPreviewTicket, source *dramaManifestSource, view *model.DramaManifestView, ratio string, req *model.DramaPreviewReq) {
-	reqCopy := *req
+func (s *DramaService) startPreviewRender(t *dramaPreviewTicket, source *dramaPreviewSource, identity dramaPreviewIdentity) {
+	req := identity.Req
 	if req.RangeF != nil {
 		rng := *req.RangeF
-		reqCopy.RangeF = &rng
+		req.RangeF = &rng
 	}
 	go func() {
 		defer s.preview.wg.Done()
@@ -199,38 +217,52 @@ func (s *DramaService) startPreviewRender(t *dramaPreviewTicket, source *dramaMa
 			s.finishPreview(t, t.ctx.Err())
 			return
 		}
-		s.renderPreview(t, source, view, ratio, &reqCopy)
+		s.finishPreview(t, s.renderPreview(t, source, identity.AspectRatio, &req))
 	}()
 }
 
-// renderPreview 先按需在后台完成冷片段下载与探测，再复用冻结清单渲染；失败仅记录票据终态。
-func (s *DramaService) renderPreview(t *dramaPreviewTicket, source *dramaManifestSource, view *model.DramaManifestView, ratio string, req *model.DramaPreviewReq) {
-	if view == nil {
-		resolved, err := s.resolveDramaManifestSource(t.ctx, source)
-		if err != nil {
-			s.finishPreview(t, err)
-			return
-		}
-		if req.SegmentVersion != resolved.SegmentVersion || req.ManifestHash != resolved.ManifestHash {
-			s.finishPreview(t, errcode.ErrDramaManifestStale)
-			return
-		}
-		if req.RangeF != nil && (req.RangeF.InF < 0 || req.RangeF.OutF <= req.RangeF.InF || req.RangeF.OutF > resolved.Manifest.TotalFrames) {
-			s.finishPreview(t, errcode.ErrDramaEditInvalid)
-			return
-		}
-		view = resolved
-	}
-	input := dramaComposeInput{Manifest: &view.Manifest, ManifestHash: view.ManifestHash, AspectRatio: ratio, Size: "720p", Variants: []string{req.Variant}}
-	for _, c := range view.Manifest.Clips {
-		input.AssetIDs = append(input.AssetIDs, c.AssetID)
-	}
+// renderPreview 先按需完成冷探测，再用票据指定的版本渲染同一份冻结清单。
+func (s *DramaService) renderPreview(t *dramaPreviewTicket, source *dramaPreviewSource, ratio string, req *model.DramaPreviewReq) error {
 	var rf *videoframe.FrameRange
 	if req.RangeF != nil {
 		rf = &videoframe.FrameRange{InF: req.RangeF.InF, OutF: req.RangeF.OutF}
 	}
-	err := s.renderFrozenManifest(t.ctx, t.user, &input, filepath.Dir(t.path), []string{t.path}, rf)
-	s.finishPreview(t, err)
+	req.SegmentVersion, req.ManifestHash = t.segmentVersion, t.manifestHash
+	if t.renderVersion == model.CurrentDramaManifestV2RenderVersion {
+		return s.renderProgramPreview(t, ratio, req, rf)
+	}
+	view := source.v1
+	if view == nil {
+		resolved, err := s.resolveDramaManifestSource(t.ctx, source.dramaManifestSource)
+		if err != nil {
+			return err
+		}
+		view = resolved
+	}
+	if err := checkPreviewTimeline(req, view.SegmentVersion, view.ManifestHash, view.Manifest.TotalFrames); err != nil {
+		return err
+	}
+	input := dramaComposeInput{Manifest: &view.Manifest, AspectRatio: ratio, Size: "720p", Variants: []string{req.Variant}}
+	return s.renderFrozenManifest(t.ctx, t.user, &input, filepath.Dir(t.path), []string{t.path}, rf)
+}
+
+// renderProgramPreview 传入完整节目单和独立选区，以整集混音、闪避及归一化结果为准。
+func (s *DramaService) renderProgramPreview(t *dramaPreviewTicket, ratio string, req *model.DramaPreviewReq, rf *videoframe.FrameRange) error {
+	view := t.v2
+	if view == nil {
+		resolved, err := s.resolveDramaManifestV2Source(t.ctx, t.stageC)
+		if err != nil {
+			return err
+		}
+		view = resolved
+	}
+	if err := checkProgramPreview(req, view); err != nil {
+		return err
+	}
+	width, height := composeDimensions(ratio, "720p")
+	outputs := []videoframe.ComposeProgramOutputSpec{{Destination: t.path, Variant: req.Variant, Width: width, Height: height}}
+	_, err := s.RenderProgramManifest(t.ctx, t.user, view.frozen, filepath.Dir(t.path), outputs, rf)
+	return err
 }
 
 // finishPreview 在渲染结束时转换终态；就绪播放期与失败冷却期均从各自终态时刻起算。
@@ -242,6 +274,10 @@ func (s *DramaService) finishPreview(t *dramaPreviewTicket, err error) {
 	now := p.now()
 	if err != nil || !active {
 		t.status = "failed"
+		if !active {
+			err = nil // 已覆盖或关闭的任务不再公开原失败原因。
+		}
+		t.err = err
 		t.expires = now.Add(p.failTTL)
 		_ = os.RemoveAll(filepath.Dir(t.path))
 		return
@@ -252,6 +288,9 @@ func (s *DramaService) finishPreview(t *dramaPreviewTicket, err error) {
 
 func (s *DramaService) previewViewLocked(t *dramaPreviewTicket, now time.Time) *model.DramaPreviewView {
 	view := &model.DramaPreviewView{Ticket: t.id, Status: t.status, ExpiresAt: t.expires.Unix()}
+	if t.status == "failed" {
+		view.ErrorCode, view.ErrorMessage, view.ProgramDiagnostics = previewFailure(t.err)
+	}
 	if t.status == "ready" {
 		expires := min(t.expires.Unix(), now.Add(2*time.Minute).Unix())
 		token := s.preview.sign(dramaPreviewClaims{User: t.user, Drama: t.drama, Episode: t.episode, Ticket: t.id, Expires: expires, Purpose: "stream"})
@@ -260,9 +299,54 @@ func (s *DramaService) previewViewLocked(t *dramaPreviewTicket, now time.Time) *
 	return view
 }
 
+// previewFailure 只投影业务文案与公开诊断，内部原因和临时文件路径永不进入票据。
+func previewFailure(err error) (int, string, []model.DramaPreviewDiagnostic) {
+	var business *errcode.Error
+	var program *model.DramaProgramError
+	switch {
+	case errors.As(err, &business):
+		if business.Code != errcode.ErrInternal.Code {
+			return business.Code, business.Msg, previewDiagnostics(business.Data)
+		}
+	case errors.As(err, &program):
+		msg := program.Msg
+		if msg == "" {
+			msg = errcode.ErrDramaProgramInvalid.Msg
+		}
+		return errcode.ErrDramaProgramInvalid.Code, msg, previewDiagnostics(program.Diagnostics)
+	case errors.Is(err, context.DeadlineExceeded):
+		return errcode.ErrInternal.Code, "CPU 预览生成超时，请缩小范围或重试", nil
+	}
+	return errcode.ErrInternal.Code, "CPU 预览生成失败，请检查片段视频并重试", nil
+}
+
+// previewDiagnostics 丢弃非诊断数据，仅保留与节目单 API 相同的五个公开字段。
+func previewDiagnostics(data any) []model.DramaPreviewDiagnostic {
+	var items []DramaProgramDiagnostic
+	switch value := data.(type) {
+	case DramaProgramDiagnosticsData:
+		items = value.Diagnostics
+	case *DramaProgramDiagnosticsData:
+		if value != nil {
+			items = value.Diagnostics
+		}
+	case []model.DramaProgramDiagnostic:
+		items = dramaProgramDiagnosticsView(value)
+	}
+	out := make([]model.DramaPreviewDiagnostic, 0, len(items))
+	for _, d := range items {
+		item := model.DramaPreviewDiagnostic{CueID: d.CueID, Field: d.Field, Reason: d.Reason, Severity: d.Severity}
+		if d.SegmentID != 0 {
+			item.SegmentID = idcodec.Encode(uint64(d.SegmentID))
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
 // GetEpisodePreview 先校验当前资源归属，再返回本人票据，跨用户与已删除资源统一不存在。
 func (s *DramaService) GetEpisodePreview(ctx context.Context, user, id uint64, no int, ticket string) (*model.DramaPreviewView, error) {
-	_, episodeID, err := s.previewEpisode(ctx, user, id, no)
+	pProj, ep, err := s.readProgramEpisode(ctx, user, id, no)
 	if err != nil {
 		return nil, err
 	}
@@ -271,8 +355,11 @@ func (s *DramaService) GetEpisodePreview(ctx context.Context, user, id uint64, n
 	defer p.mu.Unlock()
 	now := p.now()
 	t := p.tickets[ticket]
-	if t == nil || t.user != user || t.drama != id || t.episode != no || t.episodeID != episodeID || !now.Before(t.expires) {
+	if t == nil || t.user != user || t.drama != id || t.episode != no || !now.Before(t.expires) {
 		return nil, errcode.ErrDramaNotFound
+	}
+	if t.stale(pProj, ep) {
+		return nil, errcode.ErrDramaManifestStale
 	}
 	return s.previewViewLocked(t, now), nil
 }
@@ -290,7 +377,7 @@ func (s *DramaService) OpenEpisodePreview(ctx context.Context, id uint64, no int
 	if claims.User != session.User || claims.Drama != id || claims.Episode != no || claims.Ticket != ticket {
 		return nil, errcode.ErrForbidden
 	}
-	_, episodeID, err := s.previewEpisode(ctx, session.User, id, no)
+	pProj, ep, err := s.readProgramEpisode(ctx, session.User, id, no)
 	if err != nil {
 		return nil, errcode.ErrForbidden
 	}
@@ -298,7 +385,13 @@ func (s *DramaService) OpenEpisodePreview(ctx context.Context, id uint64, no int
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	t := p.tickets[ticket]
-	if t == nil || t.user != session.User || t.drama != id || t.episode != no || t.episodeID != episodeID || t.status != "ready" || !p.now().Before(t.expires) {
+	if t == nil || t.user != session.User || t.drama != id || t.episode != no || !p.now().Before(t.expires) {
+		return nil, errcode.ErrUnauthorized
+	}
+	if t.stale(pProj, ep) {
+		return nil, errcode.ErrDramaManifestStale
+	}
+	if t.status != "ready" {
 		return nil, errcode.ErrUnauthorized
 	}
 	file, err := os.Open(t.path)
@@ -308,22 +401,10 @@ func (s *DramaService) OpenEpisodePreview(ctx context.Context, id uint64, no int
 	return file, nil
 }
 
-// previewEpisode 复核软删除、项目画幅和当前集号，签名本身不能代替资源权限。
-func (s *DramaService) previewEpisode(ctx context.Context, user, id uint64, no int) (*model.DramaProject, uint64, error) {
-	p, err := s.repo.Project(ctx, user, id, false)
-	if err != nil {
-		return nil, 0, dramaError(err)
-	}
-	eps, err := s.repo.Episodes(ctx, user, id)
-	if err != nil {
-		return nil, 0, err
-	}
-	for _, ep := range eps {
-		if ep.No == no {
-			return p, ep.ID, nil
-		}
-	}
-	return nil, 0, errcode.ErrDramaNotFound
+// stale 同时识别当前项目变更和冷探测完成后才发现的清单冲突；调用时持有票据锁。
+func (t *dramaPreviewTicket) stale(project *model.DramaProject, ep *model.DramaEpisode) bool {
+	return t.episodeID != ep.ID || t.segmentVersion != ep.SegmentVersion || t.aspectRatio != project.Ratio ||
+		errors.Is(t.err, errcode.ErrDramaManifestStale)
 }
 
 // ClosePreviews 在服务退出时取消后台预览、等待渲染协程退出并回收全部临时目录。

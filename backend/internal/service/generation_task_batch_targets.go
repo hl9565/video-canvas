@@ -156,6 +156,9 @@ func resolveLockedDramaTarget(probe dramaBatchProbe, ps []model.DramaProject, es
 // validateDramaBatchTarget 在积分锁前冻结画布、锁集、短剧任务与时间轴校验结果。
 func validateDramaBatchTarget(ctx context.Context, tx repository.DramaTx, b *taskBatch, target *preResolvedTarget) error {
 	p, ep, row := target.project, target.episode, target.segment
+	if err := requireDramaVideoSegment(row); err != nil {
+		return err
+	}
 	if b.req.CanvasID == 0 || uint64(b.req.CanvasID) != p.CanvasID || b.req.Kind != model.KindVideo {
 		return errcode.ErrInvalidParams
 	}

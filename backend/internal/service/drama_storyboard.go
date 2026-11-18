@@ -36,17 +36,50 @@ func checkStoryboardRequest(req *model.DramaJobReq) error {
 	if len(req.Episodes) != 1 {
 		return errcode.ErrInvalidParams.WithMsg("分镜须且只能选择一集")
 	}
+	if req.Episodes[0] < 1 || req.Episodes[0] > 100000 {
+		return errcode.ErrInvalidParams.WithMsg("集号须为1至100000")
+	}
 	if req.MaxSeconds != 0 && (req.MaxSeconds < 4 || req.MaxSeconds > 60) {
 		return errcode.ErrInvalidParams.WithMsg("片段时长上限须为4至60秒")
 	}
 	return nil
 }
 
-// checkStoryboardTakes 与片段生成共用project行锁，在具备素材读取依赖时复用 ResolveSegmentTakes 统一准入，保留活跃流程占位并忽略悬空孤儿。
-func (s *DramaService) checkStoryboardTakes(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, selected []model.DramaEpisode) error {
+// checkStoryboardSubmission 区分普通替换与显式清空；已编排的节目单仍优先于片段版本冲突。
+func (s *DramaService) checkStoryboardSubmission(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, selected []model.DramaEpisode, req *model.DramaJobReq) error {
+	if !req.ConfirmClear {
+		return s.checkStoryboardReplacement(ctx, tx, p, selected)
+	}
+	ep := selected[0]
+	if err := checkStoryboardProgram(ep); err != nil {
+		return err
+	}
+	if ep.SegmentVersion != *req.ExpectedSegmentVersion {
+		return errcode.ErrDramaManifestStale
+	}
+	return nil
+}
+
+// checkStoryboardProgram 任何已编排的节目单都必须先由用户清空。
+func checkStoryboardProgram(ep model.DramaEpisode) error {
+	program, err := model.DecodeStoredDramaProgram(json.RawMessage(ep.ProgramJSON))
+	if err != nil {
+		return err
+	}
+	if program.HasAuthoredContent() {
+		return errcode.ErrDramaStepNotReady.WithMsg("请先清空节目单，再重新生成分镜")
+	}
+	return nil
+}
+
+// checkStoryboardReplacement 在项目锁内先保护已编排的节目单，再检查可经确认清除的编辑和候选。
+func (s *DramaService) checkStoryboardReplacement(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, selected []model.DramaEpisode) error {
 	assets, hasAssets := s.assets.(DramaSegmentAssetReader)
 	for _, ep := range selected {
-		has, err := episodeHasStoryboardTakes(ctx, tx, p, assets, hasAssets, ep.ID)
+		if err := checkStoryboardProgram(ep); err != nil {
+			return err
+		}
+		has, err := episodeHasStoryboardTakes(ctx, tx, p, assets, hasAssets, ep)
 		if err != nil {
 			return err
 		}
@@ -57,14 +90,17 @@ func (s *DramaService) checkStoryboardTakes(ctx context.Context, tx repository.D
 	return nil
 }
 
-// episodeHasStoryboardTakes 在持有项目锁的事务内复用 ResolveSegmentTakes 核验单集是否存在有效候选或活跃流程。
-func episodeHasStoryboardTakes(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, assets DramaSegmentAssetReader, hasAssets bool, epID uint64) (bool, error) {
-	if !hasAssets {
-		return tx.HasSegmentTakes(ctx, p.UserID, epID)
-	}
-	segs, err := tx.Segments(ctx, p.UserID, epID)
+// episodeHasStoryboardTakes 检查视觉编辑和有效候选，保留活跃流程占位并忽略悬空孤儿。
+func episodeHasStoryboardTakes(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, assets DramaSegmentAssetReader, hasAssets bool, ep model.DramaEpisode) (bool, error) {
+	segs, err := tx.Segments(ctx, p.UserID, ep.ID)
 	if err != nil {
 		return false, err
+	}
+	if slices.ContainsFunc(segs, dramaSegmentUsesStageC) {
+		return true, nil
+	}
+	if !hasAssets {
+		return tx.HasSegmentTakes(ctx, p.UserID, ep.ID)
 	}
 	for i := range segs {
 		if _, err := tx.ActiveFrameRun(ctx, p.UserID, segs[i].ID, false); err == nil {
@@ -83,7 +119,7 @@ func episodeHasStoryboardTakes(ctx context.Context, tx repository.DramaTx, p *mo
 	return false, nil
 }
 
-// estimateStoryboard 在项目锁下使用与提交一致的前置与take校验，不冻结积分。
+// estimateStoryboard 在项目锁下使用与提交一致的替换检查，不冻结积分。
 func (s *DramaService) estimateStoryboard(ctx context.Context, userID, id uint64, req *model.DramaJobReq) (int, error) {
 	var project *model.DramaProject
 	var selected []model.DramaEpisode
@@ -97,11 +133,14 @@ func (s *DramaService) estimateStoryboard(ctx context.Context, userID, id uint64
 		if err != nil {
 			return err
 		}
+		if err := checkExpectedDramaEpisode(eps, req); err != nil {
+			return err
+		}
 		selected, err = selectDramaEpisodes(project, eps, req)
 		if err != nil {
 			return err
 		}
-		return s.checkStoryboardTakes(ctx, tx, project, selected)
+		return s.checkStoryboardReplacement(ctx, tx, project, selected)
 	})
 	if err != nil {
 		return 0, dramaError(err)
@@ -220,7 +259,7 @@ func (s *DramaService) storyboardAssets(ctx context.Context, p *model.DramaProje
 	return assets, nil
 }
 
-// saveStoryboardOutput 在project锁内再次校验take，再原子替换全部片段和集状态。
+// saveStoryboardOutput 在项目锁内再次检查节目单和候选，再原子替换全部片段和集状态。
 func (s *DramaService) saveStoryboardOutput(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, j *model.DramaJob, output drama.StoryboardOutput) error {
 	eps, err := tx.Episodes(ctx, p.UserID, p.ID)
 	if err != nil {
@@ -234,7 +273,7 @@ func (s *DramaService) saveStoryboardOutput(ctx context.Context, tx repository.D
 	if err = checkDramaEpisodeStep(ep, "storyboard"); err != nil {
 		return err
 	}
-	if err = s.checkStoryboardTakes(ctx, tx, p, selected); err != nil {
+	if err = s.checkStoryboardReplacement(ctx, tx, p, selected); err != nil {
 		return err
 	}
 	segments := make([]model.DramaSegment, 0, len(output.Segments))
@@ -248,7 +287,7 @@ func (s *DramaService) saveStoryboardOutput(ctx context.Context, tx repository.D
 	return tx.SaveEpisode(ctx, &ep, ep.Revision)
 }
 
-// finishStoryboardStatus 失败保留旧片段；取消恢复已有ready或empty，避免集卡片永久显示generating。
+// finishStoryboardStatus 失败保留当前片段；取消按剩余片段恢复 ready 或 empty。
 func finishStoryboardStatus(ctx context.Context, tx repository.DramaTx, j *model.DramaJob, status string) error {
 	if j.Step != "storyboard" || status == "succeeded" {
 		return nil

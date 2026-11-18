@@ -1,15 +1,18 @@
-import { getEpisodeManifest } from "@/api/drama";
-import type { DramaManifestView } from "@/api/drama/type";
+import { getEpisodeManifest, getEpisodeManifestV2 } from "@/api/drama";
+import type { DramaManifestV2Response, DramaManifestView } from "@/api/drama/type";
 
 export const MANIFEST_POLL_BASE_MS = 200;
 export const MANIFEST_POLL_MAX_MS = 2_000;
 export const MANIFEST_PREPARE_MAX_WAIT_MS = 120_000;
 export const MANIFEST_PREPARE_MAX_ATTEMPTS = 80;
 
-export type WaitManifestOutcome =
-  | { kind: "ready"; manifest: DramaManifestView }
+type ManifestPollOutcome<T> =
+  | { kind: "ready"; manifest: T }
   | { kind: "timeout" }
   | { kind: "cancelled" };
+
+export type WaitManifestOutcome = ManifestPollOutcome<DramaManifestView>;
+export type WaitManifestV2Outcome = ManifestPollOutcome<DramaManifestV2Response>;
 
 export interface WaitManifestOptions {
   signal?: AbortSignal;
@@ -135,6 +138,22 @@ export async function waitForEpisodeManifest(
   episodeNo: number,
   options: WaitManifestOptions = {},
 ): Promise<WaitManifestOutcome> {
+  return waitForManifest((signal) => getEpisodeManifest(dramaId, episodeNo, { signal }), options);
+}
+
+/** 轮询 V2 冷探针；带节目单诊断的终态也立即返回给调用方。 */
+export async function waitForEpisodeManifestV2(
+  dramaId: string,
+  episodeNo: number,
+  options: WaitManifestOptions = {},
+): Promise<WaitManifestV2Outcome> {
+  return waitForManifest((signal) => getEpisodeManifestV2(dramaId, episodeNo, { signal }), options);
+}
+
+async function waitForManifest<T extends { status?: string }>(
+  read: (signal: AbortSignal) => Promise<T>,
+  options: WaitManifestOptions,
+): Promise<ManifestPollOutcome<T>> {
   const {
     signal,
     isCancelled,
@@ -153,10 +172,7 @@ export async function waitForEpisodeManifest(
 
   for (;;) {
     const step = await raceWithinDeadline(
-      (reqController) =>
-        getEpisodeManifest(dramaId, episodeNo, {
-          signal: reqController.signal,
-        }),
+      (reqController) => read(reqController.signal),
       deadlineMs,
       nowMs,
       aborted,

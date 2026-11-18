@@ -4,7 +4,8 @@ import { CircleX, Loader2, Trash2 } from "lucide-react";
 import { StatusPill } from "@/components/drama/status-pill";
 import { Button } from "@/components/ui/button";
 import { DURATION, EASE_OUT } from "@/lib/motion";
-import { hasVideo, latestError } from "@/utils/drama/segments";
+import { hasRenderableVisual, isVideoVisual, visualBadges } from "@/utils/drama/program";
+import { latestError } from "@/utils/drama/segments";
 
 import { PromptPane } from "./prompt-pane";
 import { RefsBar } from "./refs-bar";
@@ -15,7 +16,7 @@ const INSPECTOR = "bg-card h-full w-full min-w-0 overflow-y-auto";
 
 /** 中间编辑区：片段标题、参考素材条、提示词、失败提示（时长、视频模型和生成按钮在顶栏） */
 export function Editor() {
-  const { selected, actions, segmentsStatus, no } = useStudio();
+  const { selected, actions, segmentsStatus, no, visualDrawer } = useStudio();
 
   if (!selected) {
     return (
@@ -32,7 +33,7 @@ export function Editor() {
   }
 
   const error = latestError(selected);
-  const out = hasVideo(selected);
+  const out = hasRenderableVisual(selected) && isVideoVisual(selected);
 
   return (
     <section aria-label={`第 ${no} 集 片段 ${selected.seq + 1}`} className={INSPECTOR}>
@@ -48,6 +49,21 @@ export function Editor() {
             片段 {String(selected.seq + 1).padStart(2, "0")}
           </h2>
           <span className="flex-1" />
+          {visualBadges(selected).map((label) => (
+            <StatusPill key={label} tone="muted">
+              {label}
+            </StatusPill>
+          ))}
+          {visualDrawer && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => visualDrawer.open(selected.id)}
+            >
+              画面与特效
+            </Button>
+          )}
           {selected.status === "error" && <StatusPill tone="destructive">生成失败</StatusPill>}
           {selected.status === "running" && (
             <StatusPill tone="running">

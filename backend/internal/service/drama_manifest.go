@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -28,6 +29,7 @@ type dramaManifestSource struct {
 	episode model.DramaEpisode
 	rows    []model.DramaSegment
 	input   dramaComposeInput
+	stageC  *dramaManifestV2Source // 仅在合成提交门控使用，不进入 v1 清单。
 }
 
 // dramaProbeVideo 让测试注入探测函数，生产默认复用规范化探测器。
@@ -129,6 +131,10 @@ func (s *DramaService) clearManifestWarmupErr(user, id uint64, source *dramaMani
 	if err != nil {
 		return
 	}
+	s.clearManifestWarmupKey(key)
+}
+
+func (s *DramaService) clearManifestWarmupKey(key string) {
 	p := s.preview
 	p.mu.Lock()
 	delete(p.manifestErr, key)
@@ -140,6 +146,14 @@ func (s *DramaService) ensureManifestWarmup(user, id uint64, source *dramaManife
 	if err != nil {
 		return err
 	}
+	return s.ensureManifestProbeWork(key, true, func(ctx context.Context) error {
+		_, err := s.resolveDramaManifestSource(ctx, source)
+		return err
+	})
+}
+
+// ensureManifestProbeWork 让两版清单共用预热容量和失败缓存，解析及缓存键仍各自隔离。
+func (s *DramaService) ensureManifestProbeWork(key string, consumeErr bool, work func(context.Context) error) error {
 	p := s.preview
 	p.mu.Lock()
 	if p.closed {
@@ -149,8 +163,11 @@ func (s *DramaService) ensureManifestWarmup(user, id uint64, source *dramaManife
 	now := p.now()
 	ttl := p.manifestErrTTL()
 	if prev, ok := p.manifestErr[key]; ok {
-		delete(p.manifestErr, key)
-		if now.Sub(prev.at) <= ttl {
+		active := now.Sub(prev.at) <= ttl
+		if consumeErr || !active {
+			delete(p.manifestErr, key)
+		}
+		if active {
 			p.mu.Unlock()
 			return prev.err
 		}
@@ -168,11 +185,11 @@ func (s *DramaService) ensureManifestWarmup(user, id uint64, source *dramaManife
 	execTimeout := p.execTimeout
 	p.mu.Unlock()
 
-	go s.runManifestWarmup(key, source, execTimeout)
+	go s.runManifestWarmup(key, work, execTimeout)
 	return nil
 }
 
-func (s *DramaService) runManifestWarmup(key string, source *dramaManifestSource, execTimeout time.Duration) {
+func (s *DramaService) runManifestWarmup(key string, work func(context.Context) error, execTimeout time.Duration) {
 	p := s.preview
 	defer p.wg.Done()
 	workCtx, cancel := context.WithTimeout(p.ctx, execTimeout)
@@ -183,7 +200,7 @@ func (s *DramaService) runManifestWarmup(key string, source *dramaManifestSource
 	case p.sem <- struct{}{}:
 		func() {
 			defer func() { <-p.sem }()
-			_, runErr = s.resolveDramaManifestSource(workCtx, source)
+			runErr = work(workCtx)
 		}()
 	case <-workCtx.Done():
 		runErr = workCtx.Err()
@@ -243,12 +260,22 @@ func readDramaManifestSource(ctx context.Context, reader dramaManifestReader, p 
 	if err != nil {
 		return nil, err
 	}
+	return readDramaManifestSourceRows(ctx, reader, p, ep, rows)
+}
+
+// sortDramaManifestRows 固定时间轴按序号和主键排序；主键也用于 V2 锚点。
+func sortDramaManifestRows(rows []model.DramaSegment) {
 	sort.Slice(rows, func(i, j int) bool {
 		if rows[i].Seq == rows[j].Seq {
 			return rows[i].ID < rows[j].ID
 		}
 		return rows[i].Seq < rows[j].Seq
 	})
+}
+
+// readDramaManifestSourceRows 按 v1 的历史采用规则读取合成输入。
+func readDramaManifestSourceRows(ctx context.Context, reader dramaManifestReader, p *model.DramaProject, ep model.DramaEpisode, rows []model.DramaSegment) (*dramaManifestSource, error) {
+	sortDramaManifestRows(rows)
 	source := &dramaManifestSource{project: *p, episode: ep, rows: []model.DramaSegment{}, input: dramaComposeInput{EpisodeID: ep.ID, SegmentVersion: ep.SegmentVersion, AssetIDs: []uint64{}, SkippedSeqs: []int{}}}
 	for _, row := range rows {
 		if row.ChosenTaskID == nil {
@@ -385,7 +412,7 @@ func (s *DramaService) lookupCachedDramaManifestProbe(ctx context.Context, user,
 	return nil, nil, false, err
 }
 
-// dramaManifestProbe 先核验当前素材元数据；缓存未命中才在锁外下载并解码。
+// dramaManifestProbe 先核验当前素材元数据；缓存未命中才在锁外校验下载指纹并解码。
 func (s *DramaService) dramaManifestProbe(ctx context.Context, user, id uint64) (*model.Asset, *model.AssetMediaProbe, error) {
 	asset, probe, hit, err := s.lookupCachedDramaManifestProbe(ctx, user, id)
 	if err != nil {
@@ -403,7 +430,7 @@ func (s *DramaService) dramaManifestProbe(ctx context.Context, user, id uint64) 
 	if err := file.Close(); err != nil {
 		return nil, nil, err
 	}
-	if err := s.downloadCompose(ctx, user, id, path); err != nil {
+	if err := s.downloadComposeVideo(ctx, user, id, path, asset.Sha256); err != nil {
 		return nil, nil, err
 	}
 	result, err := s.probeVideo(ctx, path)
@@ -430,4 +457,80 @@ func (a manifestTakeAssets) View(ctx context.Context, user, id uint64) (*model.A
 		return nil, nil
 	}
 	return &model.AssetView{ID: asset.ID, Kind: asset.Kind}, nil
+}
+
+// dramaProbeAudio 保持音频探针独立于 v1 视频探针。
+func dramaProbeAudio(d DramaDeps) func(context.Context, string) (videoframe.AudioProbe, error) {
+	if d.ProbeAudio != nil {
+		return d.ProbeAudio
+	}
+	return videoframe.New(videoframe.Options{Timeout: dramaComposeTimeout}).ProbeProgramAudio
+}
+
+// lookupCachedDramaManifestAudioProbe 只读归属与版本化缓存，空哈希交给锁外预热。
+func (s *DramaService) lookupCachedDramaManifestAudioProbe(ctx context.Context, asset *model.Asset) (*model.AssetMediaProbe, error) {
+	if s.probes == nil || (asset.Sha256 != "" && !validDramaManifestHash(asset.Sha256)) {
+		return nil, errcode.ErrDramaMediaUnavailable
+	}
+	if asset.Sha256 == "" {
+		return nil, nil
+	}
+	probe, err := s.probes.Get(ctx, asset.ID, asset.Sha256, videoframe.NormalizedAudioProbeVersion)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, nil
+	}
+	if err == nil && (probe == nil || !probe.HasAudio || probe.DecodedAudioSamples <= 0) {
+		return nil, errcode.ErrDramaMediaUnavailable
+	}
+	return probe, err
+}
+
+// dramaManifestAudioProbe 在事务外补写历史素材哈希，并只缓存有效的音频探针。
+func (s *DramaService) dramaManifestAudioProbe(ctx context.Context, user, id uint64) (string, *model.AssetMediaProbe, error) {
+	asset, err := s.programAsset(ctx, user, id)
+	if err != nil || !validProgramAsset(asset, user, id, model.KindAudio) {
+		return "", nil, errcode.ErrDramaMediaUnavailable
+	}
+	if asset.Sha256 == "" {
+		hasher, ok := s.assets.(segmentMediaHasher)
+		if !ok {
+			return "", nil, errcode.ErrDramaMediaUnavailable
+		}
+		hash, updated, err := hasher.EnsureSha256(ctx, user, id)
+		if err != nil || !validProgramAsset(updated, user, id, model.KindAudio) || updated.Sha256 != hash || !validDramaManifestHash(hash) {
+			return "", nil, errcode.ErrDramaMediaUnavailable
+		}
+		asset = updated
+	}
+	probe, err := s.probeDramaManifestAudioAsset(ctx, user, asset)
+	return asset.Sha256, probe, err
+}
+
+// probeDramaManifestAudioAsset 使用同一份元数据核验下载并填充对应探针版本。
+func (s *DramaService) probeDramaManifestAudioAsset(ctx context.Context, user uint64, asset *model.Asset) (*model.AssetMediaProbe, error) {
+	if probe, err := s.lookupCachedDramaManifestAudioProbe(ctx, asset); err != nil || probe != nil {
+		return probe, err
+	}
+	dir, err := os.MkdirTemp("", "vc-drama-audio-probe-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "audio")
+	if err := s.downloadProgramMedia(ctx, user, path, *asset); err != nil {
+		return nil, err
+	}
+	result, err := s.probeAudio(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	if result.DecodedAudioSamples <= 0 {
+		return nil, videoframe.ErrDecode
+	}
+	probe := &model.AssetMediaProbe{AssetID: asset.ID, Sha256: asset.Sha256, ProbeVersion: videoframe.NormalizedAudioProbeVersion,
+		HasAudio: true, AudioSampleRate: model.DramaProgramSampleRate, DecodedAudioSamples: result.DecodedAudioSamples, AStartUs: result.AStartUs}
+	if err := s.probes.Upsert(ctx, probe); err != nil {
+		return nil, err
+	}
+	return probe, nil
 }

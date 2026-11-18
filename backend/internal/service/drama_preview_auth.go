@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"video-canvas/internal/model"
 )
 
 const (
@@ -23,18 +25,34 @@ type dramaPreviewKey struct {
 	key       string
 }
 
+// dramaPreviewIdentity 固定建票时的渲染器、集版本与输出请求。
+type dramaPreviewIdentity struct {
+	User, Drama, EpisodeID uint64
+	Episode                int
+	AspectRatio            string
+	RenderVersion          int
+	Req                    model.DramaPreviewReq
+}
+
 type dramaPreviewTicket struct {
-	user      uint64
-	drama     uint64
-	episode   int
-	episodeID uint64
-	key       string
-	id        string
-	path      string
-	status    string
-	expires   time.Time
-	ctx       context.Context
-	cancel    context.CancelFunc
+	user           uint64
+	drama          uint64
+	episode        int
+	episodeID      uint64
+	segmentVersion int64
+	manifestHash   string
+	aspectRatio    string
+	renderVersion  int
+	stageC         *dramaManifestV2Source
+	v2             *dramaV2Resolution
+	key            string
+	id             string
+	path           string
+	status         string
+	err            error
+	expires        time.Time
+	ctx            context.Context
+	cancel         context.CancelFunc
 }
 
 const maxConcurrentPreviewRenders = 4

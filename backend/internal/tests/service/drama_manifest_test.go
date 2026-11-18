@@ -13,6 +13,7 @@ import (
 
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/jsonhash"
 	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/provider"
 	"video-canvas/internal/repository"
@@ -21,7 +22,8 @@ import (
 
 type manifestFiles struct {
 	*composeFiles
-	sha string
+	sha  string
+	body string
 }
 
 func (a *manifestFiles) Get(_ context.Context, user, id uint64) (*model.Asset, error) {
@@ -31,15 +33,43 @@ func (a *manifestFiles) Get(_ context.Context, user, id uint64) (*model.Asset, e
 	return &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: a.sha}, nil
 }
 
+func (a *manifestFiles) Open(ctx context.Context, user, id uint64) (*provider.AssetFile, error) {
+	if a.body == "" {
+		return a.composeFiles.Open(ctx, user, id)
+	}
+	if a.downloadErr != nil {
+		return nil, a.downloadErr
+	}
+	if user != 7 || id != 30 {
+		return nil, provider.ErrAssetNotFound
+	}
+	return &provider.AssetFile{
+		Asset: &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: a.sha},
+		Body:  io.NopCloser(strings.NewReader(a.body)),
+	}, nil
+}
+
+type manifestAudioProbeKey struct {
+	id  uint64
+	sha string
+}
+
 type manifestProbes struct {
 	mu    sync.Mutex
 	rows  map[string]*model.AssetMediaProbe
+	audio map[manifestAudioProbeKey]*model.AssetMediaProbe
 	calls int
 }
 
-func (p *manifestProbes) Get(_ context.Context, _ uint64, sha string, _ int16) (*model.AssetMediaProbe, error) {
+func (p *manifestProbes) Get(_ context.Context, id uint64, sha string, version int16) (*model.AssetMediaProbe, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if version == videoframe.NormalizedAudioProbeVersion {
+		if row := p.audio[manifestAudioProbeKey{id, sha}]; row != nil {
+			return row, nil
+		}
+		return nil, repository.ErrNotFound
+	}
 	if row := p.rows[sha]; row != nil {
 		return row, nil
 	}
@@ -49,11 +79,18 @@ func (p *manifestProbes) Upsert(_ context.Context, row *model.AssetMediaProbe) e
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
-	p.rows[row.Sha256] = row
+	if row.ProbeVersion == videoframe.NormalizedAudioProbeVersion {
+		if p.audio == nil {
+			p.audio = make(map[manifestAudioProbeKey]*model.AssetMediaProbe)
+		}
+		p.audio[manifestAudioProbeKey{row.AssetID, row.Sha256}] = row
+	} else {
+		p.rows[row.Sha256] = row
+	}
 	return nil
 }
 func manifestService(r *composeMemory) (*service.DramaService, *manifestFiles, *manifestProbes) {
-	a := &manifestFiles{composeFiles: &composeFiles{r: r}, sha: strings.Repeat("a", 64)}
+	a := &manifestFiles{composeFiles: &composeFiles{r: r}, sha: verifiedVideoHash()}
 	probes := &manifestProbes{rows: map[string]*model.AssetMediaProbe{}}
 	s := service.NewDramaService(service.DramaDeps{Repo: r, Assets: a, Probes: probes, Compose: &composeProcessor{}, ProbeVideo: func(context.Context, string) (videoframe.NormalizedProbe, error) {
 		return videoframe.NormalizedProbe{FpsNum: 24, FpsDen: 1, NormalizedFrames24: 120}, nil
@@ -84,7 +121,8 @@ func TestDramaManifest_TrimHashCacheAndSchemaIsolation(t *testing.T) {
 	if err != nil || again.ManifestHash != v.ManifestHash {
 		t.Fatalf("schema=0/1 空包不一致: %v", err)
 	}
-	a.sha = strings.Repeat("b", 64)
+	a.body = "video-b"
+	a.sha = jsonhash.SHA256Hex([]byte(a.body))
 	again, err = s.ResolveEpisodeManifest(ctx, 7, 1, 1)
 	if err != nil || again.ManifestHash == v.ManifestHash || probes.calls != 2 {
 		t.Fatalf("内容变化未失效缓存 %v", err)
@@ -100,13 +138,21 @@ type asyncWarmupFiles struct {
 	*composeFiles
 }
 
+func asyncWarmupVideoBody(id uint64) string {
+	if id == 30 {
+		return "video"
+	}
+	return fmt.Sprintf("video-%d", id)
+}
+
 func (a *asyncWarmupFiles) Open(_ context.Context, user, id uint64) (*provider.AssetFile, error) {
 	if user != 7 || id < 30 || id > 39 {
 		return nil, provider.ErrAssetNotFound
 	}
+	body := asyncWarmupVideoBody(id)
 	return &provider.AssetFile{
-		Asset: &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: fmt.Sprintf("%064x", id)},
-		Body:  io.NopCloser(strings.NewReader("video")),
+		Asset: &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: jsonhash.SHA256Hex([]byte(body))},
+		Body:  io.NopCloser(strings.NewReader(body)),
 	}, nil
 }
 
@@ -114,7 +160,7 @@ func (a *asyncWarmupFiles) Get(_ context.Context, user, id uint64) (*model.Asset
 	if user != 7 || id < 30 || id > 39 {
 		return nil, repository.ErrNotFound
 	}
-	return &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: fmt.Sprintf("%064x", id)}, nil
+	return &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: jsonhash.SHA256Hex([]byte(asyncWarmupVideoBody(id)))}, nil
 }
 
 func newAsyncWarmupFixture() (*composeMemory, *manifestProbes) {
@@ -425,4 +471,98 @@ func TestDramaManifest_ManifestErrPruneExpiredAndEvictOldestOnly(t *testing.T) {
 		}
 		s.WaitManifestWarmupsForTest()
 	})
+}
+
+func TestDramaManifestV2MovesAnchorsByIDAndKeepsAbsoluteTiming(t *testing.T) {
+	ctx := context.Background()
+	r, s := newProgramFixture(t, nil)
+	r.segments[1].VisualKind = model.DramaVisualBlack
+	r.segments[1].SourceOutF = new(int32(24))
+	r.segments[1].FXJSON = []byte(`{"fade_in_f":2}`)
+	req := anchoredProgram(0, 5, 10)
+	req.Program.Audio = append(req.Program.Audio, absoluteProgramCue("music", model.DramaAudioBGM, 3, 36))
+	if _, err := s.PutProgram(ctx, 7, 1, 1, req); err != nil {
+		t.Fatal(err)
+	}
+	assertV2AnchorPlacement(t, s, 10, 20)
+	r.segments[0].Seq, r.segments[1].Seq = 1, 0
+	r.episodes[0].SegmentVersion++
+	assertV2AnchorPlacement(t, s, 34, 44)
+
+	r.segments[1].VisualKind = model.DramaVisualStill
+	r.segments[1].StillAssetID = new(uint64(32))
+	m, err := s.ResolveEpisodeManifestV2(ctx, 7, 1, 1)
+	if err != nil || m.Manifest.TotalFrames != 144 || m.Manifest.Clips[0].TaskID != 0 || m.Manifest.Clips[0].VisualKind != "still" ||
+		*m.Manifest.Clips[0].StillAssetID != 32 || m.Manifest.Clips[0].FX.FadeInF != 2 || m.Manifest.Clips[1].TaskID != 20 {
+		t.Fatalf("still plus video timeline: %+v %v", m, err)
+	}
+	r.segments[0].SourceOutF = new(int32(10)) // SourceOutF is exclusive.
+	assertV2CueDiagnostic(t, s, "hit", "anchor_frame_trimmed")
+	r.segments[0].SourceOutF = nil
+	assertV2AnchorPlacement(t, s, 34, 44)
+
+	// A new clip with the same seq must not receive the old segment's anchor.
+	saved := r.segments[0]
+	r.segments[0] = model.DramaSegment{BaseModel: model.BaseModel{ID: 8}, EpisodeID: 3, UserID: 7, Seq: 1,
+		VisualKind: model.DramaVisualBlack, SourceOutF: new(int32(120))}
+	assertV2CueDiagnostic(t, s, "hit", "anchor_segment_missing")
+	r.segments[0] = saved
+	assertV2AnchorPlacement(t, s, 34, 44)
+}
+
+func assertV2AnchorPlacement(t *testing.T, s *service.DramaService, wantStart, wantEnd int32) {
+	t.Helper()
+	m, err := s.ResolveEpisodeManifestV2(context.Background(), 7, 1, 1)
+	if err != nil || len(m.ManifestHash) != 64 {
+		t.Fatalf("expected valid V2: %+v %v", m, err)
+	}
+	audio := m.Manifest.Program.Audio
+	if len(audio) != 3 || audio[0].Anchor.SegmentID != 5 || *audio[0].StartF != wantStart || *audio[0].EndF != wantEnd ||
+		*audio[1].StartF != 0 || *audio[1].EndF != 12 || *audio[2].StartF != 3 || *audio[2].EndF != 36 {
+		t.Fatalf("unexpected cue placement: %+v", audio)
+	}
+}
+
+func assertV2CueDiagnostic(t *testing.T, s *service.DramaService, id, reason string) {
+	t.Helper()
+	m, err := s.ResolveEpisodeManifestV2(context.Background(), 7, 1, 1)
+	if err != nil || m.ManifestHash != "" || len(m.Diagnostics) == 0 {
+		t.Fatalf("expected invalid V2: %+v %v", m, err)
+	}
+	for _, d := range m.ProgramDiagnostics {
+		if d.CueID == id && d.Reason == reason {
+			return
+		}
+	}
+	t.Fatalf("missing %s diagnostic for %s: %+v", reason, id, m.ProgramDiagnostics)
+}
+
+func TestDramaManifestV2DiagnosesBoundsAndUnavailableAnchors(t *testing.T) {
+	ctx := context.Background()
+	r, s := newProgramFixture(t, nil)
+	req := anchoredProgram(0, 5, 115)
+	req.Program.Audio = append(req.Program.Audio, absoluteProgramCue("music", model.DramaAudioBGM, 0, 121))
+	if _, err := s.PutProgram(ctx, 7, 1, 1, req); err != nil {
+		t.Fatal(err)
+	}
+	assertV2CueDiagnostic(t, s, "hit", "cue_out_of_episode")
+	assertV2CueDiagnostic(t, s, "music", "cue_out_of_episode")
+
+	r.segments[0].ChosenTaskID = nil
+	assertV2CueDiagnostic(t, s, "hit", "anchor_segment_unready")
+	r.segments[0].VisualKind = model.DramaVisualBlack
+	r.segments[0].SourceOutF = new(int32(120))
+	assertV2CueDiagnostic(t, s, "hit", "anchor_non_video")
+	req.RebindAnchorCueIDs = []string{"hit"}
+	req.ExpectedSegmentVersion = new(int64(1))
+	_, err := s.PutProgram(ctx, 7, 1, 1, req)
+	requireProgramError(t, err, 91010, "anchor_non_video")
+}
+
+func TestDramaManifestV2ValidatesTimelineLimit(t *testing.T) {
+	r, s := newProgramFixture(t, nil)
+	r.segments[0].VisualKind = model.DramaVisualBlack
+	r.segments[0].ChosenTaskID = nil
+	r.segments[0].SourceOutF = new(int32(model.DramaProgramMaxFrames + 1))
+	assertV2CueDiagnostic(t, s, "", "timeline_limit")
 }

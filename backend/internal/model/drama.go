@@ -71,6 +71,8 @@ type DramaEpisode struct {
 	FinalComposeJobID   *uint64
 	LockedAt            *time.Time
 	Revision            int64 `gorm:"not null;default:1"`
+	// ProgramJSON 持久化集级音频节目单，包含服务端私有的锚点绑定。
+	ProgramJSON datatypes.JSON `gorm:"type:jsonb;not null;default:'{\"v\":1,\"audio\":[],\"overlays\":[]}'::jsonb;check:ck_de_program,jsonb_typeof(program_json) = 'object' AND jsonb_exists(program_json, 'v') AND jsonb_exists(program_json, 'audio') AND jsonb_exists(program_json, 'overlays') AND program_json->'v' = '1'::jsonb AND jsonb_typeof(program_json->'audio') = 'array' AND jsonb_typeof(program_json->'overlays') = 'array'" json:"-"`
 }
 
 // TableName 返回 DramaEpisode 对应的表名。
@@ -179,12 +181,15 @@ type UpdateDramaEpisodeReq struct {
 
 // DramaJobReq 提交或估价的步骤与范围。
 type DramaJobReq struct {
-	Compose           *DramaComposeReq `json:"compose"`
-	ComposeRequestKey string           `json:"compose_request_key" binding:"max=96"`
-	Step              string           `json:"step" binding:"required,oneof=scripts breakdown asset_prompts storyboard compose"`
-	Episodes          []int            `json:"episodes" binding:"max=200,dive,min=1,max=100000"`
-	Ratio             string           `json:"ratio" binding:"omitempty,oneof=9:16 16:9 21:9 3:4 4:3 1:1"`
-	MaxSeconds        int              `json:"max_seconds" binding:"omitempty,min=4,max=60"`
+	Compose                *DramaComposeReq `json:"compose"`
+	ComposeRequestKey      string           `json:"compose_request_key" binding:"max=96"`
+	ExpectedEpisodeID      *uint64          `json:"-"`                                  // HTTP 层解码；nil 未提供，0 表示空身份。
+	ConfirmClear           bool             `json:"confirm_clear,omitempty"`            // 分镜提交时同时确认清空旧片段。
+	ExpectedSegmentVersion *int64           `json:"expected_segment_version,omitempty"` // 分镜确认清空时的集片段版本。
+	Step                   string           `json:"step" binding:"required,oneof=scripts breakdown asset_prompts storyboard compose"`
+	Episodes               []int            `json:"episodes" binding:"max=200,dive,min=1,max=100000"`
+	Ratio                  string           `json:"ratio" binding:"omitempty,oneof=9:16 16:9 21:9 3:4 4:3 1:1"`
+	MaxSeconds             int              `json:"max_seconds" binding:"omitempty,min=4,max=60"`
 }
 
 // DramaSummary 列表项。

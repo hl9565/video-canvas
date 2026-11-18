@@ -141,15 +141,18 @@ func (s *DramaFrameRunService) Create(ctx context.Context, userID, sid uint64, r
 	if err != nil {
 		return nil, false, err
 	}
+	p, _, seg, err := s.segments.segmentSource(ctx, userID, sid)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := requireDramaVideoSegment(seg); err != nil {
+		return nil, false, err
+	}
 	run, err := s.repo.FrameRunByRequestKey(ctx, userID, normalized.RequestKey)
 	if err == nil {
 		return s.replayFrameRun(ctx, userID, sid, run, normalized, hash)
 	}
 	if !errors.Is(err, repository.ErrNotFound) {
-		return nil, false, err
-	}
-	p, _, _, err := s.segments.segmentSource(ctx, userID, sid)
-	if err != nil {
 		return nil, false, err
 	}
 	run, err = s.prepareNewFrameRun(ctx, userID, sid, p, normalized, hash)
@@ -233,6 +236,9 @@ func (s *DramaFrameRunService) prepareNewFrameRun(ctx context.Context, userID, s
 func (s *DramaFrameRunService) insertFrameRun(ctx context.Context, tx repository.DramaTx, run *model.DramaSegmentFrameRun, req *model.CreateFrameRunReq) error {
 	p, ep, seg, err := lockSegment(ctx, tx, run.UserID, run.SegmentID)
 	if err != nil {
+		return err
+	}
+	if err := requireDramaVideoSegment(seg); err != nil {
 		return err
 	}
 	if _, err := tx.FrameRunByRequestKey(ctx, run.UserID, run.RequestKey); err == nil {

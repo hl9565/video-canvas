@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/jsonhash"
 	"video-canvas/internal/pkg/videoframe"
+	"video-canvas/internal/provider"
 	"video-canvas/internal/repository"
 	"video-canvas/internal/service"
 )
@@ -21,7 +24,24 @@ func (r *composeMemory) LockSegments(context.Context, uint64, []uint64) ([]model
 	return r.segments, nil
 }
 func (r *composeMemory) ComposeAsset(_ context.Context, user, id uint64) (*model.Asset, error) {
-	return &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: strings.Repeat("a", 64)}, nil
+	return &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: verifiedVideoHash()}, nil
+}
+
+// verifiedManifestAssets 绑定测试文件真实指纹；清单测试仍可使用独立的合成指纹。
+func verifiedManifestAssets(r *composeMemory) (*manifestFiles, *manifestProbes) {
+	return &manifestFiles{composeFiles: &composeFiles{r: r}, sha: verifiedVideoHash()}, &manifestProbes{rows: map[string]*model.AssetMediaProbe{}}
+}
+
+func verifiedVideoHash() string { return jsonhash.SHA256Hex([]byte("video")) }
+
+type verifiedComposeMemory struct{ *composeMemory }
+
+func (r *verifiedComposeMemory) WithTx(ctx context.Context, fn func(repository.DramaTx) error) error {
+	return r.composeMemory.WithTx(ctx, func(repository.DramaTx) error { return fn(r) })
+}
+
+func (*verifiedComposeMemory) ComposeAsset(_ context.Context, user, id uint64) (*model.Asset, error) {
+	return &model.Asset{ID: id, UserID: user, Kind: model.KindVideo, Sha256: verifiedVideoHash()}, nil
 }
 
 func TestDramaComposeManifest_FrozenVariantsAndFinalJob(t *testing.T) {
@@ -57,6 +77,17 @@ func TestDramaComposeManifest_FrozenVariantsAndFinalJob(t *testing.T) {
 	result := jobs[0].Result
 	if result == nil || len(result.Exports) != 2 || result.Exports[0].Variant != "clean" || result.Exports[1].Variant != "packaged" || result.Exports[0].Width != 1920 || r.episodes[0].FinalComposeJobID == nil || *r.episodes[0].FinalComposeJobID != uint64(job.ID) || r.episodes[0].FinalSegmentVersion != 3 {
 		t.Fatalf("变体或主片引用错误: %+v %+v", result, r.episodes[0])
+	}
+	raw, err := json.Marshal(result.Exports[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) != 7 {
+		t.Fatalf("v1 export must retain exactly its historical keys: %s", raw)
 	}
 	if p.callsManifest != 1 || p.calls != 0 || p.input.Outputs[0].Width != 1920 || p.input.Outputs[0].Height != 1080 || !p.input.Outputs[1].WithOverlays {
 		t.Fatalf("未走新版渲染: %+v", p)
@@ -98,11 +129,11 @@ func (a *failingVariantAssets) DiscardCopies(ctx context.Context, assets []*mode
 func TestDramaComposeManifest_SecondUploadFailureDiscardsFirst(t *testing.T) {
 	r := newComposeMemory()
 	r.episodes[0].EditSchema = 1
-	_, base, probes := manifestService(r)
+	base, probes := verifiedManifestAssets(r)
 	probes.rows[base.sha] = &model.AssetMediaProbe{NormalizedFrames24: 120}
 	a := &failingVariantAssets{manifestFiles: base}
 	p := &manifestProcessor{}
-	s := service.NewDramaService(service.DramaDeps{Repo: r, Assets: a, Probes: probes, Compose: p})
+	s := service.NewDramaService(service.DramaDeps{Repo: &verifiedComposeMemory{r}, Assets: a, Probes: probes, Compose: p})
 	job, err := s.CreateJob(context.Background(), 7, 1, composeReq(t, `,"compose":{"variants":["clean","packaged"]}`))
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +209,7 @@ func TestDramaComposeManifest_PromptOnlyEditDoesNotInvalidateFrozenMedia(t *test
 }
 
 type multiEpComposeMemory struct {
-	*composeMemory
+	*verifiedComposeMemory
 }
 
 func (m *multiEpComposeMemory) WithTx(ctx context.Context, fn func(repository.DramaTx) error) error {
@@ -242,8 +273,8 @@ func TestDramaComposeManifest_Schema0FrozenRatioInvalidation(t *testing.T) {
 		model.DramaSegment{BaseModel: model.BaseModel{ID: 7}, UserID: 7, EpisodeID: 4, Seq: 0, ChosenTaskID: &c21},
 		model.DramaSegment{BaseModel: model.BaseModel{ID: 8}, UserID: 7, EpisodeID: 5, Seq: 0, ChosenTaskID: &c22},
 	)
-	r := &multiEpComposeMemory{composeMemory: base}
-	_, files, probes := manifestService(base)
+	r := &multiEpComposeMemory{verifiedComposeMemory: &verifiedComposeMemory{base}}
+	files, probes := verifiedManifestAssets(base)
 	svc := service.NewDramaService(service.DramaDeps{
 		Repo: r, Segments: r, Assets: files, Probes: probes, Compose: &manifestProcessor{},
 		ProbeVideo: func(context.Context, string) (videoframe.NormalizedProbe, error) {
@@ -324,4 +355,30 @@ func TestDramaComposeManifest_Schema0FrozenRatioInvalidation(t *testing.T) {
 	if *r.episodes[0].FinalAssetID != newerFinal || r.episodes[0].FinalSegmentVersion != 1 {
 		t.Fatalf("延迟旧画幅冻结任务覆盖了新版成片: asset=%d ver=%d", *r.episodes[0].FinalAssetID, r.episodes[0].FinalSegmentVersion)
 	}
+}
+
+func TestDramaComposeManifest_V1RejectsTamperedDownload(t *testing.T) {
+	r := newComposeMemory()
+	r.episodes[0].EditSchema = 1
+	files, probes := verifiedManifestAssets(r)
+	probes.rows[files.sha] = &model.AssetMediaProbe{NormalizedFrames24: 120}
+	proc := &manifestProcessor{}
+	svc := service.NewDramaService(service.DramaDeps{
+		Repo: &verifiedComposeMemory{r}, Assets: &tamperedManifestFiles{files}, Probes: probes, Compose: proc,
+	})
+	t.Cleanup(svc.ClosePreviews)
+	job := runSlice5Compose(t, svc, composeReq(t, ""))
+	if job.Status != "failed" || job.Result != nil || len(r.assets) != 0 || files.prepared != 0 || proc.manifestCalls() != 0 {
+		t.Fatalf("V1 compose published with bytes that did not match the frozen hash: %+v", job)
+	}
+}
+
+type tamperedManifestFiles struct{ *manifestFiles }
+
+func (f *tamperedManifestFiles) Open(ctx context.Context, user, id uint64) (*provider.AssetFile, error) {
+	asset, err := f.Get(ctx, user, id)
+	if err != nil {
+		return nil, err
+	}
+	return &provider.AssetFile{Asset: asset, Body: io.NopCloser(strings.NewReader("tampered"))}, nil
 }

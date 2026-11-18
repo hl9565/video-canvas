@@ -52,15 +52,41 @@ export function acceptTasks(views: ReadonlyArray<TaskView | null | undefined>) {
  * 提交画布节点的生成任务：生成数量 N 时一次请求拆成 N 个任务，按节点逐项返回任务或错误。
  * 请求本身失败（未登录、参数不合法、网络）会抛错，由调用方决定怎么就地提示。
  * @param data 提交内容
+ * @param idempotencyKey 不确定是否提交成功时沿用原键
  * @returns 每个节点的结果
  */
-export async function submitCanvasTasks(data: CreateTaskRequest): Promise<CreateTaskItem[]> {
-  const { items } = await submitWithRetry(
-    (key) => createGenerationTask(data, key),
-    crypto.randomUUID(),
-  );
+export async function submitCanvasTasks(
+  data: CreateTaskRequest,
+  idempotencyKey: string = crypto.randomUUID(),
+): Promise<CreateTaskItem[]> {
+  const { items } = await submitWithRetry((key) => createGenerationTask(data, key), idempotencyKey);
   acceptTasks(items.map((item) => item.task));
   return items;
+}
+
+/**
+ * 在短剧画布下提交独立的节目配音任务。
+ * @param request 画布、分集、模型能力输入与该次尝试的幂等键
+ * @returns 单条配音任务提交结果
+ */
+export async function submitProgramTtsTask(request: {
+  canvasId: string;
+  episodeId: string;
+  modelId: string;
+  input: Record<string, unknown>;
+  idempotencyKey: string;
+}): Promise<CreateTaskItem | undefined> {
+  const [item] = await submitCanvasTasks(
+    {
+      kind: "audio",
+      canvas_id: request.canvasId,
+      node_id: `program-tts:${request.episodeId}`,
+      model_id: request.modelId,
+      input: request.input,
+    },
+    request.idempotencyKey,
+  );
+  return item;
 }
 
 /**

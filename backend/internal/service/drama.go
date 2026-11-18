@@ -80,6 +80,7 @@ type DramaDeps struct {
 	Probes        DramaSegmentProbeStore
 	PreviewSecret string
 	ProbeVideo    func(context.Context, string) (videoframe.NormalizedProbe, error)
+	ProbeAudio    func(context.Context, string) (videoframe.AudioProbe, error)
 	Settings      DramaSettingsRepo
 	Skills        DramaSkills
 	Repo          DramaRepo
@@ -102,6 +103,7 @@ type DramaDeps struct {
 type DramaService struct {
 	probes       DramaSegmentProbeStore
 	probeVideo   func(context.Context, string) (videoframe.NormalizedProbe, error)
+	probeAudio   func(context.Context, string) (videoframe.AudioProbe, error)
 	preview      *dramaPreviewStore
 	settings     DramaSettingsRepo
 	skills       DramaSkills
@@ -122,7 +124,7 @@ type DramaService struct {
 
 // NewDramaService 创建短剧服务，不启动后台任务。
 func NewDramaService(d DramaDeps) *DramaService {
-	return &DramaService{probes: d.Probes, probeVideo: dramaProbeVideo(d), preview: newDramaPreviewStore(d.PreviewSecret), settings: d.Settings, skills: d.Skills, repo: d.Repo, registry: d.Registry, streamer: d.Streamer, secrets: d.Secrets, canvas: d.Canvas, bc: d.Broadcaster, credits: d.Credits, canvasAssets: d.CanvasAssets, segments: d.Segments, compose: d.Compose, assets: d.Assets, covers: d.Covers, coverURL: d.CoverURL}
+	return &DramaService{probes: d.Probes, probeVideo: dramaProbeVideo(d), probeAudio: dramaProbeAudio(d), preview: newDramaPreviewStore(d.PreviewSecret), settings: d.Settings, skills: d.Skills, repo: d.Repo, registry: d.Registry, streamer: d.Streamer, secrets: d.Secrets, canvas: d.Canvas, bc: d.Broadcaster, credits: d.Credits, canvasAssets: d.CanvasAssets, segments: d.Segments, compose: d.Compose, assets: d.Assets, covers: d.Covers, coverURL: d.CoverURL}
 }
 
 // Create 校验原文和风格，在同一事务建立项目、画布与首个研读任务。
@@ -319,58 +321,79 @@ func (s *DramaService) Update(ctx context.Context, userID, id uint64, req *model
 	if err := s.checkDramaModels(ctx, req.VideoModel, req.ImageModels); err != nil {
 		return nil, err
 	}
-	var changed map[string]model.DramaPromptSetting
-	if req.Prompts != nil {
-		p, err := s.repo.Project(ctx, userID, id, false)
-		if err != nil {
-			return nil, dramaError(err)
-		}
-		all, err := s.snapshotPrompts(ctx, userID, p.SourceKind, req.Prompts)
-		if err != nil {
-			return nil, err
-		}
-		changed = map[string]model.DramaPromptSetting{}
-		for key := range req.Prompts {
-			changed[key] = all[key]
-		}
+	changed, err := s.prepareDramaPromptPatch(ctx, userID, id, req)
+	if err != nil {
+		return nil, err
 	}
-
-	// 1. 事务中锁项目并执行revision比较；PATCH遗漏字段保持原值。
-	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
-		p, err := tx.Project(ctx, userID, id, true)
-		if err != nil {
-			return err
-		}
-		if p.Revision != req.Revision {
-			return errcode.ErrCanvasConflict
-		}
-		ratioChanged := req.Ratio != nil && *req.Ratio != p.Ratio
-		fields, err := dramaProjectPatch(p, req)
-		if err != nil {
-			return err
-		}
-		if changed != nil {
-			settings := promptSettings(p)
-			for key, value := range changed {
-				settings[key] = value
-			}
-			raw, _ := json.Marshal(settings)
-			fields["prompt_settings"] = raw
-		}
-		if err := tx.UpdateProject(ctx, userID, id, req.Revision, fields); err != nil {
-			return err
-		}
-		if ratioChanged {
-			if bumper, ok := tx.(dramaProjectRatioTx); ok {
-				return bumper.BumpProjectNewSchemaEpisodeVersions(ctx, userID, id)
-			}
-		}
-		return nil
+	// 2. 在项目锁内校验版本及目标画幅，和节目单、分镜写入串行。
+	err = s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
+		return updateDramaProjectLocked(ctx, tx, userID, id, req, changed)
 	})
 	if err != nil {
 		return nil, dramaError(err)
 	}
 	return s.Get(ctx, userID, id)
+}
+
+// prepareDramaPromptPatch 只解析显式提交的提示词，避免在项目锁内读取外部配置。
+func (s *DramaService) prepareDramaPromptPatch(ctx context.Context, userID, id uint64, req *model.UpdateDramaReq) (map[string]model.DramaPromptSetting, error) {
+	if req.Prompts == nil {
+		return nil, nil
+	}
+	p, err := s.repo.Project(ctx, userID, id, false)
+	if err != nil {
+		return nil, dramaError(err)
+	}
+	all, err := s.snapshotPrompts(ctx, userID, p.SourceKind, req.Prompts)
+	if err != nil {
+		return nil, err
+	}
+	changed := make(map[string]model.DramaPromptSetting, len(req.Prompts))
+	for key := range req.Prompts {
+		changed[key] = all[key]
+	}
+	return changed, nil
+}
+
+// updateDramaProjectLocked 校验项目版本、内容与画幅，再保存并使受影响的成片版本失效。
+func updateDramaProjectLocked(ctx context.Context, tx repository.DramaTx, userID, id uint64, req *model.UpdateDramaReq, changed map[string]model.DramaPromptSetting) error {
+	p, err := tx.Project(ctx, userID, id, true)
+	if err != nil {
+		return err
+	}
+	if p.Revision != req.Revision {
+		return errcode.ErrCanvasConflict
+	}
+	ratioChanged := req.Ratio != nil && *req.Ratio != p.Ratio
+	if ratioChanged {
+		if err := checkDramaRatioUpdate(ctx, tx, p, *req.Ratio); err != nil {
+			return err
+		}
+	}
+	fields, err := dramaProjectPatch(p, req)
+	if err != nil {
+		return err
+	}
+	if changed != nil {
+		settings := promptSettings(p)
+		for key, value := range changed {
+			settings[key] = value
+		}
+		raw, err := json.Marshal(settings)
+		if err != nil {
+			return err
+		}
+		fields["prompt_settings"] = raw
+	}
+	if err := tx.UpdateProject(ctx, userID, id, req.Revision, fields); err != nil {
+		return err
+	}
+	if ratioChanged {
+		if bumper, ok := tx.(dramaProjectRatioTx); ok {
+			return bumper.BumpProjectNewSchemaEpisodeVersions(ctx, userID, id)
+		}
+	}
+	return nil
 }
 
 type dramaProjectRatioTx interface {

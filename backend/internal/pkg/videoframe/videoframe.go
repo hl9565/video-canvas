@@ -40,6 +40,9 @@ var (
 	ErrBadCount    = errors.New("抽帧数量不合法")
 )
 
+// ErrLoudnessAcceptance 表示混音无法通过响度或真峰验收。
+var ErrLoudnessAcceptance = errors.New("混音未达到响度或真峰交付标准")
+
 // Format 是输出图片的编码。
 type Format string
 

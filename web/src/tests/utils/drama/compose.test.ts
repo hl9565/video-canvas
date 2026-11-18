@@ -346,3 +346,28 @@ describe("合成任务", () => {
     expect(latestComposeExports([failedTarget, fallbackSucceeded], 2)).toHaveLength(1);
   });
 });
+
+test("静帧和黑场可单独导出；16:9 限制和节目单诊断可阻断导出", () => {
+  const black = { ...seg("black", 0, false), visualKind: "black" as const };
+  const still = { ...seg("still", 1, false), visualKind: "still" as const, stillAssetId: 22 };
+  const missing = seg("missing", 2, false);
+  expect(composeCheck([black], null, { ratio: "16:9" }).enabled).toBe(true);
+  expect(composeCheck([still], null, { ratio: "16:9" }).enabled).toBe(true);
+  expect(composeCheck([black], null, { ratio: "9:16" }).enabled).toBe(false);
+  expect(missingVideoSeqs([black, still, missing])).toEqual([2]);
+  expect(missingVideoSeqs([black, still, missing], { skippedSeqs: [] })).toEqual([]);
+  const manifestV2 = {
+    status: "ready" as const,
+    manifest: null,
+    manifestHash: "",
+    segmentVersion: 1,
+    skippedSeqs: [],
+    diagnostics: [],
+    programDiagnostics: [
+      { cue_id: "sfx", field: "anchor", reason: "anchor_source_replaced", severity: "error" },
+    ],
+  };
+  expect(composeCheck([black], null, { manifestV2, ratio: "16:9" }).reason).toContain(
+    "锚点的视频来源已更换",
+  );
+});

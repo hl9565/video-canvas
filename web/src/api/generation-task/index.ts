@@ -1,3 +1,4 @@
+import { stageCAssetIdReviver } from "@/utils/drama/asset-id";
 import service from "@/utils/requests/service";
 import type { CreateTaskRequest, CreateTaskResponse, TaskView } from "./type";
 
@@ -11,6 +12,7 @@ import type { CreateTaskRequest, CreateTaskResponse, TaskView } from "./type";
 export const createGenerationTask = (data: CreateTaskRequest, idempotencyKey: string) =>
   service.post<CreateTaskResponse>("/generation-tasks", data, {
     headers: { "Idempotency-Key": idempotencyKey },
+    parseReviver: stageCAssetIdReviver,
   });
 
 /**
@@ -19,7 +21,9 @@ export const createGenerationTask = (data: CreateTaskRequest, idempotencyKey: st
  * @returns 任务视图
  */
 export const getGenerationTask = (id: string | number) =>
-  service.get<TaskView>(`/generation-tasks/${id}`, undefined);
+  service.get<TaskView>(`/generation-tasks/${id}`, undefined, {
+    parseReviver: stageCAssetIdReviver,
+  });
 
 /**
  * 按 id 批量对账，兼容画布十进制 ID 和短剧编码 ID；单次最多 100 个，超出自动分批
@@ -31,9 +35,11 @@ export const getGenerationTasksByIds = async (ids: Array<string | number>): Prom
   const result: TaskView[] = [];
   for (let i = 0; i < ids.length; i += 100) {
     const chunk = ids.slice(i, i + 100);
-    const list = await service.get<TaskView[] | null>("/generation-tasks", {
-      ids: chunk.join(","),
-    });
+    const list = await service.get<TaskView[] | null>(
+      "/generation-tasks",
+      { ids: chunk.join(",") },
+      { parseReviver: stageCAssetIdReviver },
+    );
     result.push(...(list ?? []));
   }
   return result;
@@ -44,7 +50,11 @@ export const getGenerationTasksByIds = async (ids: Array<string | number>): Prom
  * @returns 任务视图列表
  */
 export const getActiveGenerationTasks = async (): Promise<TaskView[]> =>
-  (await service.get<TaskView[] | null>("/generation-tasks", { status: "active" })) ?? [];
+  (await service.get<TaskView[] | null>(
+    "/generation-tasks",
+    { status: "active" },
+    { parseReviver: stageCAssetIdReviver },
+  )) ?? [];
 
 /**
  * 查某张画布某个节点最近的生成记录（如角色卡的声音任务 voice:{节点id}）：
@@ -57,10 +67,11 @@ export const getGenerationTasksByNode = async (
   canvasId: string,
   nodeId: string,
 ): Promise<TaskView[]> =>
-  (await service.get<TaskView[] | null>("/generation-tasks", {
-    node_id: nodeId,
-    canvas_project_id: canvasId,
-  })) ?? [];
+  (await service.get<TaskView[] | null>(
+    "/generation-tasks",
+    { node_id: nodeId, canvas_project_id: canvasId },
+    { parseReviver: stageCAssetIdReviver },
+  )) ?? [];
 
 /**
  * 软取消任务；后端可能返回最新快照，也可能什么都不返回，调用方都要能处理
@@ -68,4 +79,6 @@ export const getGenerationTasksByNode = async (
  * @returns 最新任务快照或 null
  */
 export const cancelGenerationTask = (id: string | number) =>
-  service.post<TaskView | null>(`/generation-tasks/${id}/cancel`, undefined);
+  service.post<TaskView | null>(`/generation-tasks/${id}/cancel`, undefined, {
+    parseReviver: stageCAssetIdReviver,
+  });

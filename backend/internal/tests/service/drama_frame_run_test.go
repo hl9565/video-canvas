@@ -26,6 +26,7 @@ import (
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/provider"
 	"video-canvas/internal/provider/modelcfg"
 	"video-canvas/internal/repository"
@@ -236,6 +237,22 @@ func (a *frameGuardAssets) SaveDerivedImage(ctx context.Context, userID uint64, 
 	return a.AssetService.SaveDerivedImage(ctx, userID, name, mime, data)
 }
 
+// frameRunSegmentRepo 让片段快照和素材服务读取同一份素材数据。
+type frameRunSegmentRepo struct {
+	*dramasegmentfake.Repo
+	assets *fakeAssetRepo
+}
+
+// WithSnapshotTx 将当前素材行复制到快照，模拟生产环境在同一事务内读多张表。
+func (r frameRunSegmentRepo) WithSnapshotTx(ctx context.Context, fn func(repository.DramaTx) error) error {
+	snapshot := *r.Repo
+	snapshot.Assets = make(map[uint64]model.Asset, len(r.assets.rows))
+	for id, asset := range r.assets.rows {
+		snapshot.Assets[id] = *asset
+	}
+	return snapshot.WithSnapshotTx(ctx, fn)
+}
+
 type frameRunEnv struct {
 	repo      *dramasegmentfake.Repo
 	assets    *frameGuardAssets
@@ -256,7 +273,7 @@ func newFrameRunEnv(t *testing.T) *frameRunEnv {
 	e := &frameRunEnv{repo: repo, assets: &frameGuardAssets{AssetService: assets, repo: repo}, assetRepo: assetRepo, store: store, registry: &fakeTaskRegistry{snap: frameI2VSnapshot()}, now: time.Now()}
 	e.tasks = &frameRunTasks{repo: repo, GenerationTaskService: service.NewGenerationTaskService(service.GenerationTaskDeps{
 		Repo: newFakeTaskRepo(), Registry: e.registry, Assets: e.assets, QuoteSecret: "frame-tests", FrameRunGuard: repo}, service.WithTaskClock(func() time.Time { return e.now }))}
-	e.segments = service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: repo, Tasks: e.tasks, Assets: e.assets, Canvases: repo, Broadcaster: repo})
+	e.segments = service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: frameRunSegmentRepo{Repo: repo, assets: assetRepo}, Tasks: e.tasks, Assets: e.assets, Canvases: repo, Broadcaster: repo})
 	e.svc = service.NewDramaFrameRunService(service.DramaFrameRunDeps{Repo: repo, Assets: e.assets, Tasks: e.tasks, Registry: e.registry,
 		Canvases: repo, Segments: e.segments, Broadcaster: repo, TicketSecret: "ticket-test"}, service.WithDramaFrameRunClock(func() time.Time { return e.now }))
 	e.segments.SetFrameRunEnricher(e.svc)
@@ -787,6 +804,7 @@ func TestFrameRunVideoSuccessRecovery(t *testing.T) {
 			}
 			a := &model.Asset{ID: 999, UserID: 1, Kind: model.KindVideo, Sha256: strings.Repeat("b", 64)}
 			e.assetRepo.rows[a.ID] = a
+			e.repo.Assets = map[uint64]model.Asset{a.ID: *a}
 			e.repo.Tasks[0].Status = model.TaskSucceeded
 			e.repo.Tasks[0].OutputJSON, _ = json.Marshal([]model.TaskOutput{{AssetID: a.ID, MediaType: model.KindVideo}})
 			if err := e.svc.RecoverUnsettledDramaFrameRuns(ctx, repository.FrameRunRecoveryFilter{}, 10); err != nil {
@@ -1095,7 +1113,7 @@ func TestFrameRunPG16EndToEndAndExpiredReplay(t *testing.T) {
 	}
 	a := &model.Asset{UserID: 7, Kind: model.KindVideo, StorageKey: "video.mp4", Source: model.AssetSourceGenerated, Sha256: strings.Repeat("b", 64)}
 	mustTakeSQL(t, e.db.Create(a))
-	mustTakeSQL(t, e.db.Create(&model.AssetMediaProbe{AssetID: a.ID, Sha256: a.Sha256, ProbeVersion: 1, NormalizedFrames24: 120}))
+	mustTakeSQL(t, e.db.Create(&model.AssetMediaProbe{AssetID: a.ID, Sha256: a.Sha256, ProbeVersion: videoframe.NormalizedProbeVersion, NormalizedFrames24: 120}))
 	out, _ := json.Marshal([]model.TaskOutput{{AssetID: a.ID, MediaType: model.KindVideo}})
 	mustTakeSQL(t, e.db.Model(&model.GenerationTask{}).Where("id = ?", task.ID).Updates(map[string]any{"status": model.TaskSucceeded, "output_json": out}))
 	if err := e.svc.RecoverUnsettledDramaFrameRuns(ctx, repository.FrameRunRecoveryFilter{}, 50); err != nil {

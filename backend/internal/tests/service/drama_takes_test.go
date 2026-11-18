@@ -135,6 +135,7 @@ func matrixTakeRepo(c takeMatrixCase) *dramasegmentfake.Repo {
 		run.SegmentRevision = 1
 	}
 	r.Tasks = []model.GenerationTask{task}
+	r.Assets = map[uint64]model.Asset{41: {ID: 41, UserID: 1, Kind: model.KindVideo}}
 	r.FrameRuns = []model.DramaSegmentFrameRun{run}
 	if c.chosen {
 		id := uint64(20)
@@ -1077,5 +1078,113 @@ func TestDramaTakesPureQCDoesNotAutoAdopt(t *testing.T) {
 	}
 	if v.ChosenTaskID != "" || v.Revision != 3 || v.SegmentVersion != 17 {
 		t.Fatalf("纯 QC 偷改了采用或集版本: %+v", v)
+	}
+}
+
+func TestDramaTakesLateCompletionCannotAdoptNonVideoOrCleared(t *testing.T) {
+	for _, kind := range []string{"still", "black", "video"} {
+		t.Run(kind, func(t *testing.T) {
+			// 模拟开始对账前已到达的历史结果；non-video 分支独立于 chosen_cleared。
+			r := matrixTakeRepo(takeMatrixCase{adopt: true, cleared: kind == "video"})
+			r.Rows[0].VisualKind = kind
+			if kind == "still" {
+				r.Rows[0].StillAssetID = new(uint64(42))
+			}
+			if kind != "video" {
+				r.Rows[0].SourceOutF = new(int32(13))
+			}
+			s := segmentService(r)
+			for _, entry := range []int{0, 1, 2, 3} {
+				triggerTakeEntry(t, s, &r.Tasks[0], entry)
+			}
+			if len(r.TakeLinks) != 1 || r.FrameRuns[0].State != model.FrameRunStateBound ||
+				r.Rows[0].ChosenTaskID != nil || r.Rows[0].Revision != 2 || r.SegmentVersion != 17 {
+				t.Fatalf("late result altered adoption or lost history: row=%+v run=%+v", r.Rows[0], r.FrameRuns[0])
+			}
+		})
+	}
+}
+
+func TestDramaTakesSyntheticHistoryWithoutAdoption(t *testing.T) {
+	for _, kind := range []string{"still", "black"} {
+		t.Run(kind, func(t *testing.T) {
+			r, s := importedTakeFixture()
+			r.Rows[0].VisualKind, r.Rows[0].ChosenCleared, r.Rows[0].SourceOutF = kind, true, new(int32(13))
+			if kind == "still" {
+				r.Rows[0].StillAssetID = new(uint64(42))
+			}
+			imp := &model.ImportDramaTakesReq{Revision: 1, SourceCanvasID: 11, TaskID: 21, Adopt: true}
+			_, err := s.ImportTakes(t.Context(), 1, 1, imp)
+			segmentCode(t, err, 91011)
+			imp.Adopt = false
+			v, err := s.ImportTakes(t.Context(), 1, 1, imp)
+			if err != nil || len(v.Takes) != 1 || v.ChosenTaskID != "" || v.Revision != 1 || v.SegmentVersion != 0 {
+				t.Fatalf("non-adopting import: %+v %v", v, err)
+			}
+
+			patch := &model.PatchDramaTakeQCReq{Revision: 1, QC: model.TakeQCRejected, ReplacementTaskID: new(idcodec.ID(22))}
+			_, err = s.PatchTakeQC(t.Context(), 1, 1, 21, patch)
+			segmentCode(t, err, 91011)
+			patch.ReplacementTaskID = nil
+			for _, qc := range []model.DramaSegmentTakeQC{model.TakeQCAccepted, model.TakeQCRejected, model.TakeQCUnreviewed} {
+				patch.QC = qc
+				v, err = s.PatchTakeQC(t.Context(), 1, 1, 21, patch)
+				if err != nil || len(v.Takes) != 1 || v.Takes[0].QC != string(qc) || v.ChosenTaskID != "" || v.SegmentVersion != 0 {
+					t.Fatalf("QC-only patch: %+v %v", v, err)
+				}
+				patch.Revision = v.Revision
+			}
+		})
+	}
+}
+
+func TestDramaTakesSyntheticGenerationGuards(t *testing.T) {
+	for _, kind := range []string{"still", "black"} {
+		t.Run(kind, func(t *testing.T) {
+			r, s := visualFixture()
+			r.Rows[0].VisualKind, r.Rows[0].ChosenCleared, r.Rows[0].SourceOutF = kind, true, new(int32(13))
+			if kind == "still" {
+				r.Rows[0].StillAssetID = new(uint64(20))
+			}
+			ctx := t.Context()
+			req := &model.GenerateDramaSegmentReq{ModelID: "m1", Input: map[string]any{"prompt": "test"}}
+			_, err := s.Quote(ctx, 1, 2, req)
+			segmentCode(t, err, 91011)
+			_, err = s.Generate(ctx, 1, 2, "test", req)
+			segmentCode(t, err, 91011)
+			if r.Created != nil {
+				t.Fatal("created a video task for synthetic visual")
+			}
+			r.FrameRuns = []model.DramaSegmentFrameRun{{ID: 9, UserID: 1, SegmentID: 2, RequestKey: "existing", Revision: 1, ConfirmedVersion: 1, State: model.FrameRunStateCancelled}}
+			f := service.NewDramaFrameRunService(service.DramaFrameRunDeps{Repo: r, Segments: s})
+			for _, key := range []string{"new", "existing"} {
+				_, _, err = f.Create(ctx, 1, 2, &model.CreateFrameRunReq{RequestKey: key, SegmentRevision: 1, FrameSource: model.FrameSourceExisting})
+				segmentCode(t, err, 91011)
+			}
+			_, err = f.Confirm(ctx, 1, 2, 9, &model.ConfirmFrameRunReq{Revision: 1, Input: req.Input, QuoteToken: "quote"})
+			segmentCode(t, err, 91011)
+			_, _, err = f.Submit(ctx, 1, 2, 9, &model.SubmitFrameRunReq{Revision: 1, ConfirmedVersion: 1})
+			segmentCode(t, err, 91011)
+			if v, err := f.Get(ctx, 1, 2, 9); err != nil || v.State != model.FrameRunStateCancelled {
+				t.Fatalf("terminal history: %+v %v", v, err)
+			}
+		})
+	}
+}
+
+type syntheticGenerationReplay struct{ *dramasegmentfake.Repo }
+
+func (syntheticGenerationReplay) CheckIdempotentReplay(context.Context, uint64, string, *model.CreateGenerationTaskReq) (*model.GenerationTaskView, error) {
+	return &model.GenerationTaskView{ID: 70}, nil
+}
+
+func TestDramaTakesSyntheticGenerationPreservesIdempotentReplay(t *testing.T) {
+	r, _ := visualFixture()
+	r.Rows[0].VisualKind, r.Rows[0].SourceOutF = "black", new(int32(13))
+	s := service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: r, Tasks: syntheticGenerationReplay{r}})
+	req := &model.GenerateDramaSegmentReq{ModelID: "m1", Input: map[string]any{"prompt": "test"}}
+	v, err := s.Generate(t.Context(), 1, 2, "pre-existing-key", req)
+	if err != nil || v.ID != 70 || r.Created != nil {
+		t.Fatalf("lost idempotent replay: %+v %v", v, err)
 	}
 }

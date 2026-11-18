@@ -1,4 +1,4 @@
-import { listSegments, mapSegment } from "@/api/drama";
+import { listEpisodeSegments, mapSegment } from "@/api/drama";
 import type { DramaSegmentEvent, Segment } from "@/api/drama/type";
 import { segmentKey, parseSegmentKey, useDramaSegmentsStore } from "@/store/drama-segments";
 
@@ -32,21 +32,38 @@ export function handleDramaSegmentEvent(event: DramaSegmentEvent) {
   const store = useDramaSegmentsStore.getState();
   const key = segmentKey(event.drama_id, event.episode_no);
   const before = store.byEpisode[key];
-  store.apply(event.drama_id, event.episode_no, mapSegment(event.segment));
-  refreshSummary(event.drama_id, before, useDramaSegmentsStore.getState().byEpisode[key]);
+  if (store.apply(event.drama_id, event.episode_no, mapSegment(event.segment))) {
+    refreshSummary(event.drama_id, before, useDramaSegmentsStore.getState().byEpisode[key]);
+  }
 }
 
 /** 重新拉一集的片段（对账 / 首次载入）；失败不抛，返回是否成功 */
-export async function reloadSegments(dramaId: string, no: number): Promise<boolean> {
+export async function reloadSegments(
+  dramaId: string,
+  no: number,
+  expectedEpisodeId?: string,
+  options?: { activate?: boolean },
+): Promise<boolean> {
   try {
-    const startFloors = { ...useDramaSegmentsStore.getState().runFloors };
-    const list = await listSegments(dramaId, no);
+    const beforeRequest = useDramaSegmentsStore.getState();
+    if (options?.activate && expectedEpisodeId) {
+      beforeRequest.activateEpisode(dramaId, no, expectedEpisodeId);
+    }
+    const expected = expectedEpisodeId ?? beforeRequest.snapshotOf(dramaId, no)?.episodeId;
+    const startFloors = { ...beforeRequest.runFloors };
+    const snapshot = await listEpisodeSegments(dramaId, no);
     const store = useDramaSegmentsStore.getState();
     const key = segmentKey(dramaId, no);
     const before = store.byEpisode[key];
-    store.setList(dramaId, no, list, startFloors);
-    refreshSummary(dramaId, before, useDramaSegmentsStore.getState().byEpisode[key]);
-    return true;
+    const accepted = store.setList(dramaId, no, snapshot.items, startFloors, {
+      episodeId: snapshot.episodeId,
+      segmentVersion: snapshot.segmentVersion,
+      expectedEpisodeId: expected,
+    });
+    if (accepted) {
+      refreshSummary(dramaId, before, useDramaSegmentsStore.getState().byEpisode[key]);
+    }
+    return accepted;
   } catch {
     return false;
   }

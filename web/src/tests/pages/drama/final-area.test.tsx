@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createElement, useEffect, useState } from "react";
 import { toast } from "sonner";
 
+import { DRAMA_ERR } from "@/api/drama/errors";
 import type {
   BackendJobView,
   BackendManifestResponse,
@@ -304,6 +305,60 @@ describe("FinalArea 多比例清单、帧时长与 final_compose_job_id 恢复",
     return res;
   };
 
+  test("有节目音频的 16:9 剧集读取 V2 清单、阻断诊断并显示历史导出的实测响度", async () => {
+    const e = makeDrama("16:9", { id: "ep-1", finalComposeJobId: "measured" });
+    const measured = composeJob("measured", "clean", "/measured.mp4", "2026-11-15T10:00:00Z");
+    const item = measured.result!.exports![0]!;
+    Object.assign(item, {
+      loudnessStatus: "accepted",
+      lufs: -16.12,
+      truePeak: -1.55,
+      audioSha256: "12345678abcdef",
+    });
+    measured.result!.exports!.push({
+      ...item,
+      variant: "packaged",
+      loudnessStatus: "silence",
+      lufs: undefined,
+      truePeak: undefined,
+    });
+    const get = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url.endsWith("/segments")) return { items: [rawSegment()] };
+      if (url.endsWith("/program"))
+        return {
+          episode_id: "ep-1",
+          segment_version: 2,
+          edit_schema: 1,
+          program: { v: 1, audio: [{ id: "hit" }], overlays: [] },
+        };
+      if (url.endsWith("/manifest?v=2"))
+        return {
+          status: "ready",
+          segment_version: 2,
+          manifest_hash: "",
+          skipped_seqs: [],
+          diagnostics: [],
+          program_diagnostics: [
+            { cue_id: "hit", field: "anchor", reason: "anchor_source_replaced", severity: "error" },
+          ],
+        };
+      throw new Error(`unexpected GET ${url}`);
+    });
+    const post = spyOn(service, "post").mockRejectedValue(
+      new Error("diagnostics must block compose"),
+    );
+    spies.push(get, post);
+    const { container } = await mountFinal(e, [measured]);
+    expect(get.mock.calls.map(([url]) => url)).toContain("/dramas/d-1/episodes/1/manifest?v=2");
+    expect(container.textContent).toContain("锚点的视频来源已更换");
+    expect(container.textContent).toContain("-16.1 LUFS / TP -1.6 dBTP · #12345678");
+    expect(container.textContent).toContain("静音母带");
+    const composeButton = [...container.querySelectorAll("button")].find(
+      (el) => el.textContent?.trim() === "合成第 1 集",
+    );
+    expect(composeButton?.disabled).toBe(true);
+    expect(post).not.toHaveBeenCalled();
+  });
   test("9:16 + editSchema=1 启用分档与版本导出，显示比例像素提示并按 total_frames/24 展示不足 1 秒时长（0.79s）", async () => {
     const seg = rawSegment(0, "seg-1", 10);
     const manifest = rawManifest(19, 19);
@@ -1064,4 +1119,421 @@ describe("FinalArea 多比例清单、帧时长与 final_compose_job_id 恢复",
     expect(keys[3]).not.toBe(keys[2]);
     expect(keys[3]).not.toBe(keys[0]);
   });
+
+  test("16:9 首次 GET /program 失败时不按无音频降级，重试后切换到 manifest?v=2；91001 过期与手动刷新也会重探节目单", async () => {
+    const seg = rawSegment(0, "seg-1", 10);
+    useDramaSegmentsStore.setState({
+      byEpisode: { [segmentKey("d-1", 1)]: [storeSegment(0, "seg-1", 10)] },
+    });
+
+    // 子场景 A：首次 GET /program 瞬态失败 -> 阻断盲目 V1 提交，点击重试后发现节目音频并切换 manifest?v=2
+    let programAttempt = 0;
+    const getA = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url.endsWith("/segments")) return { items: [seg] };
+      if (url.endsWith("/program")) {
+        programAttempt += 1;
+        if (programAttempt === 1) throw new ApiError("temporary program failure", 500, 500);
+        return {
+          episode_id: "ep-1",
+          segment_version: 2,
+          edit_schema: 1,
+          program: {
+            v: 1,
+            audio: [{ id: "bgm-1", role: "bgm", asset_id: 99, start_f: 0, end_f: 24 }],
+            overlays: [],
+          },
+        };
+      }
+      if (url.endsWith("/manifest?v=2")) {
+        return {
+          ...rawManifest(120, 120),
+          manifest_hash: "e".repeat(64),
+          manifest: {
+            ...rawManifest(120, 120).manifest,
+            episode_id: "ep-1",
+            program: {
+              v: 1,
+              audio: [{ id: "bgm-1", role: "bgm", asset_id: 99, start_f: 0, end_f: 24 }],
+              overlays: [],
+            },
+          },
+          program_diagnostics: [],
+        };
+      }
+      throw new Error(`unexpected GET ${url}`);
+    });
+    const postA = spyOn(service, "post").mockResolvedValueOnce(
+      backendComposeJob("j-v2", "clean", "https://cdn/v2.mp4", "2026-11-15T10:05:00Z", "queued"),
+    );
+    spies.push(getA, postA);
+
+    const dramaA = makeDrama("16:9", {
+      id: "ep-1",
+      editSchema: 1,
+      segmentVersion: 2,
+      finalComposeJobId: null,
+    });
+    const { container: cA, unmount: uA } = await mountFinal(dramaA, []);
+    await dom.flush(20);
+
+    expect(cA.textContent).toContain("读取节目单状态失败");
+    expect(getA.mock.calls.map(([u]) => u)).not.toContain("/dramas/d-1/episodes/1/manifest");
+    const submitA = () =>
+      Array.from(cA.querySelectorAll("button")).find((b) => b.textContent?.includes("合成第 1 集"));
+    expect(submitA()?.disabled).toBe(true);
+
+    const retryProgramBtn = cA.querySelector<HTMLButtonElement>('[aria-label="重试读取节目单"]');
+    expect(retryProgramBtn).toBeTruthy();
+    await dom.click(retryProgramBtn!);
+    await dom.flush(20);
+
+    expect(getA.mock.calls.map(([u]) => u)).toContain("/dramas/d-1/episodes/1/manifest?v=2");
+    expect(submitA()?.disabled).toBe(false);
+    await dom.click(submitA()!);
+    await dom.flush(10);
+    expect(postA).toHaveBeenCalledTimes(1);
+    expect(postA.mock.calls[0]?.[1]).toMatchObject({
+      compose: { manifest_hash: "e".repeat(64), segment_version: 2 },
+    });
+    await uA();
+    getA.mockRestore();
+    postA.mockRestore();
+
+    // 子场景 B：初始程序为空（V1），远端保存节目音频后导出 91001 过期，自动及点击“刷新”重新探测 /program 并切换至 manifest?v=2
+    let remoteHasAudio = false;
+    let v2Fetches = 0;
+    const getB = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url.endsWith("/segments")) return { items: [seg] };
+      if (url.endsWith("/program")) {
+        return {
+          episode_id: "ep-1",
+          segment_version: 2,
+          edit_schema: 1,
+          program: {
+            v: 1,
+            audio: remoteHasAudio
+              ? [{ id: "bgm-2", role: "bgm", asset_id: 100, start_f: 0, end_f: 24 }]
+              : [],
+            overlays: [],
+          },
+        };
+      }
+      if (url.endsWith("/manifest")) return rawManifest(120, 120);
+      if (url.endsWith("/manifest?v=2")) {
+        v2Fetches += 1;
+        return {
+          ...rawManifest(120, 120),
+          manifest_hash: v2Fetches === 1 ? "f".repeat(64) : "0".repeat(64),
+          manifest: {
+            ...rawManifest(120, 120).manifest,
+            episode_id: "ep-1",
+            program: {
+              v: 1,
+              audio: [{ id: "bgm-2", role: "bgm", asset_id: 100, start_f: 0, end_f: 24 }],
+              overlays: [],
+            },
+          },
+          program_diagnostics: [],
+        };
+      }
+      throw new Error(`unexpected GET ${url}`);
+    });
+    const postB = spyOn(service, "post")
+      .mockRejectedValueOnce(new ApiError("stale", DRAMA_ERR.manifestStale, 409))
+      .mockResolvedValueOnce(
+        backendComposeJob(
+          "j-v2-b",
+          "clean",
+          "https://cdn/v2b.mp4",
+          "2026-11-15T10:06:00Z",
+          "queued",
+        ),
+      );
+    spies.push(getB, postB);
+
+    const dramaB = makeDrama("16:9", {
+      id: "ep-1",
+      editSchema: 1,
+      segmentVersion: 2,
+      finalComposeJobId: null,
+    });
+    const { container: cB, unmount: uB } = await mountFinal(dramaB, []);
+    await dom.flush(20);
+
+    remoteHasAudio = true;
+    const submitB = Array.from(cB.querySelectorAll("button")).find((b) =>
+      b.textContent?.includes("合成第 1 集"),
+    )!;
+    await dom.click(submitB);
+    await dom.flush(20);
+
+    expect(v2Fetches).toBe(1);
+    const refreshBtn = Array.from(cB.querySelectorAll("button")).find(
+      (b) => b.textContent?.trim() === "刷新",
+    );
+    expect(refreshBtn).toBeTruthy();
+    await dom.click(refreshBtn!);
+    await dom.flush(20);
+    expect(v2Fetches).toBe(2);
+
+    await dom.click(submitB);
+    await dom.flush(10);
+    expect(postB).toHaveBeenCalledTimes(2);
+    expect(postB.mock.calls[1]?.[1]).toMatchObject({
+      compose: { manifest_hash: "0".repeat(64), segment_version: 2 },
+    });
+    await uB();
+  });
+
+  test("切换分集后上一集迟到的 91001 过期回调不得取消当前分集的节目单读取与合成", async () => {
+    const seg1 = storeSegment(0, "seg-1", 10);
+    const seg2 = { ...storeSegment(0, "seg-2", 10), episodeNo: 2 };
+    useDramaSegmentsStore.setState({
+      byEpisode: {
+        [segmentKey("d-1", 1)]: [seg1],
+        [segmentKey("d-1", 2)]: [seg2],
+      },
+    });
+
+    const ep2Program = Promise.withResolvers<object>();
+    const ep1Compose = Promise.withResolvers<object>();
+    const get = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url.endsWith("/episodes/1/segments")) return { items: [rawSegment(0, "seg-1", 10)] };
+      if (url.endsWith("/episodes/2/segments"))
+        return { items: [{ ...rawSegment(0, "seg-2", 10), episode_no: 2 }] };
+      if (url.endsWith("/episodes/1/program")) {
+        return {
+          episode_id: "ep-1",
+          segment_version: 2,
+          edit_schema: 1,
+          program: { v: 1, audio: [], overlays: [] },
+        };
+      }
+      if (url.endsWith("/episodes/2/program")) return ep2Program.promise;
+      if (url.endsWith("/episodes/1/manifest")) return rawManifest(120, 120);
+      if (url.endsWith("/episodes/2/manifest")) return rawManifest(120, 120);
+      throw new Error(`unexpected GET ${url}`);
+    });
+    const post = spyOn(service, "post").mockImplementation(async (_url, body) => {
+      const episodes = (body as { episodes: number[] }).episodes;
+      if (episodes[0] === 1) return ep1Compose.promise;
+      return backendComposeJob(
+        "j-ep2",
+        "clean",
+        "https://cdn/ep2.mp4",
+        "2026-11-15T10:07:00Z",
+        "queued",
+      );
+    });
+    spies.push(get, post);
+
+    const drama: DramaDetail = {
+      ...makeDrama("16:9", {
+        id: "ep-1",
+        no: 1,
+        editSchema: 1,
+        segmentVersion: 2,
+        finalComposeJobId: null,
+      }),
+      episodes: [
+        makeEpisode({
+          id: "ep-1",
+          no: 1,
+          title: "第一集",
+          editSchema: 1,
+          segmentVersion: 2,
+          finalComposeJobId: null,
+        }),
+        makeEpisode({
+          id: "ep-2",
+          no: 2,
+          title: "第二集",
+          editSchema: 1,
+          segmentVersion: 2,
+          finalComposeJobId: null,
+        }),
+      ],
+    };
+
+    function SwitchHarness() {
+      const [epIndex, setEpIndex] = useState(0);
+      const workspace = { drama, jobs: [] } as unknown as DramaWorkspace;
+      return createElement(
+        DramaWorkspaceContext.Provider,
+        { value: workspace },
+        createElement(
+          "div",
+          null,
+          createElement("button", { type: "button", onClick: () => setEpIndex(1) }, "切到第2集"),
+          createElement(FinalArea, { ep: epIndex + 1, onGo: () => {} }),
+        ),
+      );
+    }
+
+    const { container, unmount } = await dom.mount(createElement(SwitchHarness));
+    try {
+      await dom.flush(20);
+      const submit1 = Array.from(container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("合成第 1 集"),
+      )!;
+      expect(submit1.disabled).toBe(false);
+      await dom.click(submit1);
+      await dom.flush(10);
+
+      const switchBtn = Array.from(container.querySelectorAll("button")).find(
+        (b) => b.textContent?.trim() === "切到第2集",
+      )!;
+      await dom.click(switchBtn);
+      await dom.flush(10);
+
+      // 分集 1 迟到的 91001 响应在分集 2 GET /program 仍挂起时到达
+      await dom.act(async () => {
+        ep1Compose.reject(new ApiError("stale", DRAMA_ERR.manifestStale, 409));
+      });
+      await dom.flush(15);
+
+      // 分集 2 GET /program 正常返回，不应被分集 1 的 91001 取消而永久 pending
+      await dom.act(async () => {
+        ep2Program.resolve({
+          episode_id: "ep-2",
+          segment_version: 2,
+          edit_schema: 1,
+          program: { v: 1, audio: [], overlays: [] },
+        });
+      });
+      await dom.flush(20);
+
+      expect(container.textContent).toContain("合成第 2 集");
+      const submit2 = Array.from(container.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("合成第 2 集"),
+      )!;
+      expect(submit2).toBeTruthy();
+      expect(submit2.disabled).toBe(false);
+      await dom.click(submit2);
+      await dom.flush(15);
+      expect(post).toHaveBeenCalledTimes(2);
+      expect(post.mock.calls[1]?.[1]).toMatchObject({ episodes: [2] });
+    } finally {
+      await unmount();
+    }
+  });
+
+  test("本地 schema=0 分集已被服务端替换为新 episode_id 时，阻断导出、提示并触发工作台刷新后再允许提交", async () => {
+    const seg1 = storeSegment(0, "seg-1", 10);
+    useDramaSegmentsStore.setState({
+      byEpisode: { [segmentKey("d-1", 1)]: [seg1] },
+    });
+
+    let serverEpId = "ep-new";
+    let refreshCalls = 0;
+    let allowRefreshUpdate = false;
+    const handleRefresh = () => {
+      refreshCalls += 1;
+      return allowRefreshUpdate ? serverEpId : null;
+    };
+
+    const get = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url.endsWith("/episodes/1/segments")) return { items: [rawSegment(0, "seg-1", 10)] };
+      if (url.endsWith("/episodes/1/program")) {
+        return {
+          episode_id: serverEpId,
+          segment_version: 2,
+          edit_schema: 0,
+          program: { v: 1, audio: [], overlays: [] },
+        };
+      }
+      throw new Error(`unexpected GET ${url}`);
+    });
+    const post = spyOn(service, "post").mockResolvedValue(
+      backendComposeJob("j-ok", "clean", "https://cdn/ok.mp4", "2026-11-15T10:08:00Z", "queued"),
+    );
+    spies.push(get, post);
+
+    function StaleEpisodeHarness({ onRefresh }: { onRefresh: () => string | null }) {
+      const [drama, setDrama] = useState<DramaDetail>(() =>
+        makeDrama("9:16", {
+          id: "ep-old",
+          no: 1,
+          title: "旧版第1集",
+          editSchema: 0,
+          segmentVersion: 1,
+          finalComposeJobId: null,
+        }),
+      );
+      const workspace = {
+        drama,
+        jobs: [],
+        refresh: async () => {
+          const nextId = onRefresh();
+          if (nextId) {
+            setDrama(
+              makeDrama("9:16", {
+                id: nextId,
+                no: 1,
+                title: "替换后第1集",
+                editSchema: 0,
+                segmentVersion: 2,
+                finalComposeJobId: null,
+              }),
+            );
+          }
+        },
+      } as unknown as DramaWorkspace;
+      return createElement(
+        DramaWorkspaceContext.Provider,
+        { value: workspace },
+        createElement(FinalArea, { ep: 1, onGo: () => {} }),
+      );
+    }
+
+    // 子场景 A：如果自动 refresh 暂未替换本地旧 episode（如 refresh 返回暂未变更），按钮必须保持禁用且零提交
+    const { container, unmount } = await dom.mount(
+      createElement(StaleEpisodeHarness, { onRefresh: handleRefresh }),
+    );
+    try {
+      await dom.flush(20);
+      expect(refreshCalls).toBe(1);
+      expect(container.textContent).toContain("当前分集内容已更新或被替换，请刷新工作台后重试");
+      const submitBtn = () =>
+        Array.from(container.querySelectorAll("button")).find((b) =>
+          b.textContent?.includes("合成第 1 集"),
+        )!;
+      expect(submitBtn().disabled).toBe(true);
+      await dom.click(submitBtn());
+      await dom.flush(10);
+      expect(post).not.toHaveBeenCalled();
+
+      // 手动点击「刷新工作台」且工作台拿到新 episode_id 后恢复可用
+      allowRefreshUpdate = true;
+      const refreshBtn = container.querySelector<HTMLButtonElement>('[aria-label="刷新工作台"]');
+      expect(refreshBtn).toBeTruthy();
+      await dom.click(refreshBtn!);
+      await dom.flush(20);
+      expect(container.textContent).toContain("替换后第1集");
+      expect(submitBtn().disabled).toBe(false);
+    } finally {
+      await unmount();
+    }
+
+    // 子场景 B：挂载时一致，但在点击导出前服务端替换 episode_id，legacy compose 提交前复核拦截且不发 POST /jobs
+    serverEpId = "ep-old";
+    const { container: cB, unmount: uB } = await dom.mount(
+      createElement(StaleEpisodeHarness, { onRefresh: handleRefresh }),
+    );
+    try {
+      await dom.flush(20);
+      expect(containerText(cB)).toContain("旧版第1集");
+      serverEpId = "ep-replaced-before-click";
+      const submitB = Array.from(cB.querySelectorAll("button")).find((b) =>
+        b.textContent?.includes("合成第 1 集"),
+      )!;
+      await dom.click(submitB);
+      await dom.flush(20);
+      expect(post).not.toHaveBeenCalled();
+    } finally {
+      await uB();
+    }
+  });
 });
+
+const containerText = (el: HTMLElement) => el.textContent ?? "";

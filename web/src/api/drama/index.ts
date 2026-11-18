@@ -1,4 +1,5 @@
 import { mapAsset } from "@/api/asset";
+import { originalStageCAssetIds, stageCAssetIdReviver } from "@/utils/drama/asset-id";
 import service from "@/utils/requests/service";
 
 import type {
@@ -8,6 +9,9 @@ import type {
   BackendComposeExport,
   BackendDramaManifestClip,
   BackendDramaManifestView,
+  BackendDramaManifestV2Clip,
+  BackendDramaManifestV2Response,
+  BackendEpisodeProgramView,
   BackendDramaStyles,
   BackendDramaSummary,
   BackendDramaView,
@@ -40,6 +44,11 @@ import type {
   DramaEpisodeManifest,
   DramaManifestClip,
   DramaManifestView,
+  DramaManifestV2Clip,
+  DramaManifestV2Response,
+  EpisodeProgramView,
+  PutEpisodeProgramReq,
+  ProgramAudioCue,
   DramaPage,
   DramaSkill,
   DramaStyles,
@@ -118,6 +127,10 @@ export const mapEpisode = (raw: BackendEpisodeView): Episode => ({
 });
 
 const mapComposeExport = (raw: BackendComposeExport): DramaComposeExport => ({
+  ...(raw.audio_sha256 !== undefined ? { audioSha256: raw.audio_sha256 } : {}),
+  ...(raw.lufs !== undefined ? { lufs: raw.lufs } : {}),
+  ...(raw.true_peak !== undefined ? { truePeak: raw.true_peak } : {}),
+  ...(raw.loudness_status !== undefined ? { loudnessStatus: raw.loudness_status } : {}),
   sha256: raw.sha256,
   variant: raw.variant,
   size: raw.size,
@@ -233,6 +246,14 @@ export const segmentEditOf = (segment?: Pick<Segment, "edit"> | null): SegmentEd
   ...(segment?.edit ?? {}),
 });
 
+/**
+ * 读取节目单条目的写回 ID。
+ * @param cue 后端音频条目视图
+ * @returns 安全数字或原始十进制串
+ */
+export const programCueAssetId = (cue: ProgramAudioCue): number | string =>
+  originalStageCAssetIds.get(cue)?.asset_id ?? cue.asset_id;
+
 /** 片段（契约 §9.2）：takes 可能为 null，task_id 兼容数字 */
 export const mapSegment = (raw: BackendSegmentView): Segment => ({
   id: String(raw.id),
@@ -259,6 +280,12 @@ export const mapSegment = (raw: BackendSegmentView): Segment => ({
   sourceFrameCount: typeof raw.source_frame_count === "number" ? raw.source_frame_count : null,
   ...(typeof raw.has_audio === "boolean" ? { hasAudio: raw.has_audio } : {}),
   edit: mapSegmentEdit(raw.edit),
+  ...(raw.visual_kind !== undefined ? { visualKind: raw.visual_kind } : {}),
+  ...(raw.still_asset_id !== undefined ? { stillAssetId: raw.still_asset_id } : {}),
+  ...(originalStageCAssetIds.get(raw)?.still_asset_id
+    ? { stillAssetIdText: originalStageCAssetIds.get(raw)!.still_asset_id }
+    : {}),
+  ...(raw.fx ? { fx: raw.fx } : {}),
   status: raw.status,
   revision: raw.revision,
   ...(typeof raw.segment_version === "number" ? { segmentVersion: raw.segment_version } : {}),
@@ -372,6 +399,11 @@ export const toJobBody = (input: DramaJobInput) =>
     compose: input.step === "compose" ? toComposeBody(input.compose) : undefined,
     compose_request_key:
       input.step === "compose" ? input.composeRequestKey || undefined : undefined,
+    expected_episode_id:
+      input.step === "storyboard" || input.step === "compose" ? input.expectedEpisodeId : undefined,
+    confirm_clear: input.step === "storyboard" ? input.confirmClear : undefined,
+    expected_segment_version:
+      input.step === "storyboard" ? input.expectedSegmentVersion : undefined,
   });
 
 const toSegmentEditPatchBody = (edit?: SegmentEditPatch) => {
@@ -387,6 +419,17 @@ const toSegmentEditPatchBody = (edit?: SegmentEditPatch) => {
   });
   return Object.keys(body).length > 0 ? body : undefined;
 };
+
+/**
+ * 保留大素材 ID 的精确十进制串；只有安全整数可以转换成数字。
+ * @param id 写入的素材 ID
+ * @returns 适用于节目单和视觉 PATCH 的素材 ID
+ */
+export function formatDramaAssetId(id: number | string): number | string {
+  return typeof id === "string" && /^\d+$/.test(id) && Number.isSafeInteger(Number(id))
+    ? Number(id)
+    : id;
+}
 
 /** PATCH /drama-segments/:sid 请求体 */
 export const toSegmentUpdateBody = (input: UpdateSegmentInput) =>
@@ -405,6 +448,12 @@ export const toSegmentUpdateBody = (input: UpdateSegmentInput) =>
           : input.expectedTaskId,
     reset_edit_on_task_change: input.resetEditOnTaskChange,
     edit: toSegmentEditPatchBody(input.edit),
+    visual_kind: input.visualKind,
+    still_asset_id:
+      input.stillAssetId === undefined || input.stillAssetId === null
+        ? input.stillAssetId
+        : formatDramaAssetId(input.stillAssetId),
+    fx: input.fx,
     adaptation: input.adaptation,
   });
 
@@ -520,18 +569,27 @@ export const estimateSource = async (
  */
 export const createDrama = async (input: CreateDramaInput): Promise<Drama> =>
   mapDrama(
-    await service.post<BackendDramaView>("/dramas", toCreateDramaBody(input), { silent: true }),
+    await service.post<BackendDramaView>("/dramas", toCreateDramaBody(input), {
+      silent: true,
+      parseReviver: stageCAssetIdReviver,
+    }),
   );
 
 /** 短剧详情 */
 export const getDrama = async (id: string, silent = false): Promise<Drama> =>
-  mapDrama(await service.get<BackendDramaView>(`/dramas/${id}`, undefined, { silent }));
+  mapDrama(
+    await service.get<BackendDramaView>(`/dramas/${id}`, undefined, {
+      silent,
+      parseReviver: stageCAssetIdReviver,
+    }),
+  );
 
 /** 改短剧；revision 冲突（409）由调用方处理，不弹全局提示 */
 export const updateDrama = async (id: string, input: UpdateDramaInput): Promise<Drama> =>
   mapDrama(
     await service.patch<BackendDramaView>(`/dramas/${id}`, toUpdateDramaBody(input), {
       silent: true,
+      parseReviver: stageCAssetIdReviver,
     }),
   );
 
@@ -542,14 +600,22 @@ export const deleteDrama = async (id: string): Promise<void> => {
 
 /** 读单集（含剧本正文） */
 export const getEpisode = async (id: string, no: number): Promise<Episode> =>
-  mapEpisode(await service.get<BackendEpisodeView>(`/dramas/${id}/episodes/${no}`));
+  mapEpisode(
+    await service.get<BackendEpisodeView>(`/dramas/${id}/episodes/${no}`, undefined, {
+      parseReviver: stageCAssetIdReviver,
+    }),
+  );
 
 /** 在末尾追加一集 */
 export const addEpisode = async (
   id: string,
   body: { title?: string; synopsis?: string } = {},
 ): Promise<Episode> =>
-  mapEpisode(await service.post<BackendEpisodeView>(`/dramas/${id}/episodes`, body));
+  mapEpisode(
+    await service.post<BackendEpisodeView>(`/dramas/${id}/episodes`, body, {
+      parseReviver: stageCAssetIdReviver,
+    }),
+  );
 
 /** 删一集：后面的集号往前补位，资产的出现集数由后端一起改；有任务在跑 67004，由调用方提示 */
 export const deleteEpisode = async (id: string, no: number): Promise<void> => {
@@ -566,7 +632,7 @@ export const updateEpisode = async (
     await service.patch<BackendEpisodeView>(
       `/dramas/${id}/episodes/${no}`,
       toUpdateEpisodeBody(input),
-      { silent: true },
+      { silent: true, parseReviver: stageCAssetIdReviver },
     ),
   );
 
@@ -592,7 +658,10 @@ export const estimateJob = async (id: string, input: DramaJobInput): Promise<num
 /** 提交任务（202）；业务错误由调用方展示 */
 export const submitJob = async (id: string, input: DramaJobInput): Promise<DramaJob> =>
   mapJob(
-    await service.post<BackendJobView>(`/dramas/${id}/jobs`, toJobBody(input), { silent: true }),
+    await service.post<BackendJobView>(`/dramas/${id}/jobs`, toJobBody(input), {
+      silent: true,
+      parseReviver: stageCAssetIdReviver,
+    }),
   );
 
 /** 全量合成 / 生产任务列表，用于按 final_compose_job_id 精确还原成片资产 */
@@ -600,7 +669,7 @@ export const listJobs = async (id: string): Promise<DramaJob[]> => {
   const res = await service.get<{ items: BackendJobView[] | null }>(
     `/dramas/${id}/jobs`,
     undefined,
-    { silent: true },
+    { silent: true, parseReviver: stageCAssetIdReviver },
   );
   return (res?.items ?? []).map(mapJob);
 };
@@ -610,24 +679,54 @@ export const listActiveJobs = async (id: string): Promise<DramaJob[]> => {
   const res = await service.get<{ items: BackendJobView[] | null }>(
     `/dramas/${id}/jobs`,
     { status: "active" },
-    { silent: true },
+    { silent: true, parseReviver: stageCAssetIdReviver },
   );
   return (res.items ?? []).map(mapJob);
 };
 
 /** 取消任务 */
 export const cancelJob = async (id: string, jobId: string): Promise<DramaJob> =>
-  mapJob(await service.post<BackendJobView>(`/dramas/${id}/jobs/${jobId}/cancel`));
+  mapJob(
+    await service.post<BackendJobView>(`/dramas/${id}/jobs/${jobId}/cancel`, undefined, {
+      parseReviver: stageCAssetIdReviver,
+    }),
+  );
+
+const segmentRequestOptions = {
+  silent: true,
+  parseReviver: stageCAssetIdReviver,
+} as const;
+
+export interface EpisodeSegmentsSnapshot {
+  episodeId?: string;
+  segmentVersion?: number;
+  items: Segment[];
+}
+
+/** 一集的片段（含所属集身份及内容版本），按 seq 排序 */
+export const listEpisodeSegments = async (
+  id: string,
+  no: number,
+  silent = true,
+): Promise<EpisodeSegmentsSnapshot> => {
+  const res = await service.get<{
+    episode_id?: string | null;
+    segment_version?: number;
+    items: BackendSegmentView[] | null;
+  }>(`/dramas/${id}/episodes/${no}/segments`, undefined, {
+    silent,
+    parseReviver: stageCAssetIdReviver,
+  });
+  return {
+    ...(res.episode_id ? { episodeId: String(res.episode_id) } : {}),
+    ...(typeof res.segment_version === "number" ? { segmentVersion: res.segment_version } : {}),
+    items: (res.items ?? []).map(mapSegment),
+  };
+};
 
 /** 一集的片段，按 seq 排序 */
-export const listSegments = async (id: string, no: number, silent = true): Promise<Segment[]> => {
-  const res = await service.get<{ items: BackendSegmentView[] | null }>(
-    `/dramas/${id}/episodes/${no}/segments`,
-    undefined,
-    { silent },
-  );
-  return (res.items ?? []).map(mapSegment);
-};
+export const listSegments = async (id: string, no: number, silent = true): Promise<Segment[]> =>
+  (await listEpisodeSegments(id, no, silent)).items;
 
 /** 新增片段（不传 afterSeq 追加到末尾） */
 export const addSegment = async (
@@ -636,11 +735,15 @@ export const addSegment = async (
   body: AddSegmentInput = {},
 ): Promise<Segment> =>
   mapSegment(
-    await service.post<BackendSegmentView>(`/dramas/${id}/episodes/${no}/segments`, {
-      prompt: body.prompt,
-      seconds: body.seconds,
-      after_seq: body.afterSeq,
-    }),
+    await service.post<BackendSegmentView>(
+      `/dramas/${id}/episodes/${no}/segments`,
+      {
+        prompt: body.prompt,
+        seconds: body.seconds,
+        after_seq: body.afterSeq,
+      },
+      { parseReviver: stageCAssetIdReviver },
+    ),
   );
 
 /**
@@ -650,7 +753,10 @@ export const addSegment = async (
  */
 export const getSegment = async (sid: string): Promise<Segment> =>
   mapSegment(
-    await service.get<BackendSegmentView>(`/drama-segments/${sid}`, undefined, { silent: true }),
+    await service.get<BackendSegmentView>(`/drama-segments/${sid}`, undefined, {
+      silent: true,
+      parseReviver: stageCAssetIdReviver,
+    }),
   );
 
 /** 首帧流程 snake→camel；可选归属字段不虚构 ID。 */
@@ -838,7 +944,7 @@ export const importSegmentTakes = async (
         adopt: input.adopt,
         reset_edit_on_task_change: input.resetEditOnTaskChange,
       }),
-      { silent: true },
+      segmentRequestOptions,
     ),
   );
 
@@ -865,16 +971,18 @@ export const patchTakeQC = async (
         clear_chosen: input.clearChosen,
         reset_edit_on_task_change: input.resetEditOnTaskChange,
       }),
-      { silent: true },
+      segmentRequestOptions,
     ),
   );
 
 /** 改片段；revision 冲突（409）、67011 由调用方处理，不弹全局提示 */
 export const updateSegment = async (sid: string, input: UpdateSegmentInput): Promise<Segment> =>
   mapSegment(
-    await service.patch<BackendSegmentView>(`/drama-segments/${sid}`, toSegmentUpdateBody(input), {
-      silent: true,
-    }),
+    await service.patch<BackendSegmentView>(
+      `/drama-segments/${sid}`,
+      toSegmentUpdateBody(input),
+      segmentRequestOptions,
+    ),
   );
 
 /**
@@ -883,9 +991,11 @@ export const updateSegment = async (sid: string, input: UpdateSegmentInput): Pro
  */
 export const adaptSegment = async (sid: string, input: AdaptSegmentInput): Promise<Segment> =>
   mapSegment(
-    await service.post<BackendSegmentView>(`/drama-segments/${sid}/adapt`, input, {
-      silent: true,
-    }),
+    await service.post<BackendSegmentView>(
+      `/drama-segments/${sid}/adapt`,
+      input,
+      segmentRequestOptions,
+    ),
   );
 
 /** 删除片段（不删生成任务和素材） */
@@ -902,7 +1012,7 @@ export const reorderSegments = async (
   const res = await service.put<{ items: BackendSegmentView[] | null }>(
     `/dramas/${id}/episodes/${no}/segments/order`,
     { ids },
-    { silent: true },
+    segmentRequestOptions,
   );
   return (res.items ?? []).map(mapSegment);
 };
@@ -955,7 +1065,7 @@ export const generateSegment = (
 const mapManifestClip = (raw: BackendDramaManifestClip): DramaManifestClip => ({
   segmentId: String(raw.segment_id),
   taskId: String(raw.task_id),
-  assetId: String(raw.asset_id),
+  assetId: originalStageCAssetIds.get(raw)?.asset_id ?? String(raw.asset_id),
   sha256: raw.sha256 ?? "",
   seq: raw.seq,
   sourceInF: raw.source_in_f,
@@ -1007,6 +1117,136 @@ export const getEpisodeManifest = async (
       undefined,
       {
         silent: true,
+        parseReviver: stageCAssetIdReviver,
+        ...(options?.signal ? { signal: options.signal } : {}),
+      },
+    ),
+  );
+
+const mapEpisodeProgram = (raw: BackendEpisodeProgramView): EpisodeProgramView => ({
+  episodeId: raw.episode_id,
+  segmentVersion: raw.segment_version,
+  editSchema: raw.edit_schema,
+  program: raw.program,
+});
+
+/**
+ * 读取可编辑节目单及保存基线。
+ * @param dramaId 项目 ID
+ * @param episodeNo 集号
+ * @param options 后台探测时可静默并取消
+ * @returns 节目单、集身份与片段版本
+ */
+export const getEpisodeProgram = async (
+  dramaId: string,
+  episodeNo: number,
+  options?: { signal?: AbortSignal; silent?: boolean },
+): Promise<EpisodeProgramView> =>
+  mapEpisodeProgram(
+    await service.get<BackendEpisodeProgramView>(
+      `/dramas/${dramaId}/episodes/${episodeNo}/program`,
+      undefined,
+      { ...options, parseReviver: stageCAssetIdReviver },
+    ),
+  );
+
+/**
+ * 按集身份及片段版本整体替换节目单。
+ * @param dramaId 项目 ID
+ * @param episodeNo 集号
+ * @param req 节目单、版本及可选的明确重绑条目
+ * @returns 已保存节目单与新基线
+ */
+export const putEpisodeProgram = async (
+  dramaId: string,
+  episodeNo: number,
+  req: PutEpisodeProgramReq,
+): Promise<EpisodeProgramView> =>
+  mapEpisodeProgram(
+    await service.put<BackendEpisodeProgramView>(
+      `/dramas/${dramaId}/episodes/${episodeNo}/program`,
+      {
+        ...req,
+        program: {
+          ...req.program,
+          ...(req.program.audio
+            ? {
+                audio: req.program.audio.map((cue) => ({
+                  ...cue,
+                  asset_id: formatDramaAssetId(cue.asset_id),
+                })),
+              }
+            : {}),
+        },
+      },
+      { parseReviver: stageCAssetIdReviver },
+    ),
+  );
+
+const mapManifestV2Clip = (raw: BackendDramaManifestV2Clip): DramaManifestV2Clip => {
+  const preserved = originalStageCAssetIds.get(raw);
+  return {
+    ...mapManifestClip({
+      ...raw,
+      task_id: raw.task_id ?? "",
+      asset_id: raw.asset_id ?? "",
+      sha256: raw.sha256 ?? "",
+    }),
+    taskId: raw.task_id ?? null,
+    assetId: raw.asset_id ?? null,
+    ...(preserved?.asset_id ? { assetIdText: preserved.asset_id } : {}),
+    stillAssetId: raw.still_asset_id ?? null,
+    ...(preserved?.still_asset_id ? { stillAssetIdText: preserved.still_asset_id } : {}),
+    visualKind: raw.visual_kind,
+    fx: raw.fx ?? null,
+  };
+};
+
+const mapEpisodeManifestV2 = (raw: BackendDramaManifestV2Response): DramaManifestV2Response => {
+  const manifest = raw.manifest;
+  return {
+    status: raw.program_diagnostics?.length ? "ready" : (raw.status ?? "ready"),
+    manifestHash: raw.manifest_hash ?? "",
+    segmentVersion: raw.segment_version,
+    skippedSeqs: raw.skipped_seqs ?? [],
+    diagnostics: raw.diagnostics ?? [],
+    programDiagnostics: raw.program_diagnostics ?? [],
+    manifest: manifest
+      ? {
+          v: manifest.v,
+          renderVersion: manifest.render_version,
+          episodeId: manifest.episode_id,
+          segmentVersion: manifest.segment_version,
+          fps: manifest.fps,
+          sampleRate: manifest.sample_rate,
+          totalFrames: manifest.total_frames,
+          skippedSeqs: manifest.skipped_seqs ?? [],
+          clips: (manifest.clips ?? []).map(mapManifestV2Clip),
+          program: manifest.program,
+        }
+      : null,
+  };
+};
+
+/**
+ * 读取保留节目单与视觉模式的 V2 清单。
+ * @param dramaId 项目 ID
+ * @param episodeNo 集号
+ * @param options 可取消的请求选项
+ * @returns 就绪清单和诊断，或可继续轮询的预热状态
+ */
+export const getEpisodeManifestV2 = async (
+  dramaId: string,
+  episodeNo: number,
+  options?: { signal?: AbortSignal },
+): Promise<DramaManifestV2Response> =>
+  mapEpisodeManifestV2(
+    await service.get<BackendDramaManifestV2Response>(
+      `/dramas/${dramaId}/episodes/${episodeNo}/manifest?v=2`,
+      undefined,
+      {
+        silent: true,
+        parseReviver: stageCAssetIdReviver,
         ...(options?.signal ? { signal: options.signal } : {}),
       },
     ),
@@ -1017,6 +1257,9 @@ export const mapEpisodePreview = (raw: BackendEpisodePreviewView): EpisodePrevie
   status: raw.status,
   streamUrl: raw.stream_url ? raw.stream_url : null,
   expiresAt: raw.expires_at,
+  errorCode: raw.error_code,
+  errorMessage: raw.error_message,
+  programDiagnostics: raw.program_diagnostics,
 });
 
 /** 请求 CPU 预览票据（返回并种植 HttpOnly Cookie vc_preview_sess，须带 withCredentials） */

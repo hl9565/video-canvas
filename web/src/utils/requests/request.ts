@@ -1,6 +1,7 @@
 import axios from "axios";
 import { toast } from "sonner";
 import type { AxiosInstance, AxiosResponse, InternalAxiosRequestConfig } from "axios";
+import { parseStageCJson, stageCAssetIdReviver } from "../drama/asset-id";
 import { clearSession } from "../storage/session";
 import { getToken } from "../storage/token";
 import { getErrorAction } from "./error-actions";
@@ -91,12 +92,34 @@ const handleAccountDisabled = (url?: string) => {
   }
 };
 
+const baseTransforms = Array.isArray(axios.defaults.transformResponse)
+  ? axios.defaults.transformResponse
+  : axios.defaults.transformResponse
+    ? [axios.defaults.transformResponse]
+    : [];
+
 const instance: AxiosInstance = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL,
   timeout: 2 * 60 * 1000,
   headers: {
     "Content-Type": "application/json",
   },
+  transformResponse: [
+    function (data: unknown) {
+      if (
+        typeof data === "string" &&
+        (this as { parseReviver?: unknown })?.parseReviver === stageCAssetIdReviver
+      ) {
+        try {
+          return parseStageCJson(data);
+        } catch {
+          return data;
+        }
+      }
+      return data;
+    },
+    ...baseTransforms,
+  ],
 });
 
 /** 请求发出时间：只给要记日志的请求打点 */

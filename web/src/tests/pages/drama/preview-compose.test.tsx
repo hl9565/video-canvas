@@ -13,6 +13,7 @@ import {
 import type { Drama, Segment, UpdateSegmentInput } from "@/api/drama/type";
 import { ClipBar } from "@/pages/drama/studio/clip-bar";
 import { Preview } from "@/pages/drama/studio/preview";
+import { useProgram } from "@/pages/drama/studio/program/use-program";
 import { TakeCarousel } from "@/pages/drama/studio/take-carousel";
 import { PlaybackContext, usePlayback } from "@/pages/drama/studio/use-playback";
 import { StudioContext, type Studio } from "@/pages/drama/studio/use-studio";
@@ -22,6 +23,7 @@ import { useDramaJobsStore } from "@/store/drama";
 import { useDramaSegmentsStore } from "@/store/drama-segments";
 import { installDom, type DomEnv } from "@/tests/helpers/dom";
 import { trimEngine } from "@/utils/canvas/trim-engine";
+import { DRAMA_ERR } from "@/api/drama/errors";
 import { ApiError } from "@/utils/requests/request";
 import service from "@/utils/requests/service";
 
@@ -189,10 +191,14 @@ function StudioPreviewHarness({
   initialDrama,
   initialSegments,
   onPatch,
+  enableProgram = false,
+  onRefresh,
 }: {
   initialDrama: Drama;
   initialSegments: Segment[];
   onPatch: (sid: string, fields: Omit<UpdateSegmentInput, "revision">) => Promise<Segment>;
+  enableProgram?: boolean;
+  onRefresh?: () => Promise<void>;
 }) {
   const [drama, setDrama] = useState(initialDrama);
   const [segments, setSegments] = useState(initialSegments);
@@ -203,6 +209,13 @@ function StudioPreviewHarness({
   } | null>(null);
   const playback = usePlayback(segments);
   const selected = segments.find((s) => s.id === selectedId) ?? segments[0] ?? null;
+  const program = useProgram({
+    dramaId: drama.id,
+    episodeId: drama.episodes[0]?.id,
+    episodeNo: 1,
+    enabled: enableProgram && drama.ratio === "16:9",
+    segmentVersion: drama.episodes[0]?.segmentVersion,
+  });
 
   const studio = {
     drama,
@@ -229,6 +242,10 @@ function StudioPreviewHarness({
     availableCredits: 500,
     save: "saved",
     reportSave: () => {},
+    refresh: () => {
+      void onRefresh?.();
+    },
+    ...(enableProgram ? { program } : {}),
     submitting: new Set<string>(),
     registerEditor: () => () => {},
     trimDrawer: {
@@ -421,6 +438,529 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
       win.ResizeObserver = prevWinRO;
     }
   });
+
+  test("远端新增第一条音频或遇 91001 重试时刷新节目单，Preview 从 v1 切到 manifest?v=2", async () => {
+    const s1 = makeSegment("s1", 0);
+    let serverVersion = 1;
+    const get = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url === "/dramas/d-prev/episodes/1/program") {
+        return {
+          episode_id: "ep-1",
+          segment_version: serverVersion,
+          edit_schema: 1,
+          program: {
+            v: 1,
+            overlays: [],
+            audio:
+              serverVersion === 1
+                ? []
+                : [{ id: "remote-bgm", role: "bgm", asset_id: 12, start_f: 0, end_f: 48 }],
+          },
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/manifest") {
+        return {
+          manifest: { v: 1, fps: 24, total_frames: 120, clips: [] },
+          manifest_hash: "v1-hash",
+          segment_version: 1,
+          skipped_seqs: [],
+          diagnostics: [],
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/manifest?v=2") {
+        return {
+          status: "ready",
+          manifest_hash: "v2-hash",
+          segment_version: 2,
+          skipped_seqs: [],
+          program_diagnostics: [],
+          diagnostics: [],
+          manifest: {
+            v: 2,
+            render_version: 2,
+            episode_id: "ep-1",
+            segment_version: 2,
+            fps: 24,
+            sample_rate: 48000,
+            total_frames: 120,
+            skipped_seqs: [],
+            clips: [
+              {
+                segment_id: "s1",
+                visual_kind: "video",
+                task_id: "t-s1-1",
+                asset_id: 10,
+                sha256: "a".repeat(64),
+                seq: 0,
+                source_in_f: 0,
+                source_out_f: 120,
+                master_in_f: 0,
+                master_out_f: 120,
+              },
+            ],
+            program: {
+              v: 1,
+              overlays: [],
+              audio: [{ id: "remote-bgm", role: "bgm", asset_id: 12, start_f: 0, end_f: 48 }],
+            },
+          },
+        } as never;
+      }
+      return {
+        ticket: "tk-v2",
+        status: "ready",
+        stream_url: "/api/v1/dramas/d-prev/episodes/1/preview/tk-v2/stream?token=ok",
+        expires_at: 1999999999,
+      } as never;
+    });
+    const post = spyOn(service, "post").mockImplementation(async (url: string, body?: unknown) => {
+      if (
+        url === "/dramas/d-prev/episodes/1/preview" &&
+        (body as { manifest_hash?: string } | undefined)?.manifest_hash === "v1-hash"
+      ) {
+        serverVersion = 2;
+        throw new ApiError("清单已变更", 91001, 409);
+      }
+      return {
+        ticket: "tk-v2",
+        status: "ready",
+        stream_url: "/api/v1/dramas/d-prev/episodes/1/preview/tk-v2/stream?token=ok",
+        expires_at: 1999999999,
+      } as never;
+    });
+    spies.push(get, post);
+
+    const baseDrama = makeDrama();
+    const mounted = await dom.mount(
+      <StudioPreviewHarness
+        enableProgram
+        initialDrama={{
+          ...baseDrama,
+          episodes: [{ ...baseDrama.episodes[0]!, id: "ep-1", segmentVersion: 1 }],
+        }}
+        initialSegments={[s1]}
+        onPatch={async () => s1}
+      />,
+    );
+    try {
+      await dom.flush(10);
+      const previewBtn = [...mounted.container.querySelectorAll("button")].find(
+        (b) => b.textContent?.trim() === "CPU 预览",
+      );
+      expect(previewBtn?.disabled).toBe(false);
+      await dom.click(previewBtn);
+      await dom.flush(30);
+      expect(get.mock.calls.map(([url]) => url)).toContain(
+        "/dramas/d-prev/episodes/1/manifest?v=2",
+      );
+      expect(
+        post.mock.calls.some(
+          ([, body]) => (body as { manifest_hash?: string }).manifest_hash === "v2-hash",
+        ),
+      ).toBe(true);
+    } finally {
+      await mounted.unmount();
+    }
+  });
+
+  test("远端切换黑场触发 91001 时刷新片段列表，Preview 自动从 v1 切到 manifest?v=2", async () => {
+    const s1 = makeSegment("s1", 0);
+    let serverVersion = 1;
+    let blackRemote = false;
+    const get = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url === "/dramas/d-prev/episodes/1/program") {
+        return {
+          episode_id: "ep-1",
+          segment_version: serverVersion,
+          edit_schema: 1,
+          program: { v: 1, overlays: [], audio: [] },
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/segments") {
+        return {
+          items: [
+            {
+              id: "s1",
+              episode_id: "ep-1",
+              episode_no: 1,
+              seq: 0,
+              seconds: 5,
+              prompt: "",
+              visual_kind: blackRemote ? "black" : "video",
+              takes: [],
+              status: "idle",
+              revision: blackRemote ? 2 : 1,
+              segment_version: serverVersion,
+              updated_at: "2026-11-15T00:00:00Z",
+              adaptations: {},
+            },
+          ],
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/manifest") {
+        return {
+          manifest: { v: 1, fps: 24, total_frames: 120, clips: [] },
+          manifest_hash: "v1-hash",
+          segment_version: 1,
+          skipped_seqs: [],
+          diagnostics: [],
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/manifest?v=2") {
+        return {
+          status: "ready",
+          manifest_hash: "v2-black-hash",
+          segment_version: 2,
+          skipped_seqs: [],
+          program_diagnostics: [],
+          diagnostics: [],
+          manifest: {
+            v: 2,
+            render_version: 2,
+            episode_id: "ep-1",
+            segment_version: 2,
+            fps: 24,
+            sample_rate: 48000,
+            total_frames: 120,
+            skipped_seqs: [],
+            clips: [
+              {
+                segment_id: "s1",
+                visual_kind: "black",
+                seq: 0,
+                source_in_f: 0,
+                source_out_f: 120,
+                master_in_f: 0,
+                master_out_f: 120,
+              },
+            ],
+            program: { v: 1, overlays: [], audio: [] },
+          },
+        } as never;
+      }
+      return {
+        ticket: "tk-black",
+        status: "ready",
+        stream_url: "/api/v1/dramas/d-prev/episodes/1/preview/tk-black/stream?token=ok",
+        expires_at: 1999999999,
+      } as never;
+    });
+    const post = spyOn(service, "post").mockImplementation(async (url: string, body?: unknown) => {
+      if (
+        url === "/dramas/d-prev/episodes/1/preview" &&
+        (body as { manifest_hash?: string } | undefined)?.manifest_hash === "v1-hash"
+      ) {
+        serverVersion = 2;
+        blackRemote = true;
+        throw new ApiError("清单已变更", 91001, 409);
+      }
+      return {
+        ticket: "tk-black",
+        status: "ready",
+        stream_url: "/api/v1/dramas/d-prev/episodes/1/preview/tk-black/stream?token=ok",
+        expires_at: 1999999999,
+      } as never;
+    });
+    spies.push(get, post);
+
+    const baseDrama = makeDrama();
+    const mounted = await dom.mount(
+      <StudioPreviewHarness
+        enableProgram
+        initialDrama={{
+          ...baseDrama,
+          episodes: [{ ...baseDrama.episodes[0]!, id: "ep-1", segmentVersion: 1 }],
+        }}
+        initialSegments={[s1]}
+        onPatch={async () => s1}
+      />,
+    );
+    try {
+      await dom.flush(10);
+      const previewBtn = [...mounted.container.querySelectorAll("button")].find(
+        (b) => b.textContent?.trim() === "CPU 预览",
+      );
+      await dom.click(previewBtn);
+      await dom.flush(30);
+      expect(get.mock.calls.map(([url]) => url)).toContain(
+        "/dramas/d-prev/episodes/1/manifest?v=2",
+      );
+      expect(
+        post.mock.calls.some(
+          ([, body]) => (body as { manifest_hash?: string }).manifest_hash === "v2-black-hash",
+        ),
+      ).toBe(true);
+    } finally {
+      useDramaSegmentsStore.setState({ byEpisode: {}, watching: {} });
+      await mounted.unmount();
+    }
+  });
+
+  test("最后一个视频切片已被远端改为黑场导致 V1 返回 67010 时，自动刷新并切到 manifest?v=2", async () => {
+    const s1 = makeSegment("s1", 0);
+    let remoteBlack = false;
+    const get = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url === "/dramas/d-prev/episodes/1/program") {
+        return {
+          episode_id: "ep-1",
+          segment_version: remoteBlack ? 2 : 1,
+          edit_schema: 1,
+          program: { v: 1, overlays: [], audio: [] },
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/manifest") {
+        remoteBlack = true;
+        throw new ApiError("这一集还没有可合成的片段", 67010, 400);
+      }
+      if (url === "/dramas/d-prev/episodes/1/segments") {
+        return {
+          episode_id: "ep-1",
+          segment_version: 2,
+          items: [
+            {
+              id: "s1",
+              episode_id: "ep-1",
+              episode_no: 1,
+              seq: 0,
+              seconds: 5,
+              prompt: "",
+              visual_kind: "black",
+              takes: [],
+              status: "idle",
+              revision: 2,
+              segment_version: 2,
+              updated_at: "2026-11-15T00:00:00Z",
+              adaptations: {},
+            },
+          ],
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/manifest?v=2") {
+        return {
+          status: "ready",
+          manifest_hash: "v2-67010-hash",
+          segment_version: 2,
+          skipped_seqs: [],
+          program_diagnostics: [],
+          diagnostics: [],
+          manifest: {
+            v: 2,
+            render_version: 2,
+            episode_id: "ep-1",
+            segment_version: 2,
+            fps: 24,
+            sample_rate: 48000,
+            total_frames: 120,
+            skipped_seqs: [],
+            clips: [
+              {
+                segment_id: "s1",
+                visual_kind: "black",
+                seq: 0,
+                source_in_f: 0,
+                source_out_f: 120,
+                master_in_f: 0,
+                master_out_f: 120,
+              },
+            ],
+            program: { v: 1, overlays: [], audio: [] },
+          },
+        } as never;
+      }
+      return {
+        ticket: "tk-67010",
+        status: "ready",
+        stream_url: "/api/v1/dramas/d-prev/episodes/1/preview/tk-67010/stream?token=ok",
+        expires_at: 1999999999,
+      } as never;
+    });
+    const post = spyOn(service, "post").mockResolvedValue({
+      ticket: "tk-67010",
+      status: "ready",
+      stream_url: "/api/v1/dramas/d-prev/episodes/1/preview/tk-67010/stream?token=ok",
+      expires_at: 1999999999,
+    } as never);
+    spies.push(get, post);
+
+    const baseDrama = makeDrama();
+    const mounted = await dom.mount(
+      <StudioPreviewHarness
+        enableProgram
+        initialDrama={{
+          ...baseDrama,
+          episodes: [{ ...baseDrama.episodes[0]!, id: "ep-1", segmentVersion: 1 }],
+        }}
+        initialSegments={[s1]}
+        onPatch={async () => s1}
+      />,
+    );
+    try {
+      await dom.flush(10);
+      const previewBtn = [...mounted.container.querySelectorAll("button")].find(
+        (b) => b.textContent?.trim() === "CPU 预览",
+      );
+      await dom.click(previewBtn);
+      await dom.flush(30);
+      expect(get.mock.calls.map(([url]) => url)).toContain(
+        "/dramas/d-prev/episodes/1/manifest?v=2",
+      );
+      expect(
+        post.mock.calls.some(
+          ([, body]) => (body as { manifest_hash?: string }).manifest_hash === "v2-67010-hash",
+        ),
+      ).toBe(true);
+    } finally {
+      useDramaSegmentsStore.setState({ byEpisode: {}, watching: {} });
+      await mounted.unmount();
+    }
+  });
+
+  test("Stage C 的黑场预览使用 V2 清单并按权威时长夹紧当前镜头范围", async () => {
+    const black = makeSegment("s1", 0, { visualKind: "black", takes: [], chosenTaskId: "" });
+    const get = spyOn(service, "get").mockResolvedValue({
+      status: "ready",
+      manifest_hash: "v2-hash",
+      segment_version: 3,
+      skipped_seqs: [],
+      program_diagnostics: [],
+      diagnostics: [],
+      manifest: {
+        v: 2,
+        render_version: 2,
+        episode_id: "ep-1",
+        segment_version: 3,
+        fps: 24,
+        sample_rate: 48000,
+        total_frames: 36,
+        skipped_seqs: [],
+        clips: [
+          {
+            segment_id: "s1",
+            visual_kind: "black",
+            seq: 0,
+            source_in_f: 0,
+            source_out_f: 36,
+            master_in_f: 0,
+            master_out_f: 36,
+          },
+        ],
+        program: { v: 1, audio: [], overlays: [] },
+      },
+    });
+    const post = spyOn(service, "post").mockResolvedValue({
+      status: "ready",
+      ticket: "range-ticket",
+      stream_url: "/preview/stream",
+      expires_at: 1999999999,
+    });
+    spies.push(get, post);
+    const mounted = await dom.mount(
+      <StudioPreviewHarness
+        initialDrama={makeDrama()}
+        initialSegments={[black]}
+        onPatch={async () => black}
+      />,
+    );
+    try {
+      const byLabel = (label: string) =>
+        [...mounted.container.querySelectorAll("button")].find(
+          (button) => button.textContent?.trim() === label,
+        );
+      await dom.click(byLabel("CPU 预览"));
+      expect(get.mock.calls[0]?.[0]).toBe("/dramas/d-prev/episodes/1/manifest?v=2");
+      await dom.click(byLabel("当前镜头"));
+      expect(post.mock.calls.at(-1)?.[1]).toMatchObject({
+        manifest_hash: "v2-hash",
+        range_f: { in_f: 0, out_f: 36 },
+      });
+      const inputs = mounted.container.querySelectorAll('form[aria-label="预览帧范围"] input');
+      await dom.type(inputs[0], "28");
+      await dom.type(inputs[1], "999");
+      await dom.click(byLabel("预览帧范围"));
+      expect(post.mock.calls.at(-1)?.[1]).toMatchObject({ range_f: { in_f: 28, out_f: 36 } });
+    } finally {
+      await mounted.unmount();
+    }
+  });
+  for (const source of ["create", "poll"] as const) {
+    for (const code of [91012, 91013, 91001] as const) {
+      test(`CPU 预览 ${source} 失败 ${code} 展示公开原因与节目单诊断`, async () => {
+        const segment = makeSegment("s1", 0);
+        const message =
+          code === 91012
+            ? "引用素材不可用或已变更"
+            : code === 91013
+              ? "成片混音未达到响度或真峰交付标准"
+              : "清单已变更，请重新预览";
+        const failed = {
+          ticket: "failed-ticket",
+          status: "failed",
+          expires_at: Math.floor(Date.now() / 1000) + 60,
+          error_code: code,
+          error_message: `  ${message}  `,
+          program_diagnostics: [
+            {
+              cue_id: "voice-failed",
+              segment_id: "s1",
+              field: "asset_id",
+              reason: "media_unavailable",
+              severity: "error",
+            },
+          ],
+        };
+        spies.push(
+          spyOn(service, "get").mockImplementation(async (url: string) => {
+            if (url.endsWith("/manifest"))
+              return {
+                manifest: { v: 1, fps: 24, total_frames: 120, clips: [] },
+                manifest_hash: "hash",
+                segment_version: 3,
+                skipped_seqs: [],
+                diagnostics: [],
+              } as never;
+            if (url.endsWith("/preview/failed-ticket")) return failed as never;
+            return {} as never;
+          }),
+          spyOn(service, "post").mockResolvedValue(
+            source === "create"
+              ? failed
+              : {
+                  ticket: "failed-ticket",
+                  status: "pending",
+                  expires_at: Math.floor(Date.now() / 1000) + 60,
+                },
+          ),
+        );
+        const mounted = await dom.mount(
+          <StudioPreviewHarness
+            initialDrama={makeDrama()}
+            initialSegments={[segment]}
+            onPatch={async () => segment}
+          />,
+        );
+        try {
+          await dom.click(
+            [...mounted.container.querySelectorAll("button")].find((b) =>
+              b.textContent?.includes("CPU 预览"),
+            ),
+          );
+          for (
+            const deadline = Date.now() + 2000;
+            Date.now() < deadline && !mounted.container.textContent?.includes(message);
+          )
+            await dom.flush(20);
+          expect(mounted.container.textContent).toContain(message);
+          expect(mounted.container.textContent).toContain("节目单诊断");
+          expect(mounted.container.textContent).toContain("voice-failed");
+          expect(mounted.container.textContent).toContain("s1");
+          expect(mounted.container.textContent).toContain("media_unavailable");
+          if (code === 91001) expect(mounted.container.textContent).toContain("清单版本已变更");
+        } finally {
+          await mounted.unmount();
+        }
+      });
+    }
+  }
 
   test("CPU 整集预览走 manifest -> createPreview -> poll -> <video src>，处理 91001 并随版本变更重建", async () => {
     const s1 = makeSegment("s1", 0);
@@ -2900,6 +3440,175 @@ describe("片场修剪入口联动、CPU 整集预览与成片导出（FinalArea
       expect(capturedAbortSignal?.aborted).toBe(true);
       expect(createCalls).toBe(0);
     } finally {
+      await mounted.unmount();
+    }
+  });
+
+  test("V1 失败冷却期内远端切换为黑场后，点击「刷新预览」遇到 67010 时应重拉片段并切换到 manifest?v=2", async () => {
+    const s1 = makeSegment("s1", 0);
+    let switchedToBlack = false;
+    let postCalls = 0;
+    const get = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url === "/dramas/d-prev/episodes/1/program") {
+        return {
+          episode_id: "ep-1",
+          segment_version: switchedToBlack ? 2 : 1,
+          edit_schema: 1,
+          program: { v: 1, overlays: [], audio: [] },
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/segments") {
+        return {
+          episode_id: "ep-1",
+          segment_version: switchedToBlack ? 2 : 1,
+          items: [
+            switchedToBlack
+              ? {
+                  id: "s1",
+                  episode_id: "ep-1",
+                  episode_no: 1,
+                  seq: 0,
+                  seconds: 5,
+                  prompt: "seg",
+                  chosen_task_id: "",
+                  visual_kind: "black",
+                  segment_version: 2,
+                  takes: [],
+                  status: "idle",
+                  revision: 2,
+                  updated_at: "2026-01-01T00:00:01Z",
+                }
+              : {
+                  id: "s1",
+                  episode_id: "ep-1",
+                  episode_no: 1,
+                  seq: 0,
+                  seconds: 5,
+                  prompt: "seg",
+                  chosen_task_id: "tk-s1",
+                  takes: [
+                    {
+                      task_id: "tk-s1",
+                      status: "succeeded",
+                      url: "https://cdn/s1.mp4",
+                      asset: { id: 100, url: "https://cdn/s1.mp4" },
+                    },
+                  ],
+                  status: "done",
+                  revision: 1,
+                  updated_at: "2026-01-01T00:00:00Z",
+                },
+          ],
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/manifest") {
+        if (switchedToBlack) {
+          throw new ApiError("这一集还没有可合成的片段", DRAMA_ERR.nothingToCompose, 400);
+        }
+        return {
+          status: "ready",
+          manifest_hash: "v1-fail-hash",
+          segment_version: 1,
+          skipped_seqs: [],
+          diagnostics: [],
+          manifest: { v: 1, fps: 24, total_frames: 120, clips: [] },
+        } as never;
+      }
+      if (url === "/dramas/d-prev/episodes/1/manifest?v=2") {
+        return {
+          status: "ready",
+          manifest_hash: "v2-cooldown-hash",
+          segment_version: 2,
+          skipped_seqs: [],
+          program_diagnostics: [],
+          diagnostics: [],
+          manifest: {
+            v: 2,
+            render_version: 2,
+            episode_id: "ep-1",
+            segment_version: 2,
+            fps: 24,
+            sample_rate: 48000,
+            total_frames: 120,
+            skipped_seqs: [],
+            clips: [
+              {
+                segment_id: "s1",
+                visual_kind: "black",
+                seq: 0,
+                source_in_f: 0,
+                source_out_f: 120,
+                master_in_f: 0,
+                master_out_f: 120,
+              },
+            ],
+            program: { v: 1, overlays: [], audio: [] },
+          },
+        } as never;
+      }
+      throw new Error(`unexpected GET ${url}`);
+    });
+    const post = spyOn(service, "post").mockImplementation(async (_url, body) => {
+      postCalls += 1;
+      const hash = (body as { manifest_hash?: string }).manifest_hash;
+      if (hash === "v1-fail-hash") {
+        return {
+          ticket: "tk-v1-fail",
+          status: "failed",
+          stream_url: null,
+          expires_at: Math.floor(Date.now() / 1000) + 20,
+          error: "failed",
+        } as never;
+      }
+      return {
+        ticket: "tk-v2-ok",
+        status: "ready",
+        stream_url: "/api/v1/dramas/d-prev/episodes/1/preview/tk-v2-ok/stream?token=ok",
+        expires_at: Math.floor(Date.now() / 1000) + 600,
+      } as never;
+    });
+    spies.push(get, post);
+
+    const baseDrama = makeDrama();
+    const mounted = await dom.mount(
+      <StudioPreviewHarness
+        enableProgram
+        initialDrama={{
+          ...baseDrama,
+          episodes: [{ ...baseDrama.episodes[0]!, id: "ep-1", segmentVersion: 1 }],
+        }}
+        initialSegments={[s1]}
+        onPatch={async () => s1}
+      />,
+    );
+    try {
+      const cpuBtn = [...mounted.container.querySelectorAll("button")].find((b) =>
+        b.textContent?.includes("CPU 预览"),
+      );
+      await dom.click(cpuBtn);
+      await dom.flush(30);
+      expect(mounted.container.textContent).toContain("同版本失败票据缓存中");
+
+      switchedToBlack = true;
+      const refreshBtn = [...mounted.container.querySelectorAll("button")].find((b) =>
+        b.textContent?.includes("刷新预览"),
+      );
+      expect(refreshBtn).toBeTruthy();
+      await dom.click(refreshBtn);
+      await dom.flush(50);
+
+      expect(get.mock.calls.map(([url]) => url)).toContain(
+        "/dramas/d-prev/episodes/1/manifest?v=2",
+      );
+      expect(postCalls).toBe(2);
+      expect(mounted.container.textContent).not.toContain("同版本失败票据缓存中");
+      expect(
+        mounted.container
+          .querySelector('div[aria-label="整集 CPU 预览"] video')
+          ?.getAttribute("src"),
+      ).toContain("tk-v2-ok/stream");
+    } finally {
+      useDramaSegmentsStore.setState({ byEpisode: {}, watching: {} });
       await mounted.unmount();
     }
   });

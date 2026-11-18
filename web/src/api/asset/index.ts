@@ -1,6 +1,7 @@
 import { toast } from "sonner";
 
 import { buildIntentBody, planUpload, sendDirect } from "@/utils/asset/direct-upload";
+import { originalStageCAssetIds, stageCAssetIdReviver } from "@/utils/drama/asset-id";
 import service from "@/utils/requests/service";
 import type { AssetDto, BackendAssetDto, UploadIntent, UploadOptions } from "./type";
 
@@ -10,7 +11,7 @@ const positiveOrNull = (value: number | null | undefined) =>
 
 /** 后端 AssetView（snake_case、数字 id）适配成前端 AssetDto；同时兼容 camelCase 响应 */
 export const mapAsset = (raw: BackendAssetDto): AssetDto => ({
-  id: String(raw.id),
+  id: originalStageCAssetIds.get(raw)?.id ?? String(raw.id),
   url: raw.url,
   kind: raw.kind,
   mimeType: raw.mime_type ?? raw.mimeType ?? "",
@@ -36,6 +37,7 @@ const uploadViaProxy = async (file: File, options: UploadOptions): Promise<Asset
   return mapAsset(
     await service.upload<BackendAssetDto>("/assets", formData, {
       signal,
+      parseReviver: stageCAssetIdReviver,
       onUploadProgress: (event) => {
         if (onProgress && event.total) onProgress(Math.floor((event.loaded / event.total) * 100));
       },
@@ -91,6 +93,7 @@ export const uploadAsset = async (file: File, options: UploadOptions = {}): Prom
       undefined,
       {
         signal,
+        parseReviver: stageCAssetIdReviver,
       },
     ),
   );
@@ -103,4 +106,9 @@ export const uploadAsset = async (file: File, options: UploadOptions = {}): Prom
  * @returns 素材信息
  */
 export const getAsset = async (id: string | number): Promise<AssetDto> =>
-  mapAsset(await service.get<BackendAssetDto>(`/assets/${id}`, undefined, { silent: true }));
+  mapAsset(
+    await service.get<BackendAssetDto>(`/assets/${id}`, undefined, {
+      silent: true,
+      parseReviver: stageCAssetIdReviver,
+    }),
+  );

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useDefaultLayout } from "react-resizable-panels";
 
 import type { Drama } from "@/api/drama/type";
@@ -12,6 +12,8 @@ import { ClipBar } from "./clip-bar";
 import { Editor } from "./editor";
 import { Library } from "./library";
 import { Preview } from "./preview";
+import { ProgramPanel } from "./program/program-panel";
+import { SegmentVisualDrawer } from "./segment-visual-drawer";
 import { StudioBar } from "./studio-bar";
 import { PlaybackContext, usePlayback } from "./use-playback";
 import { StudioContext, useStudio, useStudioState } from "./use-studio";
@@ -53,6 +55,9 @@ function Shell() {
   const {
     drama,
     no,
+    episode,
+    program,
+    visualDrawer,
     segments,
     selected,
     select,
@@ -62,6 +67,9 @@ function Shell() {
     importTakesModal,
     frameRunActions,
   } = useStudio();
+  const [programOpen, setProgramOpen] = useState(false);
+  const visualSegment =
+    segments.find((segment) => segment.id === visualDrawer?.openSegmentId) ?? null;
   const frameSegment = frameRunDrawer?.openSegmentId
     ? (segments.find((segment) => segment.id === frameRunDrawer.openSegmentId) ?? null)
     : selected;
@@ -85,7 +93,10 @@ function Shell() {
   return (
     <PlaybackContext.Provider value={playback}>
       <div className="flex h-full min-h-0 flex-col">
-        <StudioBar />
+        <StudioBar
+          programOpen={programOpen}
+          onToggleProgram={program && (() => setProgramOpen((open) => !open))}
+        />
         <ResizablePanelGroup
           orientation="vertical"
           className="min-h-0 flex-1"
@@ -125,6 +136,28 @@ function Shell() {
             <ClipBar />
           </ResizablePanel>
         </ResizablePanelGroup>
+        {program && episode.id && (
+          <ProgramPanel
+            key={JSON.stringify([drama.id, episode.id, no])}
+            open={programOpen}
+            canvasId={drama.canvasId}
+            episodeId={episode.id}
+            segments={segments}
+            program={program}
+          />
+        )}
+        <SegmentVisualDrawer
+          open={!!visualSegment}
+          onOpenChange={(open) => {
+            if (!open) visualDrawer?.close();
+          }}
+          ratio={drama.ratio}
+          assets={assets}
+          segment={visualSegment ?? selected}
+          onSave={async (input, options) => {
+            if (visualSegment) await actions.patch(visualSegment.id, input, options);
+          }}
+        />
         <FrameRunDrawer
           open={!!frameRunDrawer?.openSegmentId}
           onOpenChange={(open) => {

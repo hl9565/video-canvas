@@ -1,4 +1,5 @@
 import { mapAsset } from "@/api/asset";
+import { stageCAssetIdReviver } from "@/utils/drama/asset-id";
 import service from "@/utils/requests/service";
 import type {
   BackendCursorPage,
@@ -92,13 +93,17 @@ export const listLibraryItems = async (
   query: LibraryQueryDto,
 ): Promise<CursorPageDto<LibraryItemDto>> =>
   mapPage(
-    await service.get<BackendCursorPage<BackendLibraryItemDto>>("/asset-library/items", {
-      folder_id: query.folderId,
-      kind: query.kind,
-      q: query.q,
-      cursor: query.cursor,
-      limit: query.limit ?? ASSET_PAGE_SIZE,
-    }),
+    await service.get<BackendCursorPage<BackendLibraryItemDto>>(
+      "/asset-library/items",
+      {
+        folder_id: query.folderId,
+        kind: query.kind,
+        q: query.q,
+        cursor: query.cursor,
+        limit: query.limit ?? ASSET_PAGE_SIZE,
+      },
+      { parseReviver: stageCAssetIdReviver },
+    ),
     mapLibraryItem,
   );
 
@@ -145,15 +150,19 @@ export const listGeneratedAssets = async (
   query: GeneratedQueryDto,
 ): Promise<CursorPageDto<GeneratedItemDto>> =>
   mapPage(
-    await service.get<BackendCursorPage<BackendGeneratedItemDto>>("/assets/generated", {
-      kind: query.kind,
-      source: query.source,
-      canvas_id: query.canvasId,
-      created_from: query.createdFrom,
-      order: query.order,
-      q: query.q,
-      cursor: query.cursor,
-      limit: query.limit ?? ASSET_PAGE_SIZE,
-    }),
+    await service.get<BackendCursorPage<BackendGeneratedItemDto>>(
+      "/assets/generated",
+      {
+        kind: query.kind,
+        source: query.source,
+        canvas_id: query.canvasId,
+        created_from: query.createdFrom,
+        order: query.order,
+        q: query.q,
+        cursor: query.cursor,
+        limit: query.limit ?? ASSET_PAGE_SIZE,
+      },
+      { parseReviver: stageCAssetIdReviver },
+    ),
     mapGeneratedItem,
   );

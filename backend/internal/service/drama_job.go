@@ -23,6 +23,9 @@ func (s *DramaService) Estimate(ctx context.Context, userID, id uint64, req *mod
 	if err := validateDramaJobRequest(req); err != nil {
 		return 0, err
 	}
+	if req.ConfirmClear {
+		return 0, errcode.ErrInvalidParams.WithMsg("估价不接受清空片段的确认")
+	}
 	if req.Step == "compose" {
 		return s.estimateCompose(ctx, userID, id, req)
 	}
@@ -154,12 +157,25 @@ func (s *DramaService) insertDramaJob(ctx context.Context, tx repository.DramaTx
 	if req.Step == "compose" {
 		return nil, false, errcode.ErrInvalidParams
 	}
+	if req.ConfirmClear {
+		// 空集合替换软删全集片段并只递增一次版本；任一入队步骤失败时一起回滚。
+		if err := tx.ReplaceSegments(ctx, userID, selected[0].ID, nil); err != nil {
+			return nil, false, err
+		}
+	}
 	job, err := s.enqueue(ctx, tx, current, req, snap, selected, initial, approvalID, intent.signature)
 	return job, err == nil, err
 }
 
 // prepareDramaJob 在项目锁内校验并发、前置条件与比例。
 func (s *DramaService) prepareDramaJob(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, req *model.DramaJobReq) ([]model.DramaEpisode, error) {
+	eps, e := tx.Episodes(ctx, p.UserID, p.ID)
+	if e != nil {
+		return nil, e
+	}
+	if e := checkExpectedDramaEpisode(eps, req); e != nil {
+		return nil, e
+	}
 	jobs, e := tx.Jobs(ctx, p.UserID, p.ID, true)
 	if e != nil {
 		return nil, e
@@ -167,16 +183,12 @@ func (s *DramaService) prepareDramaJob(ctx context.Context, tx repository.DramaT
 	if dramaJobsConflict(jobs, req) {
 		return nil, errcode.ErrDramaJobBusy
 	}
-	eps, e := tx.Episodes(ctx, p.UserID, p.ID)
-	if e != nil {
-		return nil, e
-	}
 	selected, e := selectDramaEpisodes(p, eps, req)
 	if e != nil {
 		return nil, e
 	}
 	if req.Step == "storyboard" {
-		if e := s.checkStoryboardTakes(ctx, tx, p, selected); e != nil {
+		if e := s.checkStoryboardSubmission(ctx, tx, p, selected, req); e != nil {
 			return nil, e
 		}
 	}
@@ -189,6 +201,41 @@ func (s *DramaService) prepareDramaJob(ctx context.Context, tx repository.DramaT
 		return nil, errcode.ErrDramaStepNotReady.WithMsg("项目缺少画面比例")
 	}
 	return selected, nil
+}
+
+// checkExpectedDramaEpisode 先校验单集任务的目标身份，避免补位集的状态掩盖过期请求。
+func checkExpectedDramaEpisode(eps []model.DramaEpisode, req *model.DramaJobReq) error {
+	if req.ExpectedEpisodeID == nil {
+		return nil
+	}
+	switch req.Step {
+	case "compose":
+		if err := validateComposeEpisodeNumbers(req.Episodes); err != nil {
+			return err
+		}
+	case "storyboard":
+		if err := checkStoryboardRequest(req); err != nil {
+			return err
+		}
+	default:
+		return errcode.ErrInvalidParams
+	}
+	for _, ep := range eps {
+		if ep.No == req.Episodes[0] && ep.ID == *req.ExpectedEpisodeID {
+			return nil
+		}
+	}
+	return errcode.ErrDramaManifestStale
+}
+
+func validateComposeEpisodeNumbers(numbers []int) error {
+	if len(numbers) != 1 {
+		return errcode.ErrInvalidParams.WithMsg("合成须且只能选择一集")
+	}
+	if numbers[0] < 1 || numbers[0] > 100000 {
+		return errcode.ErrInvalidParams.WithMsg("集号须为1至100000且不能重复")
+	}
+	return nil
 }
 
 // ListJobs 返回用户项目任务，active仅返回排队或执行中的任务。
@@ -385,8 +432,10 @@ func selectDramaEpisodes(p *model.DramaProject, eps []model.DramaEpisode, req *m
 	if err := checkStoryboardRequest(req); err != nil {
 		return nil, err
 	}
-	if req.Step == "compose" && len(req.Episodes) != 1 {
-		return nil, errcode.ErrInvalidParams.WithMsg("合成须且只能选择一集")
+	if req.Step == "compose" {
+		if err := validateComposeEpisodeNumbers(req.Episodes); err != nil {
+			return nil, err
+		}
 	}
 	switch req.Step {
 	case "analyze":

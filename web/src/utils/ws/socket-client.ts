@@ -4,6 +4,7 @@ import type { ServerMessage, TaskView } from "@/api/generation-task/type";
 import type { MarketingRoundEvent, MarketingScriptEvent } from "@/api/marketing/type";
 import type { PaymentWsUpdate } from "@/store/payment";
 import type { ConnectionState } from "@/store/ws";
+import { parseStageCJson } from "@/utils/drama/asset-id";
 
 /** 客户端每隔多久发一次 ping */
 export const HEARTBEAT_INTERVAL = 25_000;
@@ -54,7 +55,7 @@ export function parseServerMessage(raw: unknown): ServerMessage | null {
   if (typeof raw !== "string") return null;
   let msg: unknown;
   try {
-    msg = JSON.parse(raw);
+    msg = parseStageCJson(raw);
   } catch {
     return null;
   }

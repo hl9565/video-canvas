@@ -91,14 +91,17 @@ describe("useCompose 幂等键保留与竞态防护", () => {
     const stateRef: {
       latest?: ReturnType<typeof useCompose>;
       setDrama?: (id: string) => void;
+      setEpisode?: (id: string) => void;
     } = {};
     const React = await import("react");
 
     function Harness() {
       const [id, setId] = React.useState(initialDramaId);
-      const api = useCompose(id);
+      const [episodeId, setEpisode] = React.useState<string>();
+      const api = useCompose(id, episodeId === undefined ? undefined : 1, episodeId);
       React.useEffect(() => {
         stateRef.setDrama = setId;
+        stateRef.setEpisode = setEpisode;
       }, []);
       React.useEffect(() => {
         stateRef.latest = api;
@@ -114,9 +117,41 @@ describe("useCompose 幂等键保留与竞态防护", () => {
           stateRef.setDrama?.(next);
         });
       },
+      setEpisodeId: async (id: string) => {
+        await dom.act(async () => stateRef.setEpisode?.(id));
+      },
       unmount: mounted.unmount,
     };
   };
+
+  test("Stage C uses the V2 manifest and stops on terminal diagnostics before submitting", async () => {
+    const request = spyOn(service, "get").mockResolvedValue({
+      status: "preparing",
+      segment_version: 4,
+      manifest_hash: "",
+      skipped_seqs: [],
+      program_diagnostics: [
+        { cue_id: "hit", field: "anchor", reason: "anchor_source_replaced", severity: "error" },
+      ],
+    });
+    const post = spyOn(service, "post").mockResolvedValue(backendJob());
+    spies.push(request, post);
+    const { get, unmount } = await mountHook();
+    try {
+      await dom.act(async () => {
+        expect(await get().compose(1, { ratio: "16:9", programAudioCount: 1 })).toBe(false);
+      });
+      expect(request.mock.calls.map(([url]) => url)).toEqual([
+        "/dramas/d-1/episodes/1/manifest?v=2",
+      ]);
+      expect(post).not.toHaveBeenCalled();
+      expect(get().manifests[1]?.data).toMatchObject({
+        programDiagnostics: [{ cue_id: "hit" }],
+      });
+    } finally {
+      await unmount();
+    }
+  });
 
   test("瞬时错误（503 / 429 / 408 / status=0 / 网络异常）重用同一 composeRequestKey；成功后轮换新键", async () => {
     const post = spyOn(service, "post")
@@ -468,6 +503,55 @@ describe("useCompose 幂等键保留与竞态防护", () => {
 
     await h.unmount();
   });
+
+  test.each(["ep-old", "ep-new"])(
+    "an old 91001 leaves the newer manifest request in flight for %s",
+    async (activeEpisodeId) => {
+      const submit = deferred<BackendJobView>();
+      const replacement = deferred<BackendManifestResponse>();
+      const post = spyOn(service, "post").mockReturnValueOnce(submit.promise);
+      const get = spyOn(service, "get").mockReturnValueOnce(replacement.promise);
+      const onManifestStale = spyOn({ refresh: async () => {} }, "refresh");
+      spies.push(post, get, onManifestStale);
+      const h = await mountHook();
+      try {
+        await h.setEpisodeId("ep-old");
+        let oldSubmit!: Promise<boolean>;
+        await dom.act(async () => {
+          oldSubmit = h.get().compose(1, {
+            manifest: manifestView(),
+            expectedEpisodeId: "ep-old",
+            onManifestStale,
+          });
+        });
+        expect(post).toHaveBeenCalledTimes(1);
+        if (activeEpisodeId !== "ep-old") await h.setEpisodeId(activeEpisodeId);
+        let newManifest!: Promise<unknown>;
+        await dom.act(async () => {
+          newManifest = h.get().loadManifest(1);
+        });
+        expect(h.get().manifests[1]).toMatchObject({ loading: true, stale: false });
+        await dom.act(async () => {
+          submit.reject(new ApiError("stale", DRAMA_ERR.manifestStale, 409));
+          expect(await oldSubmit).toBe(false);
+        });
+        expect(h.get().manifests[1]).toMatchObject({ loading: true, stale: false });
+        expect(onManifestStale).not.toHaveBeenCalled();
+        expect(get).toHaveBeenCalledTimes(1);
+        await dom.act(async () => {
+          replacement.resolve(rawManifest(1, "b".repeat(64)));
+          await newManifest;
+        });
+        expect(h.get().manifests[1]).toMatchObject({
+          loading: false,
+          stale: false,
+          data: { segmentVersion: 1 },
+        });
+      } finally {
+        await h.unmount();
+      }
+    },
+  );
 
   test("compose 内部先拉取旧版清单再提交，在途期间 loadManifest 刷新后不会被回写覆盖", async () => {
     const get = spyOn(service, "get")
@@ -911,5 +995,73 @@ describe("useCompose 幂等键保留与竞态防护", () => {
     expect(sleepCalled).toBe(true);
     expect(getCalls).toBe(1);
     expect(outcome).toEqual({ kind: "timeout" });
+  });
+
+  test("useManifest=false 在 GET->POST 窗口分集被替换返回 91001 时携带 expected_episode_id 拦截并触发工作台刷新，不拉清单", async () => {
+    const get = spyOn(service, "get").mockImplementation(async (url: string) => {
+      if (url.endsWith("/program")) {
+        return {
+          episode_id: "ep-old",
+          segment_version: 1,
+          edit_schema: 0,
+          program: { v: 1, audio: [], overlays: [] },
+        };
+      }
+      throw new Error(`unexpected GET ${url}`);
+    });
+    const post = spyOn(service, "post").mockRejectedValue(
+      new ApiError("分集已被替换", DRAMA_ERR.manifestStale, 409),
+    );
+    spies.push(get, post);
+
+    let staleCallbacks = 0;
+    const h = await mountHook("d-toctou");
+    const ok = await dom.act(async () =>
+      h.get().compose(1, {
+        useManifest: false,
+        ratio: "9:16",
+        segmentVersion: 1,
+        expectedEpisodeId: "ep-old",
+        onEpisodeStale: () => {
+          staleCallbacks += 1;
+        },
+        segments: [],
+      }),
+    );
+
+    expect(ok).toBe(false);
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post.mock.calls[0]?.[1]).toMatchObject({
+      step: "compose",
+      episodes: [1],
+      expected_episode_id: "ep-old",
+    });
+    // 绝不因 91001 去请求 legacy /manifest
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(staleCallbacks).toBe(1);
+    expect(spies[0]!.mock.calls.some((call) => String(call[0]).includes("已被替换"))).toBe(true);
+    await h.unmount();
+  });
+
+  test("useManifest=true 提交同样携带 expected_episode_id", async () => {
+    const post = spyOn(service, "post").mockResolvedValue(backendJob("j-v1-ep"));
+    spies.push(post);
+
+    const h = await mountHook("d-ep-pin");
+    const ok = await dom.act(async () =>
+      h.get().compose(1, {
+        useManifest: true,
+        ratio: "9:16",
+        manifest: manifestView(3, "a".repeat(64)),
+        expectedEpisodeId: "ep-v1-1",
+      }),
+    );
+    expect(ok).toBe(true);
+    expect(post.mock.calls[0]?.[1]).toMatchObject({
+      step: "compose",
+      episodes: [1],
+      expected_episode_id: "ep-v1-1",
+    });
+    await h.unmount();
   });
 });

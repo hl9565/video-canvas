@@ -1,3 +1,5 @@
+import { useProgram, type ProgramStateApi } from "./program/use-program";
+import { usesProgramFeatures } from "@/utils/drama/program";
 import {
   createContext,
   useCallback,
@@ -41,6 +43,7 @@ import type {
   TaskQuote,
   UpdateSegmentInput,
 } from "@/api/drama/type";
+import type { TaskView } from "@/api/generation-task/type";
 import { confirm } from "@/components/admin-ui/confirm-dialog";
 import { choose as chooseOption } from "@/components/drama/choice-dialog";
 import { useTextHashes } from "@/hooks/use-text-hashes";
@@ -74,13 +77,15 @@ import {
 } from "@/utils/drama/timeline";
 import { effectiveDuration } from "@/utils/drama/video-models";
 import {
-  applyOrder,
   batchTargets,
   chooseCheck,
+  hasTerminalTake,
   isRunning,
   orderIds,
+  preserveNewerFrameRun,
   sameOrder,
 } from "@/utils/drama/segments";
+import { isActiveStatus } from "@/utils/tasks/status";
 import { describeSubmitError } from "@/utils/tasks/submit";
 import {
   cancelSegmentFrameRun,
@@ -200,6 +205,10 @@ export type Studio = {
     open: (segmentId: string, pendingTaskId?: string | null) => void;
     close: () => void;
   };
+  /** 画面模式与特效抽屉。 */
+  visualDrawer?: SegmentModal;
+  /** 稳定分集下的节目音频编辑状态。 */
+  program?: ProgramStateApi;
   /** 首帧控镜抽屉 */
   frameRunDrawer?: SegmentModal;
   /** 画布候选导入弹窗 */
@@ -209,6 +218,8 @@ export type Studio = {
   availableCredits: number | null;
   save: SaveSummary;
   reportSave: (key: string, status: AutosaveStatus) => void;
+  /** 刷新短剧和各集最新版本号。 */
+  refresh?: () => Promise<void> | void;
   /** 正在提交视频的片段 */
   submitting: ReadonlySet<string>;
   /** 提示词编辑器登记：生成 / 转写前立即存盘；返回注销函数 */
@@ -308,13 +319,55 @@ export function useStudioState(
     },
     [episodeId, no, syncEpisode],
   );
-  const triggerRefresh = useCallback(() => {
-    void Promise.resolve(refresh()).catch(() => undefined);
-  }, [refresh]);
+  const reloadEpisode = useCallback(
+    () => reloadSegments(dramaId, no, episodeId),
+    [dramaId, episodeId, no],
+  );
+  const applySegment = useCallback(
+    (segment: Segment) => {
+      const accepted = useDramaSegmentsStore.getState().apply(dramaId, no, segment, episodeId);
+      if (accepted) syncEpisodeVersion(segment);
+      return accepted;
+    },
+    [dramaId, episodeId, no, syncEpisodeVersion],
+  );
+  const triggerRefresh = useCallback(
+    () =>
+      Promise.all([refresh(), reloadEpisode()]).then(
+        () => undefined,
+        () => undefined,
+      ),
+    [refresh, reloadEpisode],
+  );
   const key = segmentKey(dramaId, no);
-  const list = useDramaSegmentsStore((state) => state.byEpisode[key]);
+  const list = useDramaSegmentsStore((state) => {
+    const cachedId = state.snapshotOf(dramaId, no)?.episodeId;
+    return episodeId && cachedId && episodeId !== cachedId ? undefined : state.byEpisode[key];
+  });
   const segments = list ?? NO_SEGMENTS;
-  const [segmentsStatus, setSegmentsStatus] = useState<Studio["segmentsStatus"]>("loading");
+  const [visualSegmentId, setVisualSegmentId] = useState<string | null>(null);
+  const program = useProgram({
+    dramaId,
+    episodeId,
+    episodeNo: no,
+    enabled: drama.ratio === "16:9",
+    visualStageC: usesProgramFeatures(segments),
+    segmentVersion: episode?.segmentVersion,
+    onSaved: (view) => {
+      syncEpisode?.(no, {
+        id: view.episodeId,
+        segmentVersion: view.segmentVersion,
+        editSchema: view.editSchema,
+      });
+      triggerRefresh();
+    },
+  });
+  const loadKey = JSON.stringify([key, episodeId]);
+  const [segmentLoad, setSegmentLoad] = useState<{
+    key: string;
+    status: Studio["segmentsStatus"];
+  }>();
+  const segmentsStatus = segmentLoad?.key === loadKey ? segmentLoad.status : "loading";
   const [selectedId, setSelectedId] = useState<string | null>(() => studioSearch().get("segment"));
   const [frameRunSegmentId, setFrameRunSegmentId] = useState<string | null>(() =>
     studioSearch().has("frame_run") ? studioSearch().get("segment") : null,
@@ -333,23 +386,23 @@ export function useStudioState(
   // 载入 + 登记「正在看这一集」（WebSocket 重连 / 回到前台时据此对账）
   useEffect(() => {
     let active = true;
-    void reloadSegments(dramaId, no).then(
-      (ok) => active && setSegmentsStatus(ok ? "ready" : "error"),
+    void reloadSegments(dramaId, no, episodeId, { activate: true }).then(
+      (ok) => active && setSegmentLoad({ key: loadKey, status: ok ? "ready" : "error" }),
     );
     const unwatch = useDramaSegmentsStore.getState().watch(dramaId, no);
     return () => {
       active = false;
       unwatch();
     };
-  }, [dramaId, no]);
+  }, [dramaId, episodeId, loadKey, no]);
 
   // 有片段在生成：定时对账，推送丢了也能看到结果
   const anyRunning = segments.some(isRunning);
   useEffect(() => {
     if (!anyRunning) return;
-    const timer = setInterval(() => void reloadSegments(dramaId, no), POLL_MS);
+    const timer = setInterval(() => void reloadEpisode(), POLL_MS);
     return () => clearInterval(timer);
-  }, [anyRunning, dramaId, no]);
+  }, [anyRunning, reloadEpisode]);
 
   const settled = useDramaJobsStore((state) => state.settled[dramaId] ?? 0);
   const {
@@ -531,14 +584,18 @@ export function useStudioState(
           current.revision !== options.expectedRevision
         ) {
           toast.warning("这个片段在别处被修改过，已为你加载最新内容");
-          void reloadSegments(dramaId, no);
+          void reloadEpisode();
           throw new ApiError("这个片段在别处被修改过，请重新载入最新版本后再保存", 30002, 409);
         }
+        const visualEdit =
+          fields.visualKind !== undefined ||
+          fields.stillAssetId !== undefined ||
+          fields.fx !== undefined;
         try {
           const next = await updateSegment(sid, { ...fields, revision: expectedRev });
-          useDramaSegmentsStore.getState().apply(dramaId, no, next);
-          syncEpisodeVersion(next);
+          applySegment(next);
           if (
+            visualEdit ||
             fields.edit !== undefined ||
             fields.chosenTaskId !== undefined ||
             fields.expectedTaskId !== undefined ||
@@ -550,17 +607,25 @@ export function useStudioState(
         } catch (e) {
           if (isRevisionConflict(e)) {
             toast.warning("这个片段在别处被修改过，已为你加载最新内容");
-            void reloadSegments(dramaId, no);
+            void reloadEpisode();
           } else if (isDramaError(e, DRAMA_ERR.jobBusy)) {
             toast.warning(dramaErrorMessage(e, "这一集还有任务在跑，请等任务结束后再修改"));
+          } else if (
+            visualEdit &&
+            (isDramaError(e, DRAMA_ERR.visualInvalid) ||
+              isDramaError(e, DRAMA_ERR.mediaUnavailable))
+          ) {
+            if (isDramaError(e, DRAMA_ERR.mediaUnavailable)) triggerRefresh();
           } else if (isEditInvalidError(e)) {
             toast.error(dramaErrorMessage(e, "分镜剪辑参数不合法"));
           } else if (isDramaError(e, DRAMA_ERR.segmentNotFound)) {
             toast.error(dramaErrorMessage(e));
-            useDramaSegmentsStore.getState().remove(dramaId, no, sid);
+            useDramaSegmentsStore
+              .getState()
+              .remove(dramaId, no, sid, episodeId ?? current.episodeId);
           } else if (isDramaError(e, DRAMA_ERR.takeInvalid)) {
             toast.error(dramaErrorMessage(e));
-            void reloadSegments(dramaId, no);
+            void reloadEpisode();
           } else {
             toast.error(dramaErrorMessage(e, "保存失败，请稍后重试"));
           }
@@ -575,7 +640,7 @@ export function useStudioState(
       );
       return result;
     },
-    [dramaId, key, no, syncEpisodeVersion, triggerRefresh],
+    [applySegment, dramaId, episodeId, key, no, reloadEpisode, triggerRefresh],
   );
 
   /** 带保存状态的一次性修改（时长、采用） */
@@ -646,27 +711,39 @@ export function useStudioState(
       try {
         await flushEditors();
         const current = latestOf(segment.id) ?? segment;
+        if (current.visualKind && current.visualKind !== "video") return false;
         if (!current.prompt.trim()) throw new Error("原稿是空的，先写好原稿再转写");
         const next = await adaptSegment(segment.id, { format, revision: current.revision });
-        useDramaSegmentsStore.getState().apply(dramaId, no, next);
-        syncEpisodeVersion(next);
-        return true;
+        return applySegment(next);
       } catch (e) {
         const message =
           e instanceof ApiError || !(e instanceof Error)
             ? dramaErrorMessage(e, "转写失败，请稍后重试")
             : e.message;
         setAdaptErrors((prev) => ({ ...prev, [errorKey]: message }));
-        if (isRevisionConflict(e)) void reloadSegments(dramaId, no);
+        if (isRevisionConflict(e)) void reloadEpisode();
         if (isDramaError(e, DRAMA_ERR.segmentNotFound)) {
-          useDramaSegmentsStore.getState().remove(dramaId, no, segment.id);
+          useDramaSegmentsStore
+            .getState()
+            .remove(dramaId, no, segment.id, episodeId ?? segment.episodeId);
         }
         return false;
       } finally {
         markAdapting(segment.id, false);
       }
     },
-    [adapting, dramaId, flushEditors, format, latestOf, markAdapting, no, syncEpisodeVersion],
+    [
+      adapting,
+      applySegment,
+      dramaId,
+      episodeId,
+      flushEditors,
+      format,
+      latestOf,
+      markAdapting,
+      no,
+      reloadEpisode,
+    ],
   );
 
   /**
@@ -951,7 +1028,7 @@ export function useStudioState(
           toast.error(result.message);
           return;
         }
-        void reloadSegments(dramaId, no);
+        void reloadEpisode();
       } finally {
         markSubmitting(segment.id, false);
       }
@@ -962,8 +1039,8 @@ export function useStudioState(
       flushEditors,
       freshAssets,
       markSubmitting,
-      no,
       prefs,
+      reloadEpisode,
       resolveSubmit,
       submitVideo,
       submitting,
@@ -978,6 +1055,7 @@ export function useStudioState(
    */
   const prepareBatch = useCallback(
     async (targets: Segment[]): Promise<Segment[] | null> => {
+      targets = batchTargets(targets.flatMap((item) => latestOf(item.id) ?? []));
       const effectiveSecondsOf = (item: Segment) => effectiveDuration(caps, item.seconds).value;
       if (format === "seedance") {
         const checked = evaluateSeedanceBatch(targets, effectiveSecondsOf);
@@ -1051,8 +1129,10 @@ export function useStudioState(
         const queue = [...pending];
         const worker = async () => {
           for (let item = queue.shift(); item; item = queue.shift()) {
-            if (await adapt(item, { force: true })) ids.add(item.id);
-            else failed.push(item);
+            const current = latestOf(item.id);
+            if (!current || (current.visualKind && current.visualKind !== "video")) continue;
+            if (await adapt(current, { force: true })) ids.add(current.id);
+            else failed.push(current);
           }
         };
         await Promise.all(
@@ -1071,7 +1151,8 @@ export function useStudioState(
       const stillOverrun: Segment[] = [];
       for (const item of targets) {
         if (!ids.has(item.id)) continue;
-        const current = latestOf(item.id) ?? item;
+        const current = latestOf(item.id);
+        if (!current || (current.visualKind && current.visualKind !== "video")) continue;
         const text = submitText(current, format);
         const sec = effectiveSecondsOf(current);
         if (!text || timelineOverrun(text, sec).overrun) {
@@ -1131,8 +1212,10 @@ export function useStudioState(
     let ok = 0;
     const failed: string[] = [];
     for (const item of targets) {
+      const current = latestOf(item.id);
+      if (!current || (current.visualKind && current.visualKind !== "video")) continue;
       markSubmitting(item.id, true);
-      const result = await submitVideo(item, latest);
+      const result = await submitVideo({ ...current, prompt: item.prompt }, latest);
       markSubmitting(item.id, false);
       if (result.ok) ok += 1;
       else {
@@ -1141,7 +1224,7 @@ export function useStudioState(
         if (/积分不足|排队任务已达上限/.test(result.message)) break;
       }
     }
-    void reloadSegments(dramaId, no);
+    void reloadEpisode();
     if (ok > 0) toast.info(`已提交 ${ok} 个片段`);
     if (failed.length > 0) toast.error(`有 ${targets.length - ok} 个片段没能提交：${failed[0]}`);
   }, [
@@ -1150,10 +1233,11 @@ export function useStudioState(
     flushEditors,
     freshAssets,
     key,
+    latestOf,
     markSubmitting,
-    no,
     prefs,
     prepareBatch,
+    reloadEpisode,
     submitVideo,
     video.model,
   ]);
@@ -1163,14 +1247,13 @@ export function useStudioState(
       const created = await addSegment(dramaId, no, {
         seconds: effectiveDuration(video.model?.capabilities, DEFAULT_SECONDS).value,
       });
-      useDramaSegmentsStore.getState().apply(dramaId, no, created);
-      syncEpisodeVersion(created);
+      if (!applySegment(created)) return;
       setSelectedId(created.id);
       triggerRefresh();
     } catch (e) {
       toast.error(dramaErrorMessage(e, "新增失败，请稍后重试"));
     }
-  }, [dramaId, no, syncEpisodeVersion, triggerRefresh, video.model]);
+  }, [applySegment, dramaId, no, triggerRefresh, video.model]);
 
   const remove = useCallback<Studio["actions"]["remove"]>(
     async (segment) => {
@@ -1182,31 +1265,35 @@ export function useStudioState(
         onConfirm: () => deleteSegment(segment.id),
       });
       if (!ok) return;
-      useDramaSegmentsStore.getState().remove(dramaId, no, segment.id);
-      void reloadSegments(dramaId, no);
+      useDramaSegmentsStore
+        .getState()
+        .remove(dramaId, no, segment.id, episodeId ?? segment.episodeId);
+      void reloadEpisode();
       triggerRefresh();
     },
-    [dramaId, no, triggerRefresh],
+    [dramaId, episodeId, no, reloadEpisode, triggerRefresh],
   );
 
   const reorder = useCallback<Studio["actions"]["reorder"]>(
     async (ids) => {
-      const current = useDramaSegmentsStore.getState().byEpisode[key] ?? NO_SEGMENTS;
+      const store = useDramaSegmentsStore.getState();
+      const current = store.byEpisode[key] ?? NO_SEGMENTS;
       if (sameOrder(ids, orderIds(current))) return;
       // 先在本地换序，界面不等请求
-      useDramaSegmentsStore.getState().setList(dramaId, no, applyOrder(current, ids));
+      const expectedEpisodeId = episodeId ?? store.snapshotOf(dramaId, no)?.episodeId;
+      if (!store.reorderLocal(dramaId, no, ids, expectedEpisodeId)) return;
       try {
         const reordered = await reorderSegments(dramaId, no, ids);
-        useDramaSegmentsStore.getState().setList(dramaId, no, reordered);
+        if (!store.setList(dramaId, no, reordered, undefined, { expectedEpisodeId })) return;
         syncEpisodeVersion(...reordered);
         // 顺序变了：成片是否过期要跟着刷新
         triggerRefresh();
       } catch (e) {
         toast.error(dramaErrorMessage(e, "排序失败，已恢复原顺序"));
-        void reloadSegments(dramaId, no);
+        void reloadEpisode();
       }
     },
-    [dramaId, key, no, syncEpisodeVersion, triggerRefresh],
+    [dramaId, episodeId, key, no, reloadEpisode, syncEpisodeVersion, triggerRefresh],
   );
 
   const setSeconds = useCallback<Studio["actions"]["setSeconds"]>(
@@ -1274,8 +1361,7 @@ export function useStudioState(
         if (!current) throw new Error("片段不存在");
         try {
           const next = await change(current);
-          useDramaSegmentsStore.getState().apply(dramaId, no, next);
-          syncEpisodeVersion(next);
+          applySegment(next);
           triggerRefresh();
           return next;
         } catch (error) {
@@ -1285,7 +1371,7 @@ export function useStudioState(
               error.code === DRAMA_ERR.takeInvalid ||
               error.code === DRAMA_ERR.takeQcRejected)
           ) {
-            await reloadSegments(dramaId, no);
+            if (!(await reloadEpisode())) throw error;
             syncEpisodeVersion(...(useDramaSegmentsStore.getState().byEpisode[key] ?? NO_SEGMENTS));
             triggerRefresh();
           }
@@ -1300,7 +1386,7 @@ export function useStudioState(
       );
       return result;
     },
-    [dramaId, key, no, syncEpisodeVersion, triggerRefresh],
+    [applySegment, key, reloadEpisode, syncEpisodeVersion, triggerRefresh],
   );
 
   const patchTakeQc = useCallback<Studio["actions"]["patchTakeQc"]>(
@@ -1326,15 +1412,19 @@ export function useStudioState(
   }, []);
 
   const applyRun = useCallback(
-    (sid: string, run: SegmentFrameRun) => {
+    (sid: string, run: SegmentFrameRun, task?: TaskView) => {
       const store = useDramaSegmentsStore.getState();
       const current = store.byEpisode[key]?.find((item) => item.id === sid);
       if (!current || run.segmentId !== sid) return;
       if (current.frameRun?.id === run.id && current.frameRun.revision > run.revision) return;
+      const frameVideoActive =
+        task &&
+        isActiveStatus(task.status) &&
+        !hasTerminalTake(current.takes, run.videoTaskId ?? task.task_ref ?? String(task.id));
       store.bumpRunFloor(sid);
-      store.apply(dramaId, no, { ...current, frameRun: run });
+      store.apply(dramaId, no, { ...current, frameRun: run }, episodeId, frameVideoActive);
     },
-    [dramaId, key, no],
+    [dramaId, episodeId, key, no],
   );
 
   const refreshRun = useCallback<StudioFrameRunActions["refresh"]>(
@@ -1353,12 +1443,23 @@ export function useStudioState(
         current.frameRun.revision > (run?.revision ?? 0)
           ? current.frameRun
           : run;
-      useDramaSegmentsStore.getState().apply(dramaId, no, { ...segment, frameRun: latestRun });
-      syncEpisodeVersion(segment);
-      if (latestRun) applyRun(sid, latestRun);
+      // 片段读取期间视频可能已入队，较新的流程未必反映在片段状态里。
+      const videoTaskId = latestRun?.videoTaskId;
+      const running =
+        latestRun?.state === "video_pending" &&
+        !!videoTaskId &&
+        latestRun !== segment.frameRun &&
+        (!segment.frameRun ||
+          preserveNewerFrameRun({ ...segment, frameRun: latestRun }, segment).frameRun ===
+            latestRun) &&
+        !hasTerminalTake(segment.takes, videoTaskId) &&
+        !hasTerminalTake(current?.takes ?? [], videoTaskId);
+      const status = running ? "running" : segment.status;
+      if (!applySegment({ ...segment, frameRun: latestRun, status })) return null;
+      if (latestRun?.segmentId === sid) useDramaSegmentsStore.getState().bumpRunFloor(sid);
       return latestRun;
     },
-    [advanceRunEpoch, applyRun, dramaId, key, no, syncEpisodeVersion],
+    [advanceRunEpoch, applySegment, key],
   );
 
   const changeRun = useCallback(
@@ -1372,13 +1473,13 @@ export function useStudioState(
       } catch (error) {
         advanceRunEpoch(sid);
         if (error instanceof ApiError && error.status === 409) {
-          await reloadSegments(dramaId, no);
+          await reloadEpisode();
           triggerRefresh();
         }
         throw error;
       }
     },
-    [advanceRunEpoch, applyRun, dramaId, no, triggerRefresh],
+    [advanceRunEpoch, applyRun, reloadEpisode, triggerRefresh],
   );
 
   const frameRunActions = useMemo<StudioFrameRunActions>(
@@ -1396,19 +1497,19 @@ export function useStudioState(
         try {
           const result = await submitSegmentFrameRun(sid, rid, input);
           advanceRunEpoch(sid);
-          applyRun(sid, result.run);
-          void reloadSegments(dramaId, no);
+          applyRun(sid, result.run, result.task);
+          void reloadEpisode();
           triggerRefresh();
           return result;
         } catch (error) {
           advanceRunEpoch(sid);
-          if (error instanceof ApiError && error.status === 409) await reloadSegments(dramaId, no);
+          if (error instanceof ApiError && error.status === 409) await reloadEpisode();
           throw error;
         }
       },
       cancel: (sid, rid, input) => changeRun(sid, () => cancelSegmentFrameRun(sid, rid, input)),
     }),
-    [advanceRunEpoch, applyRun, changeRun, dramaId, no, refreshRun, triggerRefresh],
+    [advanceRunEpoch, applyRun, changeRun, refreshRun, reloadEpisode, triggerRefresh],
   );
 
   const frameRunDrawer = useMemo<SegmentModal>(
@@ -1531,12 +1632,19 @@ export function useStudioState(
     credits,
     quoteState,
     trimDrawer,
+    visualDrawer: {
+      openSegmentId: visualSegmentId,
+      open: setVisualSegmentId,
+      close: () => setVisualSegmentId(null),
+    },
+    ...(episodeId && drama.ratio === "16:9" ? { program } : {}),
     frameRunDrawer,
     importTakesModal,
     frameRunActions,
     availableCredits,
     save,
     reportSave,
+    refresh: triggerRefresh,
     submitting,
     registerEditor,
     actions: {

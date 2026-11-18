@@ -72,6 +72,18 @@ export const DRAMA_ERR = {
   takeQcRejected: FORK_ERR.takeQcRejected,
   /** 首帧无效或未就绪 */
   frameInvalid: FORK_ERR.frameInvalid,
+  /** 节目单参数或结构不合法 */
+  programInvalid: FORK_ERR.programInvalid,
+  /** 绑定的源镜头已变更 */
+  anchorInvalid: FORK_ERR.anchorInvalid,
+  /** 分镜视觉模式或特效参数不合法 */
+  visualInvalid: FORK_ERR.visualInvalid,
+  /** 引用素材不可用或已变更 */
+  mediaUnavailable: FORK_ERR.mediaUnavailable,
+  /** 响度或真峰验收失败 */
+  loudnessInvalid: FORK_ERR.loudnessInvalid,
+  /** 被剧集引用的素材无法执行此操作 */
+  assetInUse: FORK_ERR.assetInUse,
   /** 内容触发了模型的安全过滤（Msg 可点名被过滤的资产） */
   contentFiltered: 67029,
 } as const;
@@ -141,12 +153,17 @@ const MSG_FIRST = new Set<number>([
   DRAMA_ERR.stepNotReady,
   DRAMA_ERR.promptInvalid,
   DRAMA_ERR.editInvalid,
+  DRAMA_ERR.programInvalid,
+  DRAMA_ERR.anchorInvalid,
+  DRAMA_ERR.visualInvalid,
+  DRAMA_ERR.mediaUnavailable,
+  DRAMA_ERR.loudnessInvalid,
+  DRAMA_ERR.assetInUse,
   REVISION_CONFLICT_CODE,
 ]);
 
 /**
- * 把错误转成给用户看的一句话：
- * 67002 / 67006 / 67017 / 91003 后端 Msg 写了具体原因，优先用 Msg；其余优先用本地文案，Msg 兜底。
+ * 把错误转成给用户看的一句话。对带具体原因的业务码优先展示后端 Msg，其余优先使用本地文案。
  */
 export function dramaErrorMessage(error: unknown, fallback = "操作失败，请稍后重试"): string {
   if (!(error instanceof ApiError)) return fallback;

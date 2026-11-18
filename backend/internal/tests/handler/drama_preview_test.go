@@ -25,6 +25,7 @@ import (
 	"video-canvas/internal/handler"
 	"video-canvas/internal/middleware"
 	"video-canvas/internal/model"
+	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
 	"video-canvas/internal/pkg/jsonhash"
 	"video-canvas/internal/pkg/logger"
@@ -34,9 +35,16 @@ import (
 	"video-canvas/internal/service"
 )
 
-type previewHTTPRepo struct{ *httpDramaRepo }
+type previewHTTPRepo struct {
+	*httpDramaRepo
+	blackFrames *int32
+}
 
 func (r *previewHTTPRepo) Segments(context.Context, uint64, uint64) ([]model.DramaSegment, error) {
+	if r.blackFrames != nil {
+		return []model.DramaSegment{{BaseModel: model.BaseModel{ID: 5}, UserID: 1, EpisodeID: 10,
+			VisualKind: model.DramaVisualBlack, SourceOutF: r.blackFrames}}, nil
+	}
 	chosen := uint64(20)
 	return []model.DramaSegment{{BaseModel: model.BaseModel{ID: 5}, UserID: 1, EpisodeID: 10, ChosenTaskID: &chosen}}, nil
 }
@@ -62,16 +70,113 @@ func (previewHTTPProbes) Upsert(context.Context, *model.AssetMediaProbe) error {
 
 type previewHTTPComposer struct{}
 
+type previewHTTPFailureComposer struct {
+	previewHTTPComposer
+	err error
+}
+
+func (p previewHTTPFailureComposer) ComposeProgramManifest(context.Context, videoframe.ComposeProgramInput) (videoframe.ProgramComposeReport, error) {
+	return videoframe.ProgramComposeReport{}, p.err
+}
+
+func TestDramaPreviewHTTP_PublicFailureWire(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		code    int
+		message string
+	}{
+		{"media", errcode.ErrDramaMediaUnavailable.WithData(service.DramaProgramDiagnosticsData{Diagnostics: []service.DramaProgramDiagnostic{
+			{CueID: "voice", SegmentID: 5, Field: "asset_id", Reason: "media_unavailable", Severity: "error"},
+			{Field: "program", Reason: "media_unavailable", Severity: "error"},
+		}}), 91012, errcode.ErrDramaMediaUnavailable.Msg},
+		{"loudness", videoframe.ErrLoudnessAcceptance, 91013, errcode.ErrDramaLoudnessInvalid.Msg},
+		{"private", errors.New("open /tmp/vc-drama-preview-secret: SQL https://private/asset bound_source"), 10000, "CPU 预览生成失败，请检查片段视频并重试"},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			r, svc, repo := previewHTTPRouterWithRepo(t, func(d *service.DramaDeps) { d.Compose = previewHTTPFailureComposer{err: tt.err} })
+			repo.blackFrames = new(int32(24))
+			manifest, err := svc.ResolveEpisodeManifestV2(t.Context(), 1, 7, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ticket, _, err := svc.CreateEpisodePreview(t.Context(), 1, 7, 1, &model.DramaPreviewReq{ManifestHash: manifest.ManifestHash, Variant: "clean"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := "/api/v1/dramas/" + idcodec.Encode(7) + "/episodes/1/preview/" + ticket.Ticket
+			var data map[string]json.RawMessage
+			for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+				w := getHTTPPreviewStatus(r, path)
+				var body struct {
+					Data map[string]json.RawMessage `json:"data"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || w.Code != http.StatusOK {
+					t.Fatalf("HTTP status: %d %s %v", w.Code, w.Body.String(), err)
+				}
+				data = body.Data
+				if string(data["status"]) == `"failed"` {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			assertPreviewFailureWire(t, data, tt.code, tt.message)
+		})
+	}
+}
+
+func assertPreviewFailureWire(t *testing.T, data map[string]json.RawMessage, code int, message string) {
+	t.Helper()
+	var gotCode int
+	var gotMessage string
+	if err := json.Unmarshal(data["error_code"], &gotCode); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data["error_message"], &gotMessage); err != nil {
+		t.Fatal(err)
+	}
+	if gotCode != code || gotMessage != message || data["stream_url"] != nil {
+		t.Fatalf("wrong failure wire: %v", data)
+	}
+	if code != 91012 {
+		if data["program_diagnostics"] != nil {
+			t.Fatal("unexpected failure diagnostics")
+		}
+		return
+	}
+	var diagnostics []map[string]string
+	if err := json.Unmarshal(data["program_diagnostics"], &diagnostics); err != nil {
+		t.Fatal(err)
+	}
+	if len(diagnostics) != 2 || len(diagnostics[0]) != 5 || len(diagnostics[1]) != 3 || diagnostics[0]["segment_id"] != idcodec.Encode(5) || diagnostics[0]["cue_id"] != "voice" || diagnostics[0]["reason"] != "media_unavailable" {
+		t.Fatalf("unsafe or missing diagnostics: %+v", diagnostics)
+	}
+}
+
 func (previewHTTPComposer) Compose(context.Context, []string, string) error { return nil }
 func (previewHTTPComposer) ComposeManifest(_ context.Context, in videoframe.ComposeManifestInput) error {
 	return os.WriteFile(in.Outputs[0].Destination, []byte("preview-video-data"), 0600)
 }
 
+func (previewHTTPComposer) ComposeProgramManifest(_ context.Context, in videoframe.ComposeProgramInput) (videoframe.ProgramComposeReport, error) {
+	return videoframe.ProgramComposeReport{}, os.WriteFile(in.Outputs[0].Destination, []byte("stage-c-preview"), 0600)
+}
+
 func previewHTTPRouter(t *testing.T) (*gin.Engine, *service.DramaService) {
+	r, svc, _ := previewHTTPRouterWithRepo(t)
+	return r, svc
+}
+
+func previewHTTPRouterWithRepo(t *testing.T, configure ...func(*service.DramaDeps)) (*gin.Engine, *service.DramaService, *previewHTTPRepo) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	repo := &previewHTTPRepo{&httpDramaRepo{project: &model.DramaProject{BaseModel: model.BaseModel{ID: 7}, UserID: 1, CanvasID: 9}, episode: &model.DramaEpisode{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1}}}
-	svc := service.NewDramaService(service.DramaDeps{Repo: repo, Assets: previewHTTPAssets{}, Probes: previewHTTPProbes{}, Compose: previewHTTPComposer{}, PreviewSecret: "http-preview-secret"})
+	repo := &previewHTTPRepo{httpDramaRepo: &httpDramaRepo{project: &model.DramaProject{BaseModel: model.BaseModel{ID: 7}, UserID: 1, CanvasID: 9, Ratio: "16:9"}, episode: &model.DramaEpisode{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1}}}
+	deps := service.DramaDeps{Repo: repo, Assets: previewHTTPAssets{}, Probes: previewHTTPProbes{}, Compose: previewHTTPComposer{}, PreviewSecret: "http-preview-secret"}
+	for _, apply := range configure {
+		apply(&deps)
+	}
+	svc := service.NewDramaService(deps)
 	t.Cleanup(svc.ClosePreviews)
 	h := handler.NewDramaHandler(svc)
 	r := gin.New()
@@ -90,7 +195,7 @@ func previewHTTPRouter(t *testing.T) (*gin.Engine, *service.DramaService) {
 	auth.GET("/dramas/:id/episodes/:no/manifest", h.Manifest)
 	auth.POST("/dramas/:id/episodes/:no/preview", h.CreatePreview)
 	auth.GET("/dramas/:id/episodes/:no/preview/:ticket", h.GetPreview)
-	return r, svc
+	return r, svc, repo
 }
 
 func TestDramaPreviewHTTP_CookieRangeAndIsolation(t *testing.T) {
@@ -264,7 +369,7 @@ func (p *coldHTTPProbes) Upsert(_ context.Context, row *model.AssetMediaProbe) e
 func setupColdManifestRouter(t *testing.T, probeFn func(context.Context, string) (videoframe.NormalizedProbe, error)) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	repo := &previewHTTPRepo{&httpDramaRepo{
+	repo := &previewHTTPRepo{httpDramaRepo: &httpDramaRepo{
 		project: &model.DramaProject{BaseModel: model.BaseModel{ID: 7}, UserID: 1, CanvasID: 9},
 		episode: &model.DramaEpisode{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1, EditSchema: 1, SegmentVersion: 1},
 	}}
@@ -417,4 +522,98 @@ func TestDramaManifestHTTP_ColdWarmupAcceptedThenReadyAndFailureSurfaced(t *test
 		}
 		t.Fatal("错误恢复后等待 200 OK 超时")
 	})
+}
+
+func TestDramaPreviewHTTP_V2StaleTicketReturns409ForStatusAndStream(t *testing.T) {
+	for name, change := range map[string]func(*previewHTTPRepo){
+		"segment version": func(repo *previewHTTPRepo) { repo.episode.SegmentVersion++ },
+		"ratio only":      func(repo *previewHTTPRepo) { repo.project.Ratio = "9:16" },
+	} {
+		t.Run(name, func(t *testing.T) { checkHTTPStalePreview(t, change) })
+	}
+}
+
+func checkHTTPStalePreview(t *testing.T, change func(*previewHTTPRepo)) {
+	t.Helper()
+	r, svc, repo := previewHTTPRouterWithRepo(t)
+	repo.blackFrames = new(int32(24))
+	view, err := svc.ResolveEpisodeManifestV2(t.Context(), 1, 7, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "/api/v1/dramas/" + idcodec.Encode(7) + "/episodes/1/preview"
+	req := httptest.NewRequest(http.MethodPost, base, strings.NewReader(`{"segment_version":0,"manifest_hash":"`+view.ManifestHash+`","variant":"clean","range_f":{"in_f":4,"out_f":12}}`))
+	req.Header.Set("Authorization", "Bearer test")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	var created struct {
+		Data model.DramaPreviewView `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil || w.Code != http.StatusOK || len(w.Result().Cookies()) != 1 {
+		t.Fatalf("V2 preview creation: %d %s (%v)", w.Code, w.Body.String(), err)
+	}
+	cookie := w.Result().Cookies()[0]
+	ready := waitHTTPPreviewReady(t, svc, 1, 7, 1, created.Data.Ticket)
+	change(repo)
+
+	assertHTTPPreviewStaleStatus(t, getHTTPPreviewStatus(r, base+"/"+ready.Ticket))
+	assertHTTPPreviewStaleStream(t, r, ready.StreamURL, cookie)
+}
+
+func TestDramaPreviewHTTP_ColdStaleTicketReturns409ForStatusAndStream(t *testing.T) {
+	r, svc, _ := previewHTTPRouterWithRepo(t, func(d *service.DramaDeps) {
+		d.Probes = &coldHTTPProbes{rows: map[string]*model.AssetMediaProbe{}}
+		d.ProbeVideo = func(context.Context, string) (videoframe.NormalizedProbe, error) {
+			return videoframe.NormalizedProbe{NormalizedFrames24: 120}, nil
+		}
+	})
+	view, cookie, err := svc.CreateEpisodePreview(t.Context(), 1, 7, 1, &model.DramaPreviewReq{
+		ManifestHash: strings.Repeat("a", 64), Variant: "clean",
+	})
+	if err != nil || view.Status != "pending" {
+		t.Fatalf("cold preview creation: %+v %v", view, err)
+	}
+	path := "/api/v1/dramas/" + idcodec.Encode(7) + "/episodes/1/preview/" + view.Ticket
+	deadline := time.Now().Add(2 * time.Second)
+	for w := getHTTPPreviewStatus(r, path); ; w = getHTTPPreviewStatus(r, path) {
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"pending"`) || time.Now().After(deadline) {
+			assertHTTPPreviewStaleStatus(t, w)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	token := previewCredential(t, map[string]any{
+		"u": 1, "d": 7, "e": 1, "t": view.Ticket, "x": time.Now().Add(time.Minute).Unix(), "p": "stream",
+	})
+	assertHTTPPreviewStaleStream(t, r, path+"/stream?token="+token, &http.Cookie{Name: "vc_preview_sess", Value: cookie})
+}
+
+func getHTTPPreviewStatus(r *gin.Engine, path string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer test")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func assertHTTPPreviewStaleStatus(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	var body struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil || w.Code != http.StatusConflict || body.Code != 91001 {
+		t.Fatalf("stale status: %d %s (%v)", w.Code, w.Body.String(), err)
+	}
+}
+
+func assertHTTPPreviewStaleStream(t *testing.T, r *gin.Engine, path string, cookie *http.Cookie) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict || w.Body.Len() != 0 {
+		t.Fatalf("stale stream: %d %q", w.Code, w.Body.String())
+	}
 }

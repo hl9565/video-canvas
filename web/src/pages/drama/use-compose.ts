@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { submitJob } from "@/api/drama";
+import { getEpisodeProgram, submitJob } from "@/api/drama";
 import {
   DRAMA_ERR,
   dramaErrorMessage,
@@ -13,20 +13,27 @@ import type {
   DramaComposeSize,
   DramaComposeVariant,
   DramaJob,
-  DramaManifestView,
+  DramaManifestV2Response,
   Segment,
   SegmentTake,
 } from "@/api/drama/type";
 import { useDramaJobsStore } from "@/store/drama";
 import {
   buildComposeJobInput,
+  type ComposeManifest,
+  manifestProgramDiagnostics,
   composeNotice,
   createComposeRequestKey,
   DEFAULT_COMPOSE_SIZE,
   DEFAULT_COMPOSE_VARIANTS,
   normalizeComposeVariants,
 } from "@/utils/drama/compose";
-import { waitForEpisodeManifest } from "@/utils/drama/manifest";
+import { waitForEpisodeManifest, waitForEpisodeManifestV2 } from "@/utils/drama/manifest";
+import {
+  programDiagnosticsFrom,
+  usesProgramFeatures,
+  VISUAL_RATIO_MESSAGE,
+} from "@/utils/drama/program";
 import { ApiError } from "@/utils/requests/request";
 
 /**
@@ -36,7 +43,8 @@ import { ApiError } from "@/utils/requests/request";
  */
 
 export interface ComposeManifestState {
-  data: DramaManifestView | null;
+  data: ComposeManifest | null;
+  programDiagnostics?: DramaManifestV2Response["programDiagnostics"];
   loading: boolean;
   error: string | null;
   stale: boolean;
@@ -44,7 +52,7 @@ export interface ComposeManifestState {
 
 export type ComposeSegmentIdentity = Pick<
   Segment,
-  "id" | "seq" | "chosenTaskId" | "revision" | "seconds"
+  "id" | "seq" | "chosenTaskId" | "revision" | "seconds" | "visualKind" | "fx"
 > & {
   takes?: readonly SegmentTake[];
 };
@@ -53,7 +61,19 @@ export interface ComposeSubmitOptions {
   useManifest?: boolean;
   size?: DramaComposeSize;
   variants?: readonly DramaComposeVariant[];
-  manifest?: DramaManifestView | null;
+  manifest?: ComposeManifest | null;
+  /** 显式使用 Stage C 清单，可直接附带已读取的 V2 响应。 */
+  manifestV2?: boolean | DramaManifestV2Response | null;
+  /** 已保存节目单的音频数。 */
+  programAudioCount?: number;
+  /** 清单 91001 过期时由调用方联动重探测分镜/节目单并刷新清单。 */
+  onManifestStale?: (
+    refresh: (no: number, useV2?: boolean) => Promise<ComposeManifest | null>,
+  ) => Promise<void> | void;
+  /** 期望当前集号对应的稳定分集 ID；提交与 91001 复核共用以防删集替补窗口。 */
+  expectedEpisodeId?: string;
+  /** 检测到分集身份不匹配时通知调用方刷新工作台。 */
+  onEpisodeStale?: () => Promise<void> | void;
   /** 项目比例（用于本地意图签名；旧协议同样依赖比例变化轮换幂等键，不上送后端 compose 字段） */
   ratio?: string;
   /** 分集版本号（用于旧协议本地意图签名） */
@@ -156,7 +176,7 @@ const patchManifestMap = (
   };
 };
 
-export function useCompose(dramaId: string) {
+export function useCompose(dramaId: string, activeNo?: number, activeEpisodeId?: string) {
   const [pendingState, setPendingState] = useState<{ dramaId: string; no: number | null }>({
     dramaId,
     no: null,
@@ -173,6 +193,11 @@ export function useCompose(dramaId: string) {
   const manifestAbortRef = useRef<Map<string, AbortController>>(new Map());
   const pendingKeysRef = useRef<Map<string, PendingComposeEntry>>(new Map());
   const inflightRef = useRef<Map<string, InflightComposeEntry>>(new Map());
+
+  const activeScopeRef = useRef({ no: activeNo, episodeId: activeEpisodeId });
+  useLayoutEffect(() => {
+    activeScopeRef.current = { no: activeNo, episodeId: activeEpisodeId };
+  }, [dramaId, activeNo, activeEpisodeId]);
 
   const cancelManifestWaiter = useCallback((key: string) => {
     const cancel = manifestWaitersRef.current.get(key);
@@ -282,9 +307,14 @@ export function useCompose(dramaId: string) {
   }, [dramaId]);
 
   const loadManifest = useCallback(
-    async (no: number): Promise<DramaManifestView | null> => {
+    async (no: number, useV2 = false, stale = false): Promise<ComposeManifest | null> => {
+      const scope = activeScopeRef.current;
       const key = scopeKey(dramaId, no);
       const { seq, signal, cleanup } = startManifestWait(key);
+      const active = () =>
+        mountedDramaRef.current === dramaId &&
+        activeScopeRef.current === scope &&
+        manifestReqSeqRef.current[key] === seq;
       setManifestsState((prev) =>
         patchManifestMap(prev, dramaId, no, (cur) => ({
           data: cur?.data ?? null,
@@ -294,17 +324,12 @@ export function useCompose(dramaId: string) {
         })),
       );
       try {
-        const res = await waitForEpisodeManifest(dramaId, no, {
+        const res = await (useV2 ? waitForEpisodeManifestV2 : waitForEpisodeManifest)(dramaId, no, {
           signal,
-          isCancelled: () =>
-            mountedDramaRef.current !== dramaId || manifestReqSeqRef.current[key] !== seq,
+          isCancelled: () => !active(),
           sleep: (ms) => sleepForManifestKey(key, seq, ms),
         });
-        if (
-          res.kind === "cancelled" ||
-          mountedDramaRef.current !== dramaId ||
-          manifestReqSeqRef.current[key] !== seq
-        ) {
+        if (res.kind === "cancelled" || !active()) {
           return null;
         }
         if (res.kind === "timeout") {
@@ -320,16 +345,18 @@ export function useCompose(dramaId: string) {
         }
         const data = res.manifest;
         setManifestsState((prev) =>
-          patchManifestMap(prev, dramaId, no, () => ({
-            data,
-            loading: false,
-            error: null,
-            stale: false,
-          })),
+          active()
+            ? patchManifestMap(prev, dramaId, no, () => ({
+                data,
+                loading: false,
+                error: null,
+                stale,
+              }))
+            : prev,
         );
         return data;
       } catch (e) {
-        if (mountedDramaRef.current !== dramaId || manifestReqSeqRef.current[key] !== seq) {
+        if (!active()) {
           return null;
         }
         const empty = isDramaError(e, DRAMA_ERR.nothingToCompose);
@@ -339,6 +366,7 @@ export function useCompose(dramaId: string) {
             data: empty ? null : (cur?.data ?? null),
             loading: false,
             error: message,
+            programDiagnostics: programDiagnosticsFrom(e),
             stale: false,
           })),
         );
@@ -353,20 +381,35 @@ export function useCompose(dramaId: string) {
   const compose = useCallback(
     async (no: number, options?: ComposeSubmitOptions): Promise<boolean> => {
       const key = scopeKey(dramaId, no);
-      const useManifest = options?.useManifest ?? options?.manifest !== undefined;
+      const stageC = usesProgramFeatures(options?.segments ?? [], options?.programAudioCount);
+      const v2 =
+        Boolean(options?.manifestV2) ||
+        Boolean(options?.manifest && "programDiagnostics" in options.manifest) ||
+        (options?.ratio === "16:9" && stageC);
+      if ((stageC || v2) && options?.ratio && options.ratio !== "16:9") {
+        toast.error(VISUAL_RATIO_MESSAGE);
+        return false;
+      }
+      const candidate =
+        typeof options?.manifestV2 === "object" && options.manifestV2
+          ? options.manifestV2
+          : options?.manifest;
+      const supplied = candidate && "programDiagnostics" in candidate === v2 ? candidate : null;
+      const useManifest = v2 || (options?.useManifest ?? options?.manifest !== undefined);
       const size = options?.size ?? DEFAULT_COMPOSE_SIZE;
       const variants = useManifest
         ? normalizeComposeVariants(options?.variants ?? DEFAULT_COMPOSE_VARIANTS)
         : [];
       const ratio = options?.ratio ?? "";
       const segmentVersion = options?.segmentVersion ?? 0;
+      const expectedEpisodeId = options?.expectedEpisodeId ?? "";
       const legacySegSig = useManifest ? "" : legacySegmentsIdentity(options);
       const basePreIntent = useManifest
-        ? `manifest:${ratio}:${size}:${variants.join(",")}`
-        : `legacy:${ratio}:${segmentVersion}:${legacySegSig}`;
+        ? `manifest:${v2 ? "v2" : "v1"}:${expectedEpisodeId}:${ratio}:${size}:${variants.join(",")}`
+        : `legacy:${expectedEpisodeId}:${ratio}:${segmentVersion}:${legacySegSig}`;
       const callerResolvedIntent =
-        useManifest && options?.manifest
-          ? `${basePreIntent}:${options.manifest.segmentVersion}:${options.manifest.manifestHash}`
+        useManifest && supplied
+          ? `${basePreIntent}:${supplied.segmentVersion}:${supplied.manifestHash}`
           : useManifest
             ? null
             : basePreIntent;
@@ -392,16 +435,43 @@ export function useCompose(dramaId: string) {
       pendingKeysRef.current.set(key, pendingEntry);
 
       const token = Symbol("compose-submit");
+      const scope = activeScopeRef.current;
+      let submitManifestSeq = manifestReqSeqRef.current[key] ?? 0;
+      const ownsSubmit = () =>
+        mountedDramaRef.current === dramaId &&
+        activeScopeRef.current === scope &&
+        (scope.no === undefined || scope.no === no) &&
+        (!scope.episodeId || !expectedEpisodeId || scope.episodeId === expectedEpisodeId) &&
+        inflightRef.current.get(key)?.token === token;
+      const ownsManifest = () =>
+        ownsSubmit() && (manifestReqSeqRef.current[key] ?? 0) === submitManifestSeq;
       if (mountedDramaRef.current === dramaId) {
         setPendingState({ dramaId, no });
       }
 
       const run = (async (): Promise<boolean> => {
+        await Promise.resolve();
         try {
           if (!useManifest) {
+            if (options?.expectedEpisodeId) {
+              try {
+                const prog = await getEpisodeProgram(dramaId, no, { silent: true });
+                if (prog.episodeId && prog.episodeId !== options.expectedEpisodeId) {
+                  if (pendingKeysRef.current.get(key) === pendingEntry) {
+                    pendingKeysRef.current.delete(key);
+                  }
+                  void options.onEpisodeStale?.();
+                  toast.error("当前分集已被替换，请刷新工作台后重试");
+                  return false;
+                }
+              } catch {
+                // 仅在确认 episode_id 不匹配时阻断旧版合成，瞬态探测失败不误杀既有路径。
+              }
+            }
             const input = buildComposeJobInput({
               episodeNo: no,
               composeRequestKey: pendingEntry.key,
+              expectedEpisodeId: options?.expectedEpisodeId,
             });
             const job = await submitJob(dramaId, input);
             useDramaJobsStore.getState().applyJob(dramaId, job);
@@ -411,27 +481,23 @@ export function useCompose(dramaId: string) {
             return true;
           }
 
-          let manifest = options?.manifest ?? null;
-          let submitManifestSeq = manifestReqSeqRef.current[key] ?? 0;
+          let manifest = supplied ?? null;
           if (!manifest || manifest.status === "preparing") {
             const { seq, signal, cleanup } = startManifestWait(key);
             submitManifestSeq = seq;
-            let res: Awaited<ReturnType<typeof waitForEpisodeManifest>>;
+            let res: Awaited<
+              ReturnType<typeof waitForEpisodeManifest | typeof waitForEpisodeManifestV2>
+            >;
             try {
-              res = await waitForEpisodeManifest(dramaId, no, {
+              res = await (v2 ? waitForEpisodeManifestV2 : waitForEpisodeManifest)(dramaId, no, {
                 signal,
-                isCancelled: () =>
-                  mountedDramaRef.current !== dramaId || manifestReqSeqRef.current[key] !== seq,
+                isCancelled: () => !ownsManifest(),
                 sleep: (ms) => sleepForManifestKey(key, seq, ms),
               });
             } finally {
               cleanup();
             }
-            if (
-              res.kind === "cancelled" ||
-              mountedDramaRef.current !== dramaId ||
-              manifestReqSeqRef.current[key] !== seq
-            ) {
+            if (res.kind === "cancelled" || !ownsManifest()) {
               if (pendingKeysRef.current.get(key) === pendingEntry) {
                 pendingKeysRef.current.delete(key);
               }
@@ -464,6 +530,20 @@ export function useCompose(dramaId: string) {
             manifest = loaded;
           }
 
+          if (manifestProgramDiagnostics(manifest).length || (v2 && !manifest.manifestHash)) {
+            if (pendingKeysRef.current.get(key) === pendingEntry)
+              pendingKeysRef.current.delete(key);
+            setManifestsState((prev) =>
+              patchManifestMap(prev, dramaId, no, () => ({
+                data: manifest,
+                loading: false,
+                error: null,
+                stale: false,
+              })),
+            );
+            return false;
+          }
+
           const actualResolvedIntent = `${basePreIntent}:${manifest.segmentVersion}:${manifest.manifestHash}`;
           if (
             pendingEntry.resolvedIntent !== null &&
@@ -490,16 +570,14 @@ export function useCompose(dramaId: string) {
             size,
             variants,
             composeRequestKey: pendingEntry.key,
+            expectedEpisodeId: options?.expectedEpisodeId,
           });
           const job = await submitJob(dramaId, input);
           useDramaJobsStore.getState().applyJob(dramaId, job);
           if (pendingKeysRef.current.get(key) === pendingEntry) {
             pendingKeysRef.current.delete(key);
           }
-          if (
-            mountedDramaRef.current === dramaId &&
-            (manifestReqSeqRef.current[key] ?? 0) === submitManifestSeq
-          ) {
+          if (ownsManifest()) {
             setManifestsState((prev) =>
               patchManifestMap(prev, dramaId, no, (cur) => {
                 if (
@@ -525,21 +603,40 @@ export function useCompose(dramaId: string) {
             if (pendingKeysRef.current.get(key) === pendingEntry) {
               pendingKeysRef.current.delete(key);
             }
-            await loadManifest(no);
-            if (mountedDramaRef.current === dramaId) {
+            if (!ownsSubmit()) return false;
+            if (!useManifest) {
+              await (options?.onEpisodeStale
+                ? options.onEpisodeStale()
+                : options?.onManifestStale?.(loadManifest));
+              toast.error("当前分集已被替换，请刷新工作台后重试");
+            } else if (ownsManifest()) {
+              const refresh = async (requestedNo: number, useV2 = v2) => {
+                if (!ownsManifest() || requestedNo !== no) return null;
+                const request = loadManifest(no, useV2, true);
+                const refreshSeq = manifestReqSeqRef.current[key];
+                const refreshed = await request;
+                if (refreshed && ownsSubmit() && manifestReqSeqRef.current[key] === refreshSeq) {
+                  toast.warning("分镜清单已更新，已为你刷新最新版本，请再次点击导出");
+                }
+                return refreshed;
+              };
+              await (options?.onManifestStale ? options.onManifestStale(refresh) : refresh(no));
+            }
+          } else {
+            if (!isTransientComposeError(e) && pendingKeysRef.current.get(key) === pendingEntry) {
+              pendingKeysRef.current.delete(key);
+            }
+            const issues = programDiagnosticsFrom(e);
+            if (issues.length && ownsManifest()) {
               setManifestsState((prev) =>
                 patchManifestMap(prev, dramaId, no, (cur) => ({
                   data: cur?.data ?? null,
                   loading: false,
-                  error: cur?.error ?? null,
-                  stale: true,
+                  error: null,
+                  stale: false,
+                  programDiagnostics: issues,
                 })),
               );
-            }
-            toast.warning("分镜清单已更新，已为你刷新最新版本，请再次点击导出");
-          } else {
-            if (!isTransientComposeError(e) && pendingKeysRef.current.get(key) === pendingEntry) {
-              pendingKeysRef.current.delete(key);
             }
             toast.error(dramaErrorMessage(e, "合成提交失败，请稍后重试"));
           }

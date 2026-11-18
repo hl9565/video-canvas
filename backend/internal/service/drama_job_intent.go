@@ -11,6 +11,7 @@ import (
 
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
+	"video-canvas/internal/pkg/idcodec"
 	"video-canvas/internal/pkg/jsonhash"
 	"video-canvas/internal/repository"
 )
@@ -27,6 +28,10 @@ func newDramaJobIntent(id uint64, approvalID *uint64, req *model.DramaJobReq) (*
 	if err := validateDramaJobRequest(req); err != nil {
 		return nil, err
 	}
+	// Agent 审批只授权生成，清空需要用户通过提交接口确认。
+	if approvalID != nil && req.ConfirmClear {
+		return nil, errcode.ErrInvalidParams
+	}
 	copyReq := *req
 	copyReq.Episodes = canonicalDramaEpisodes(req.Episodes)
 	compose := model.DramaComposeReq{}
@@ -35,14 +40,22 @@ func newDramaJobIntent(id uint64, approvalID *uint64, req *model.DramaJobReq) (*
 	}
 	compose.Variants = canonicalDramaVariants(compose.Variants)
 	copyReq.Compose = &compose
+	// 沿用编码后的分集主键形态，保持已有请求签名可重放。
 	sig, err := jsonhash.CanonicalSHA256(struct {
-		DramaID       uint64                `json:"drama_id"`
-		Step          string                `json:"step"`
-		Episodes      []int                 `json:"ordered_episodes"`
-		Ratio         string                `json:"ratio"`
-		RawMaxSeconds int                   `json:"raw_max_seconds"`
-		Compose       model.DramaComposeReq `json:"compose"`
-	}{id, req.Step, copyReq.Episodes, req.Ratio, req.MaxSeconds, compose})
+		DramaID                uint64                `json:"drama_id"`
+		Step                   string                `json:"step"`
+		Episodes               []int                 `json:"ordered_episodes"`
+		Ratio                  string                `json:"ratio"`
+		RawMaxSeconds          int                   `json:"raw_max_seconds"`
+		ExpectedEpisodeID      *idcodec.ID           `json:"expected_episode_id,omitempty"`
+		Compose                model.DramaComposeReq `json:"compose"`
+		ConfirmClear           bool                  `json:"confirm_clear,omitempty"`
+		ExpectedSegmentVersion *int64                `json:"expected_segment_version,omitempty"`
+	}{
+		DramaID: id, Step: req.Step, Episodes: copyReq.Episodes, Ratio: req.Ratio,
+		RawMaxSeconds: req.MaxSeconds, ExpectedEpisodeID: (*idcodec.ID)(req.ExpectedEpisodeID), Compose: compose,
+		ConfirmClear: req.ConfirmClear, ExpectedSegmentVersion: req.ExpectedSegmentVersion,
+	})
 	if err != nil {
 		return nil, errcode.ErrInvalidParams
 	}
@@ -54,7 +67,7 @@ func newDramaJobIntent(id uint64, approvalID *uint64, req *model.DramaJobReq) (*
 	return intent, nil
 }
 
-// validateDramaJobRequest 在查询前拒绝保留键及跨步骤合成参数；服务调用也执行 HTTP 同等校验。
+// validateDramaJobRequest 在查询前拒绝保留键和跨步骤参数；服务调用也执行 HTTP 同等校验。
 func validateDramaJobRequest(req *model.DramaJobReq) error {
 	if req == nil || len(req.ComposeRequestKey) > 96 || strings.HasPrefix(req.ComposeRequestKey, "approval:") {
 		return errcode.ErrInvalidParams
@@ -62,8 +75,26 @@ func validateDramaJobRequest(req *model.DramaJobReq) error {
 	if req.Step != "compose" && (req.ComposeRequestKey != "" || !emptyDramaCompose(req.Compose)) {
 		return errcode.ErrInvalidParams
 	}
+	if req.ExpectedEpisodeID != nil && req.Step != "storyboard" && req.Step != "compose" {
+		return errcode.ErrInvalidParams
+	}
+	if err := validateStoryboardClear(req); err != nil {
+		return err
+	}
 	if req.Compose != nil {
 		return validateDramaComposeRequest(req.Compose)
+	}
+	return nil
+}
+
+// validateStoryboardClear 片段版本只用于显式清空，必须同时提供目标身份。
+func validateStoryboardClear(req *model.DramaJobReq) error {
+	if !req.ConfirmClear && req.ExpectedSegmentVersion == nil {
+		return nil
+	}
+	if req.Step != "storyboard" || !req.ConfirmClear || req.ExpectedEpisodeID == nil ||
+		req.ExpectedSegmentVersion == nil || *req.ExpectedSegmentVersion < 0 {
+		return errcode.ErrInvalidParams
 	}
 	return nil
 }
@@ -166,9 +197,15 @@ func matchesDramaJobIntent(hit *model.DramaJob, i *dramaJobIntent) bool {
 		if json.Unmarshal(hit.InputJSON, &frozen) != nil {
 			return false
 		}
+		if r.ExpectedEpisodeID != nil && (frozen.EpisodeID == 0 || *r.ExpectedEpisodeID != frozen.EpisodeID) {
+			return false
+		}
 		c := r.Compose
 		return r.MaxSeconds == 0 && c.Size == "" && len(c.Variants) == 0 && c.ManifestHash == "" && (c.SegmentVersion == nil || *c.SegmentVersion == frozen.SegmentVersion)
 	case "storyboard":
+		if r.ExpectedEpisodeID != nil || r.ConfirmClear || r.ExpectedSegmentVersion != nil {
+			return false
+		}
 		var frozen dramaStoryboardInput
 		if json.Unmarshal(hit.InputJSON, &frozen) != nil {
 			return false

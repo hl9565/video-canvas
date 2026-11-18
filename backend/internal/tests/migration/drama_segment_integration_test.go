@@ -19,8 +19,8 @@ func TestDramaSegmentMigration_Upgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range names {
-		// 0027、9001、9002 依赖片段表，片段表要到升级步骤才建，所以一并留到后面
-		if strings.HasPrefix(name, "0018_") || strings.HasPrefix(name, "0027_") || strings.HasPrefix(name, "9001_") || strings.HasPrefix(name, "9002_") {
+		// 0027、9001、9002、9003 依赖片段表或短剧集表，片段表要到升级步骤才建，所以一并留到后面
+		if strings.HasPrefix(name, "0018_") || strings.HasPrefix(name, "0027_") || strings.HasPrefix(name, "9001_") || strings.HasPrefix(name, "9002_") || strings.HasPrefix(name, "9003_") {
 			continue
 		}
 		data, err := migrations.FS.ReadFile(name)

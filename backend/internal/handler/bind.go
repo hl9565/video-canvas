@@ -17,6 +17,7 @@ import (
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
 	"video-canvas/internal/pkg/response"
+	"video-canvas/internal/service"
 )
 
 // trans 把 validator 的校验错误翻译成中文。
@@ -94,6 +95,12 @@ func CanvasPathID(c *gin.Context) (uint64, bool) {
 func bindWith(c *gin.Context, err error) bool {
 	if err == nil {
 		return true
+	}
+	err = service.DramaContractError(err)
+	var businessErr *errcode.Error
+	if errors.As(err, &businessErr) {
+		response.Fail(c, err)
+		return false
 	}
 	response.Fail(c, errcode.ErrInvalidParams.WithMsg(bindErrMsg(err)))
 	return false

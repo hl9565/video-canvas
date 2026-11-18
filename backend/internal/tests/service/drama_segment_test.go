@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/videoframe"
+	"video-canvas/internal/repository"
 	"video-canvas/internal/service"
 	"video-canvas/internal/service/dramasegmentfake"
 )
@@ -73,6 +76,7 @@ func TestDramaSegmentService_TakesReconcileAndStatus(t *testing.T) {
 	node := "seg:" + idcodec.Encode(uint64(v.ID))
 	canvas := uint64(9)
 	output, _ := json.Marshal([]model.TaskOutput{{AssetID: 41, MediaType: "video"}})
+	r.Assets = map[uint64]model.Asset{41: {ID: 41, UserID: 1, Kind: model.KindVideo}}
 	r.Tasks = []model.GenerationTask{
 		{ID: 21, UserID: 1, CanvasProjectID: &canvas, NodeID: node, Kind: "video", Status: "succeeded", OutputJSON: output, CreatedAt: time.Unix(1, 0)},
 		{ID: 22, UserID: 1, CanvasProjectID: &canvas, NodeID: node, Kind: "video", Status: "running", CreatedAt: time.Unix(2, 0)},
@@ -219,5 +223,278 @@ func TestDramaSegmentService_ObserverIsolationAndUnknownErrors(t *testing.T) {
 	r.Err = want
 	if _, err := s.List(ctx, 1, 7, 1); !errors.Is(err, want) {
 		t.Fatalf("未知错误必须保留：%v", err)
+	}
+}
+
+type changingSegmentSnapshotRepo struct {
+	*dramasegmentfake.Repo
+	writes  int
+	reads   int
+	advance func()
+}
+
+func (r *changingSegmentSnapshotRepo) WithTx(ctx context.Context, fn func(repository.DramaTx) error) error {
+	r.writes++
+	return r.Repo.WithTx(ctx, fn)
+}
+
+func (r *changingSegmentSnapshotRepo) WithSnapshotTx(ctx context.Context, fn func(repository.DramaTx) error) error {
+	r.reads++
+	snapshot := *r.Repo
+	return fn(&changingSegmentSnapshotTx{DramaTx: &snapshot, advance: r.advance})
+}
+
+type changingSegmentSnapshotTx struct {
+	repository.DramaTx
+	advance func()
+}
+
+func (tx *changingSegmentSnapshotTx) Segments(ctx context.Context, user, episode uint64) ([]model.DramaSegment, error) {
+	rows, err := tx.DramaTx.Segments(ctx, user, episode)
+	if tx.advance != nil {
+		tx.advance()
+		tx.advance = nil
+	}
+	return rows, err
+}
+
+type segmentSnapshotAssetViews struct{}
+
+func (segmentSnapshotAssetViews) View(context.Context, uint64, uint64) (*model.AssetView, error) {
+	return nil, errors.New("asset metadata must be read through the snapshot")
+}
+
+func (segmentSnapshotAssetViews) ViewOf(_ context.Context, row *model.Asset) (*model.AssetView, error) {
+	return &model.AssetView{ID: row.ID, Kind: row.Kind, DurationMs: row.DurationMs}, nil
+}
+
+func TestDramaSegmentService_ListEpisodeReadsTasksLinksAndRunsFromOneSnapshot(t *testing.T) {
+	fake := dramasegmentfake.New()
+	fake.SegmentVersion = 4
+	chosen, canvas := uint64(21), uint64(9)
+	fake.Rows = []model.DramaSegment{
+		{BaseModel: model.BaseModel{ID: 101}, UserID: 1, EpisodeID: 10, Revision: 1, ChosenTaskID: &chosen},
+		{BaseModel: model.BaseModel{ID: 102}, UserID: 1, EpisodeID: 10, Revision: 1, Seq: 1},
+	}
+	fake.Tasks = []model.GenerationTask{{
+		ID: chosen, UserID: 1, Kind: model.KindVideo, CanvasProjectID: &canvas,
+		NodeID: "seg:" + idcodec.Encode(101), Status: model.TaskSucceeded,
+		OutputJSON: []byte(`[{"asset_id":41,"media_type":"video"}]`),
+	}}
+	fake.TakeLinks = []model.DramaSegmentTakeLink{{
+		UserID: 1, SegmentID: 101, TaskID: chosen, Origin: model.TakeOriginNative, QC: model.TakeQCAccepted,
+	}}
+	fake.FrameRuns = []model.DramaSegmentFrameRun{
+		{ID: 31, UserID: 1, SegmentID: 101, State: model.FrameRunStateCancelled, Revision: 1},
+		{ID: 32, UserID: 1, SegmentID: 102, State: model.FrameRunStateCancelled, Revision: 1},
+	}
+	fake.Assets = map[uint64]model.Asset{
+		41: {ID: 41, UserID: 1, Kind: model.KindVideo, DurationMs: 5000},
+	}
+	repo := &changingSegmentSnapshotRepo{Repo: fake}
+	repo.advance = func() {
+		task := fake.Tasks[0]
+		task.Status, task.OutputJSON = model.TaskFailed, nil
+		fake.Tasks = []model.GenerationTask{task}
+		fake.TakeLinks = nil
+		fake.Assets = map[uint64]model.Asset{
+			41: {ID: 41, UserID: 1, Kind: model.KindVideo, DurationMs: 2500},
+		}
+		fake.FrameRuns = []model.DramaSegmentFrameRun{
+			{ID: 33, UserID: 1, SegmentID: 101, State: model.FrameRunStateFailed, Revision: 2},
+		}
+	}
+	svc := service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: repo, Assets: segmentSnapshotAssetViews{}})
+	ep, views, err := svc.ListEpisode(t.Context(), 1, 7, 1)
+	if err != nil || ep.SegmentVersion != 4 || len(views) != 2 || repo.reads != 1 || repo.writes != 0 {
+		t.Fatalf("expected one read-only snapshot, got %d reads and %d writes: %+v %v", repo.reads, repo.writes, views, err)
+	}
+	if take := views[0].Takes; len(take) != 1 || take[0].Status != model.TaskSucceeded ||
+		take[0].QC != string(model.TakeQCAccepted) || take[0].Asset == nil || take[0].Asset.ID != 41 || take[0].Asset.DurationMs != 5000 {
+		t.Fatalf("take details crossed snapshot boundary: %+v", take)
+	}
+	if views[0].FrameRun == nil || views[0].FrameRun.ID != 31 || views[0].FrameRun.Revision != 1 ||
+		views[1].FrameRun == nil || views[1].FrameRun.ID != 32 {
+		t.Fatalf("frame runs crossed snapshot boundary: %+v", views)
+	}
+}
+
+type contendedAfterCommitRepo struct {
+	*dramasegmentfake.Repo
+	writes      int
+	snapshotErr error
+}
+
+func (r *contendedAfterCommitRepo) WithTx(ctx context.Context, fn func(repository.DramaTx) error) error {
+	r.writes++
+	if r.writes > 1 {
+		return errors.New("unexpected post-commit write locks")
+	}
+	return r.Repo.WithTx(ctx, fn)
+}
+
+func (r *contendedAfterCommitRepo) WithSnapshotTx(ctx context.Context, fn func(repository.DramaTx) error) error {
+	if r.snapshotErr != nil {
+		return r.snapshotErr
+	}
+	return r.Repo.WithSnapshotTx(ctx, fn)
+}
+
+func TestDramaSegmentService_CommittedDeleteAndOrderSurviveFollowUpListContention(t *testing.T) {
+	for _, snapshotErr := range []error{nil, context.DeadlineExceeded} {
+		name := "read-only projection"
+		if snapshotErr != nil {
+			name = "snapshot timed out"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			fake := dramasegmentfake.New()
+			fake.SegmentVersion = 1
+			fake.Rows = []model.DramaSegment{
+				{BaseModel: model.BaseModel{ID: 101}, UserID: 1, EpisodeID: 10, Seq: 0, Seconds: 5, Prompt: "A", Revision: 1},
+				{BaseModel: model.BaseModel{ID: 102}, UserID: 1, EpisodeID: 10, Seq: 1, Seconds: 4, Prompt: "B", Revision: 1},
+				{BaseModel: model.BaseModel{ID: 103}, UserID: 1, EpisodeID: 10, Seq: 2, Seconds: 6, Prompt: "C", Revision: 1},
+			}
+			chosen, canvas := uint64(21), uint64(9)
+			fake.Rows[1].ChosenTaskID = &chosen
+			fake.Tasks = []model.GenerationTask{{
+				ID: chosen, UserID: 1, Kind: model.KindVideo, CanvasProjectID: &canvas,
+				NodeID: "seg:" + idcodec.Encode(102), Status: model.TaskSucceeded,
+				OutputJSON: []byte(`[{"asset_id":41,"media_type":"video"}]`),
+			}}
+			fake.Assets = map[uint64]model.Asset{
+				41: {ID: 41, UserID: 1, Kind: model.KindVideo, Sha256: strings.Repeat("a", 64)},
+			}
+			fake.FrameRuns = []model.DramaSegmentFrameRun{
+				{ID: 31, UserID: 1, SegmentID: 102, State: model.FrameRunStateBound, Revision: 3},
+			}
+			repo := &contendedAfterCommitRepo{Repo: fake, snapshotErr: snapshotErr}
+			probe := model.AssetMediaProbe{
+				AssetID: 41, Sha256: fake.Assets[41].Sha256, ProbeVersion: videoframe.NormalizedProbeVersion, NormalizedFrames24: 96,
+			}
+			fake.MediaProbes = map[uint64]model.AssetMediaProbe{41: probe}
+			probes := &segmentProbeCache{row: &probe}
+			svc := service.NewDramaSegmentService(service.DramaSegmentDeps{
+				Repo: repo, Assets: segmentSnapshotAssetViews{}, Broadcaster: fake, Probes: probes,
+			})
+
+			views, err := svc.Order(ctx, 1, 7, 1, &model.OrderDramaSegmentsReq{IDs: []idcodec.ID{103, 101, 102}})
+			if err != nil || repo.writes != 1 {
+				t.Fatalf("Order must succeed with one write transaction; got %d: %v", repo.writes, err)
+			}
+			if len(views) != 3 || views[0].ID != 103 || views[1].ID != 101 || views[2].ID != 102 {
+				t.Fatalf("Order must return the committed membership and order: %+v", views)
+			}
+			for i, view := range views {
+				if view.Seq != i || view.Revision != 2 || view.EpisodeID != idcodec.Encode(10) || view.SegmentVersion != 2 {
+					t.Fatalf("Order returned incorrect committed row %d: %+v", i, view)
+				}
+			}
+
+			assertCommittedClip(t, views[2], chosen, 31, 96)
+			assertPublishedClip(t, fake, 102, 2, chosen, 31, 96)
+
+			repo.writes = 0
+			fake.Messages = nil
+			if err := svc.Delete(ctx, 1, 101); err != nil || repo.writes != 1 {
+				t.Fatalf("Delete must succeed with one write transaction; got %d: %v", repo.writes, err)
+			}
+			assertPublishedClip(t, fake, 102, 3, chosen, 31, 96)
+			repo.snapshotErr = nil
+			ep, after, err := svc.ListEpisode(ctx, 1, 7, 1)
+			if err != nil || len(after) != 2 || after[0].ID != 103 || after[1].ID != 102 || ep.SegmentVersion != 3 {
+				t.Fatalf("Delete did not preserve the committed state: ep=%+v views=%+v err=%v", ep, after, err)
+			}
+		})
+	}
+}
+
+func assertCommittedClip(t *testing.T, v model.DramaSegmentView, chosen, run uint64, frames int32) {
+	t.Helper()
+	if v.ChosenTaskID != idcodec.Encode(chosen) || len(v.Takes) != 1 ||
+		v.Takes[0].Asset == nil || v.Takes[0].Status != model.TaskSucceeded ||
+		v.FrameRun == nil || uint64(v.FrameRun.ID) != run ||
+		v.SourceFrameCount == nil || *v.SourceFrameCount != frames {
+		t.Fatalf("committed clip lost its adopted take or frames: %+v", v)
+	}
+}
+
+func assertPublishedClip(t *testing.T, feed *dramasegmentfake.Repo, segment uint64, version int64, chosen, run uint64, frames int32) {
+	t.Helper()
+	for _, msg := range feed.Messages {
+		raw, err := json.Marshal(msg.Data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var event struct {
+			Segment model.DramaSegmentView `json:"segment"`
+		}
+		if err := json.Unmarshal(raw, &event); err != nil {
+			t.Fatal(err)
+		}
+		if uint64(event.Segment.ID) == segment && event.Segment.SegmentVersion == version {
+			assertCommittedClip(t, event.Segment, chosen, run, frames)
+			return
+		}
+	}
+	t.Fatalf("no event for clip %d at version %d", segment, version)
+}
+
+type segmentTakeReadFailureRepo struct {
+	*dramasegmentfake.Repo
+	err error
+}
+
+func (r segmentTakeReadFailureRepo) WithTx(ctx context.Context, fn func(repository.DramaTx) error) error {
+	return r.Repo.WithTx(ctx, func(tx repository.DramaTx) error {
+		return fn(failingSegmentTakeReadTx{DramaTx: tx, err: r.err})
+	})
+}
+
+type failingSegmentTakeReadTx struct {
+	repository.DramaTx
+	err error
+}
+
+func (tx failingSegmentTakeReadTx) SegmentTasks(context.Context, uint64, uint64, string) ([]model.GenerationTask, error) {
+	return nil, tx.err
+}
+
+func TestDramaSegmentService_ProjectionFailureRollsBackWithoutBroadcast(t *testing.T) {
+	for _, method := range []string{"order", "delete"} {
+		t.Run(method, func(t *testing.T) {
+			ctx := t.Context()
+			fake := matrixTakeRepo(takeMatrixCase{chosen: true})
+			fake.Rows = append(fake.Rows, model.DramaSegment{
+				BaseModel: model.BaseModel{ID: 2}, UserID: 1, EpisodeID: 10, Seq: 1, Revision: 1,
+			})
+			failure := errors.New("take query unavailable")
+			svc := service.NewDramaSegmentService(service.DramaSegmentDeps{
+				Repo: segmentTakeReadFailureRepo{Repo: fake, err: failure}, Assets: fake, Broadcaster: fake,
+			})
+			var err error
+			if method == "order" {
+				_, err = svc.Order(ctx, 1, 7, 1, &model.OrderDramaSegmentsReq{IDs: []idcodec.ID{2, 1}})
+			} else {
+				err = svc.Delete(ctx, 1, 2)
+			}
+			if !errors.Is(err, failure) || len(fake.Messages) != 0 || len(fake.Rows) != 2 ||
+				fake.Rows[0].ID != 1 || fake.Rows[0].Seq != 0 || fake.SegmentVersion != 17 {
+				t.Fatalf("incomplete projection must not commit or publish: rows=%+v events=%v err=%v", fake.Rows, fake.Messages, err)
+			}
+		})
+	}
+}
+
+func TestDramaSegmentService_RecoveryNeverUsesOuterAssetReader(t *testing.T) {
+	fake := matrixTakeRepo(takeMatrixCase{adopt: true})
+	svc := service.NewDramaSegmentService(service.DramaSegmentDeps{
+		Repo: fake, Assets: segmentSnapshotAssetViews{},
+	})
+	ep, clips, err := svc.ListEpisode(t.Context(), 1, 7, 1)
+	if err != nil || len(clips) != 1 || clips[0].ChosenTaskID != idcodec.Encode(21) ||
+		clips[0].FrameRun == nil || clips[0].FrameRun.State != model.FrameRunStateBound ||
+		ep.SegmentVersion != 18 {
+		t.Fatalf("recovery must adopt the take and bind the run using the transaction's asset reader: %+v %v", clips, err)
 	}
 }

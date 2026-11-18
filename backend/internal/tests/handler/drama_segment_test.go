@@ -1,6 +1,7 @@
 package handler_test
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -36,6 +37,11 @@ func segmentHTTP() (*gin.Engine, *dramasegmentfake.Repo) {
 func TestDramaSegmentHandler_Contracts(t *testing.T) {
 	r, _ := segmentHTTP()
 	projectSegments := "/dramas/" + idcodec.Encode(7) + "/episodes/1/segments"
+	emptyStatus, emptyBody := characterCall(t, r, "GET", projectSegments, "")
+	if emptyStatus != 200 || responseData(t, emptyBody)["episode_id"] != idcodec.Encode(10) ||
+		responseData(t, emptyBody)["segment_version"] != float64(0) || len(responseData(t, emptyBody)["items"].([]any)) != 0 {
+		t.Fatalf("空列表也应返回分集身份与版本：status=%d body=%+v", emptyStatus, emptyBody)
+	}
 	status, body := characterCall(t, r, "POST", projectSegments, `{}`)
 	if status != 201 || responseCode(t, body) != 0 || responseData(t, body)["status"] != "idle" {
 		t.Fatalf("创建：status=%d body=%+v", status, body)
@@ -140,6 +146,56 @@ func TestDramaSegmentHandler_Quote(t *testing.T) {
 		status, got := characterCall(t, r, "POST", tc.path, tc.body)
 		if status != tc.status || responseCode(t, got) != tc.code {
 			t.Fatalf("status=%d body=%+v", status, got)
+		}
+	}
+}
+
+func TestDramaSegmentHandler_EpisodeIdentityOnHTTPAndWS(t *testing.T) {
+	r, repo := segmentHTTP()
+	path := "/dramas/" + idcodec.Encode(7) + "/episodes/1/segments"
+	_, created := characterCall(t, r, "POST", path, `{"prompt":"分镜"}`)
+	segment := responseData(t, created)
+	id := segment["id"].(string)
+	want := idcodec.Encode(10)
+	if segment["episode_id"] != want {
+		t.Fatalf("create identity: %+v", segment)
+	}
+	for _, tc := range []struct {
+		method, path, body string
+		list               bool
+	}{
+		{"PATCH", "/drama-segments/" + id, `{"revision":1,"prompt":"修改"}`, false},
+		{"POST", "/drama-segments/" + id + "/adapt", `{"revision":2,"format":"h3"}`, false},
+		{"PUT", path + "/order", `{"ids":["` + id + `"]}`, true},
+		{"GET", path, "", true},
+	} {
+		status, body := characterCall(t, r, tc.method, tc.path, tc.body)
+		if status != 200 {
+			t.Fatalf("%s %s: %d %+v", tc.method, tc.path, status, body)
+		}
+		row := responseData(t, body)
+		if tc.list {
+			row = row["items"].([]any)[0].(map[string]any)
+		}
+		if row["episode_id"] != want {
+			t.Fatalf("%s identity: %+v", tc.method, row)
+		}
+	}
+	for _, msg := range repo.Messages {
+		if msg.Type != "drama.segment" {
+			continue
+		}
+		bytes, err := json.Marshal(msg.Data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var event struct {
+			Segment struct {
+				EpisodeID string `json:"episode_id"`
+			} `json:"segment"`
+		}
+		if err := json.Unmarshal(bytes, &event); err != nil || event.Segment.EpisodeID != want {
+			t.Fatalf("WS identity: %s (%v)", bytes, err)
 		}
 	}
 }

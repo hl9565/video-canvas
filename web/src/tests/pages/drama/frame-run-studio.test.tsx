@@ -99,6 +99,28 @@ const task = {
   credits: 10,
 };
 
+const confirmedRun = makeRun({ state: "confirmed", revision: 4, confirmed_version: 1 });
+const pendingRun = makeRun({
+  state: "video_pending",
+  revision: 6,
+  confirmed_version: 1,
+  video_task_id: task.id,
+});
+const adoptedTake = {
+  task_id: "adopted",
+  status: "succeeded",
+  asset: { id: 2, kind: "video", url: "/adopted.mp4" },
+  error_message: "",
+  created_at: "2026-11-17T10:01:00Z",
+} as const;
+const completedSegment = (videoResolved = false): BackendSegmentView => ({
+  ...rawSegment(),
+  chosen_task_id: adoptedTake.task_id,
+  takes: videoResolved ? [adoptedTake, { ...adoptedTake, task_id: task.id }] : [adoptedTake],
+  status: "done",
+  frame_run: confirmedRun,
+});
+
 beforeAll(async () => {
   dom = await installDom();
 });
@@ -475,6 +497,124 @@ describe("首帧控镜与普通视频生成", () => {
       await mounted.unmount();
     }
   });
+
+  test.each([
+    ["queued", "running", false],
+    ["finalizing", "running", false],
+    ["succeeded", "done", false],
+    ["queued", "done", true],
+  ] as const)(
+    "a %s video task updates an adopted clip to %s before the delayed list",
+    async (taskStatus, status, videoResolved) => {
+      const oldSegment = completedSegment(videoResolved);
+      let finishList!: () => void;
+      const delayedList = new Promise<void>((resolve) => {
+        finishList = resolve;
+      });
+      let listReads = 0;
+      const get = service.get;
+      spies.push(
+        spyOn(service, "get").mockImplementation(async (url, ...args) => {
+          if (!url.endsWith("/segments")) return get(url, ...args);
+          if (++listReads > 1) await delayedList;
+          return { items: [oldSegment] } as never;
+        }),
+        spyOn(service, "post").mockResolvedValue({
+          run: pendingRun,
+          task: { ...task, status: taskStatus },
+        }),
+      );
+      const schedule = spyOn(globalThis, "setInterval");
+      spies.push(schedule);
+      let studio!: Studio;
+      const mounted = await dom.mount(
+        <Harness
+          open={false}
+          onStudio={(value) => {
+            studio = value;
+          }}
+        />,
+      );
+      try {
+        await waitFor(() => studio.selected?.status === "done");
+        await dom.act(async () => {
+          await studio.frameRunActions.submit("s1", confirmedRun.id, {
+            revision: confirmedRun.revision,
+            confirmedVersion: confirmedRun.confirmed_version,
+          });
+        });
+        expect(studio.selected).toMatchObject({
+          status,
+          frameRun: { state: "video_pending", revision: 6 },
+        });
+        await dom.act(async () => {
+          finishList();
+        });
+        expect(studio.selected).toMatchObject({
+          status,
+          frameRun: { state: "video_pending", revision: 6 },
+        });
+
+        const poll = schedule.mock.calls.find(([, interval]) => interval === 8000)?.[0];
+        expect(Boolean(poll)).toBe(status === "running");
+        if (poll) {
+          const readsBeforePoll = listReads;
+          await dom.act(async () => {
+            poll();
+          });
+          expect(listReads).toBe(readsBeforePoll + 1);
+        }
+      } finally {
+        finishList();
+        await mounted.unmount();
+      }
+    },
+  );
+
+  test.each([
+    ["an older confirmed run", confirmedRun, false, "running"],
+    ["no run", null, false, "running"],
+    ["an already completed take", confirmedRun, true, "done"],
+  ] as const)(
+    "refresh keeps %s consistent with the latest video run",
+    async (_name, oldRun, resolved, status) => {
+      const oldSegment = {
+        ...completedSegment(resolved),
+        frame_run: oldRun,
+      };
+      const get = service.get;
+      spies.push(
+        spyOn(service, "get").mockImplementation(async (url, ...args) => {
+          if (url.endsWith("/segments")) return { items: [oldSegment] } as never;
+          if (url === "/drama-segments/s1") return oldSegment as never;
+          if (url.endsWith("/frame-runs/r1")) return pendingRun as never;
+          return get(url, ...args);
+        }),
+      );
+      let studio!: Studio;
+      const mounted = await dom.mount(
+        <Harness
+          open={false}
+          onStudio={(value) => {
+            studio = value;
+          }}
+        />,
+      );
+      try {
+        await waitFor(() => studio.selected?.status === "done");
+        await dom.act(async () => {
+          await studio.frameRunActions.refresh("s1", pendingRun.id);
+        });
+        expect(studio.selected).toMatchObject({
+          status,
+          frameRun: { state: "video_pending", revision: 6 },
+        });
+      } finally {
+        await mounted.unmount();
+      }
+    },
+  );
+
   test("画布返回链接自动选中片段并打开指定历史流程，广播、焦点与可见性同步最新首帧", async () => {
     dom.win.history.replaceState(
       null,

@@ -19,6 +19,8 @@ type DramaTx interface {
 	TasksByIDs(context.Context, uint64, []uint64) ([]model.GenerationTask, error)
 	// ComposeAsset 按用户读取事务内合成素材元数据，缺失返回 ErrNotFound。
 	ComposeAsset(context.Context, uint64, uint64) (*model.Asset, error)
+	// SegmentVideoProbe 按视频素材指纹和探针版本读取当前事务的规范帧数缓存。
+	SegmentVideoProbe(context.Context, uint64, string, int16) (*model.AssetMediaProbe, error)
 	// RecentDramaBatches 读取最近三次成功规划或拆解的范围，不加载原文及快照。
 	RecentDramaBatches(context.Context, uint64, uint64) ([]model.DramaJob, error)
 	// Canvas 在当前事务按用户读取实时资产画布。
@@ -109,6 +111,14 @@ func (r *DramaRepository) SetEnqueuer(e DramaEnqueuer) { r.enq = e }
 // WithTx 只通过此入口创建短剧事务。
 func (r *DramaRepository) WithTx(ctx context.Context, fn func(DramaTx) error) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error { return fn(&DramaRepository{db: tx, enq: r.enq}) })
+}
+
+// WithSnapshotTx 在只读可重复读事务中读取多表快照，避免跨语句看到不同提交。
+func (r *DramaRepository) WithSnapshotTx(ctx context.Context, fn func(DramaTx) error) error {
+	return r.db.WithContext(ctx).Transaction(
+		func(tx *gorm.DB) error { return fn(&DramaRepository{db: tx, enq: r.enq}) },
+		&sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true},
+	)
 }
 
 // List 按用户、标题分页读取，更新时间倒序。
@@ -213,7 +223,7 @@ func (r *DramaRepository) Episodes(ctx context.Context, userID, id uint64) ([]mo
 	return rows, err
 }
 
-// SaveEpisode 新建集或按用户和revision更新，冲突返回ErrStateConflict。
+// SaveEpisode 新建集或按用户和 revision 更新，冲突返回 ErrStateConflict。节目单只由 SaveEpisodeProgram 更新。
 func (r *DramaRepository) SaveEpisode(ctx context.Context, e *model.DramaEpisode, revision int64) error {
 	if e.ID == 0 {
 		return r.db.WithContext(ctx).Create(e).Error
@@ -349,4 +359,9 @@ func (r *DramaRepository) ComposeAsset(ctx context.Context, user, id uint64) (*m
 	var asset model.Asset
 	err := r.db.WithContext(ctx).Where("user_id = ? AND id = ?", user, id).First(&asset).Error
 	return &asset, translate(err)
+}
+
+// SegmentVideoProbe 按素材 ID、指纹和版本读取缓存，未命中返回 ErrNotFound。
+func (r *DramaRepository) SegmentVideoProbe(ctx context.Context, assetID uint64, sha256 string, version int16) (*model.AssetMediaProbe, error) {
+	return NewAssetMediaProbeRepository(r.db).Get(ctx, assetID, sha256, version)
 }

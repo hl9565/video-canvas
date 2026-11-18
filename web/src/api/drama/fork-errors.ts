@@ -12,6 +12,12 @@ export const FORK_ERR = {
   frameRunInconsistent: 91006,
   takeQcRejected: 91007,
   frameInvalid: 91008,
+  programInvalid: 91009,
+  anchorInvalid: 91010,
+  visualInvalid: 91011,
+  mediaUnavailable: 91012,
+  loudnessInvalid: 91013,
+  assetInUse: 91014,
 } as const;
 
 /** Fork 错误的兜底文案；需要具体参数原因时，由 errors.ts 优先展示后端 Msg。 */
@@ -25,4 +31,10 @@ export const FORK_ERROR_FALLBACK = {
   [FORK_ERR.frameRunInconsistent]: "首帧控镜任务归属或确认快照不一致",
   [FORK_ERR.takeQcRejected]: "该候选已被驳回，无法直接采用",
   [FORK_ERR.frameInvalid]: "首帧素材无效或尚未就绪",
+  [FORK_ERR.programInvalid]: "节目单参数或结构不合法",
+  [FORK_ERR.anchorInvalid]: "节目锚点已失效",
+  [FORK_ERR.visualInvalid]: "分镜视觉模式或特效参数不合法",
+  [FORK_ERR.mediaUnavailable]: "引用素材不可用或已变更",
+  [FORK_ERR.loudnessInvalid]: "成片混音未达到响度或真峰交付标准",
+  [FORK_ERR.assetInUse]: "素材正被剧集引用，无法执行此操作",
 } as const;

@@ -9,6 +9,7 @@ import (
 type Error struct {
 	Code   int
 	Msg    string
+	Data   any // 可选的公开诊断数据。
 	status int
 }
 
@@ -24,7 +25,16 @@ func (e *Error) HTTPStatus() int { return e.status }
 
 // WithMsg 返回一个替换了提示文案的副本，不修改预定义的错误。
 func (e *Error) WithMsg(msg string) *Error {
-	return &Error{Code: e.Code, Msg: msg, status: e.status}
+	clone := *e
+	clone.Msg = msg
+	return &clone
+}
+
+// WithData 返回一个附有公开诊断数据的副本，不修改预定义的错误。
+func (e *Error) WithData(data any) *Error {
+	clone := *e
+	clone.Data = data
+	return &clone
 }
 
 // 通用错误 1xxxx

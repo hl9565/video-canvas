@@ -128,6 +128,34 @@ describe("api/drama：请求体", () => {
       ratio: "9:16",
     });
   });
+  test("分镜确认清空保留版本 0，普通剧本请求仍只发送原有字段", () => {
+    expect(
+      toJobBody({
+        step: "storyboard",
+        episodes: [1],
+        maxSeconds: 15,
+        expectedEpisodeId: "ep-a",
+        confirmClear: true,
+        expectedSegmentVersion: 0,
+      }),
+    ).toEqual({
+      step: "storyboard",
+      episodes: [1],
+      max_seconds: 15,
+      expected_episode_id: "ep-a",
+      confirm_clear: true,
+      expected_segment_version: 0,
+    });
+    expect(toJobBody({ step: "storyboard", episodes: [1], expectedEpisodeId: "" })).toEqual({
+      step: "storyboard",
+      episodes: [1],
+      expected_episode_id: "",
+    });
+    expect(toJobBody({ step: "scripts", episodes: [1, 2] })).toEqual({
+      step: "scripts",
+      episodes: [1, 2],
+    });
+  });
 });
 
 describe("api/drama：请求", () => {

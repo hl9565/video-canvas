@@ -18,18 +18,18 @@ func NewDramaSegmentHandler(svc *service.DramaSegmentService) *DramaSegmentHandl
 	return &DramaSegmentHandler{svc: svc}
 }
 
-// List 按seq返回用户分集的完整片段视图。
+// List 按seq返回用户分集的身份、版本和完整片段视图。
 func (h *DramaSegmentHandler) List(c *gin.Context) {
 	id, no, ok := dramaEpisodePath(c)
 	if !ok {
 		return
 	}
-	items, err := h.svc.List(c.Request.Context(), currentUserID(c), id, no)
+	ep, items, err := h.svc.ListEpisode(c.Request.Context(), currentUserID(c), id, no)
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-	response.OK(c, gin.H{"items": items})
+	response.OK(c, gin.H{"episode_id": idcodec.ID(ep.ID), "segment_version": ep.SegmentVersion, "items": items})
 }
 
 // Get 返回单段完整视图及最新首帧流程。

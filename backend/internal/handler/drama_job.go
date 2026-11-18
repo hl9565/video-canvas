@@ -9,22 +9,43 @@ import (
 	"video-canvas/internal/pkg/response"
 )
 
+// bindDramaJobReq 在 HTTP 边界解码分集主键；空串保留为 0，由项目锁内的身份校验拒绝。
+func bindDramaJobReq(c *gin.Context) (*model.DramaJobReq, bool) {
+	var wire struct {
+		model.DramaJobReq
+		ExpectedEpisodeID *idcodec.ID `json:"expected_episode_id"`
+		ConfirmClear      *bool       `json:"confirm_clear"`
+	}
+	if !BindJSON(c, &wire) {
+		return nil, false
+	}
+	if wire.ConfirmClear != nil {
+		if wire.Step != "storyboard" {
+			response.Fail(c, errcode.ErrInvalidParams)
+			return nil, false
+		}
+		wire.DramaJobReq.ConfirmClear = *wire.ConfirmClear
+	}
+	wire.DramaJobReq.ExpectedEpisodeID = (*uint64)(wire.ExpectedEpisodeID)
+	return &wire.DramaJobReq, true
+}
+
 // Estimate 返回所选步骤的积分估算，前置和模型规则与实际提交一致。
 func (h *DramaHandler) Estimate(c *gin.Context) {
 	id, ok := CanvasPathID(c)
 	if !ok {
 		return
 	}
-	var req model.DramaJobReq
-	if !BindJSON(c, &req) {
+	req, ok := bindDramaJobReq(c)
+	if !ok {
 		return
 	}
-	credits, err := h.svc.Estimate(c.Request.Context(), currentUserID(c), id, &req)
+	credits, err := h.svc.Estimate(c.Request.Context(), currentUserID(c), id, req)
 	if err != nil {
 		response.Fail(c, err)
 		return
 	}
-	gaps, err := h.svc.ScriptGaps(c.Request.Context(), currentUserID(c), id, &req)
+	gaps, err := h.svc.ScriptGaps(c.Request.Context(), currentUserID(c), id, req)
 	if err != nil {
 		response.Fail(c, err)
 		return
@@ -38,11 +59,11 @@ func (h *DramaHandler) CreateJob(c *gin.Context) {
 	if !ok {
 		return
 	}
-	var req model.DramaJobReq
-	if !BindJSON(c, &req) {
+	req, ok := bindDramaJobReq(c)
+	if !ok {
 		return
 	}
-	v, err := h.svc.CreateJob(c.Request.Context(), currentUserID(c), id, &req)
+	v, err := h.svc.CreateJob(c.Request.Context(), currentUserID(c), id, req)
 	if err != nil {
 		response.Fail(c, err)
 		return

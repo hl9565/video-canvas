@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -13,6 +12,7 @@ import (
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/logger"
+	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/provider"
 	"video-canvas/internal/repository"
 
@@ -44,15 +44,17 @@ type DramaComposeAssets interface {
 
 // dramaComposeInput 固定提交时的采用、跳过列表与片段版本，重试不能改用后来选中的 take。
 type dramaComposeInput struct {
-	EpisodeID      uint64                      `json:"episode_id"`
-	SegmentVersion int64                       `json:"segment_version"`
-	AssetIDs       []uint64                    `json:"asset_ids"`
-	SkippedSeqs    []int                       `json:"skipped_seqs"`
-	Manifest       *model.DramaEpisodeManifest `json:"manifest,omitempty"`
-	ManifestHash   string                      `json:"manifest_hash,omitempty"`
-	AspectRatio    string                      `json:"aspect_ratio,omitempty"`
-	Size           string                      `json:"size,omitempty"`
-	Variants       []string                    `json:"variants,omitempty"`
+	EpisodeID      uint64                        `json:"episode_id"`
+	SegmentVersion int64                         `json:"segment_version"`
+	AssetIDs       []uint64                      `json:"asset_ids"`
+	SkippedSeqs    []int                         `json:"skipped_seqs"`
+	Manifest       *model.DramaEpisodeManifest   `json:"manifest,omitempty"`
+	ManifestV2     *model.DramaEpisodeManifestV2 `json:"manifest_v2,omitempty"`
+	RenderVersion  int                           `json:"render_version,omitempty"`
+	ManifestHash   string                        `json:"manifest_hash,omitempty"`
+	AspectRatio    string                        `json:"aspect_ratio,omitempty"`
+	Size           string                        `json:"size,omitempty"`
+	Variants       []string                      `json:"variants,omitempty"`
 }
 
 // composeChosenAsset 复用片段任务输出解析，成功任务也必须有已转存的视频素材。
@@ -76,7 +78,7 @@ func composeChosenAsset(tasks []model.GenerationTask, chosen uint64) (uint64, er
 func (s *DramaService) handleCompose(ctx context.Context, run *dramaRun) error {
 	workCtx, cancel := context.WithTimeout(ctx, dramaComposeTimeout)
 	defer cancel()
-	assets, input, err := s.renderCompose(workCtx, run.job)
+	assets, input, report, err := s.renderCompose(workCtx, run.job)
 	committed := false
 	defer func() {
 		if !committed && len(assets) > 0 {
@@ -86,53 +88,80 @@ func (s *DramaService) handleCompose(ctx context.Context, run *dramaRun) error {
 	if err != nil {
 		return s.failDrama(ctx, run.job, err)
 	}
-	committed, err = s.commitCompose(ctx, run.job, assets, input)
+	committed, err = s.commitCompose(ctx, run.job, assets, input, report)
 	if committed {
 		logger.RunOf(ctx).End(logger.StatusSucceeded, zap.Int("segments", len(input.AssetIDs)), zap.Ints("skipped_seqs", input.SkippedSeqs))
 	}
 	return err
 }
 
-// renderCompose 下载并渲染旧整段或新版冻结清单；错误不泄露本地路径。
-func (s *DramaService) renderCompose(ctx context.Context, job *model.DramaJob) ([]*model.Asset, *dramaComposeInput, error) {
+// renderCompose 下载并渲染冻结输入，再暂存全部变体；上传失败仍返回已暂存对象。
+func (s *DramaService) renderCompose(ctx context.Context, job *model.DramaJob) ([]*model.Asset, *dramaComposeInput, *model.DramaComposeExportReport, error) {
 	if s.compose == nil || s.assets == nil {
-		return nil, nil, errcode.ErrInternal.WithMsg("转码失败：合成服务未配置")
+		return nil, nil, nil, errcode.ErrInternal.WithMsg("转码失败：合成服务未配置")
 	}
 	var input dramaComposeInput
-	if err := json.Unmarshal(job.InputJSON, &input); err != nil || len(input.AssetIDs) == 0 {
-		return nil, nil, errcode.ErrInternal.WithMsg("转码失败：合成输入不可用")
+	if err := json.Unmarshal(job.InputJSON, &input); err != nil || !input.hasComposeMedia() {
+		return nil, nil, nil, errcode.ErrInternal.WithMsg("转码失败：合成输入不可用")
 	}
 	dir, err := os.MkdirTemp("", "vc-drama-compose-*")
 	if err != nil {
-		return nil, nil, withCause(errcode.ErrInternal.WithMsg("转码失败：无法创建临时目录"), err, "compose_transcode")
+		return nil, nil, nil, withCause(errcode.ErrInternal.WithMsg("转码失败：无法创建临时目录"), err, "compose_transcode")
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	destinations := []string{filepath.Join(dir, "final.mp4")}
-	if input.Manifest != nil {
-		destinations = make([]string, len(input.Variants))
-		for i := range destinations {
-			destinations[i] = filepath.Join(dir, fmt.Sprintf("final-%d.mp4", i))
-		}
-		err = s.renderFrozenManifest(ctx, job.UserID, &input, dir, destinations, nil)
-	} else {
-		err = s.renderLegacyCompose(ctx, job, dir, destinations[0], &input)
-	}
+	destinations, report, err := s.renderComposeFiles(ctx, job, &input, dir)
 	if err != nil {
 		var business *errcode.Error
 		if errors.As(err, &business) {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		return nil, nil, withCause(errcode.ErrInternal.WithMsg("转码失败：无法合成视频"), err, "compose_transcode")
+		return nil, nil, nil, withCause(errcode.ErrInternal.WithMsg("转码失败：无法合成视频"), err, "compose_transcode")
 	}
+	assets, err := s.prepareComposeExports(ctx, job.UserID, destinations)
+	return assets, &input, report, err
+}
+
+// hasComposeMedia 根据冻结版本判断输入；纯黑场和静帧没有视频素材 ID。
+func (input *dramaComposeInput) hasComposeMedia() bool {
+	if input.ManifestV2 != nil {
+		return input.RenderVersion == model.CurrentDramaManifestV2RenderVersion && len(input.ManifestV2.Clips) != 0 && len(input.Variants) != 0
+	}
+	return len(input.AssetIDs) != 0
+}
+
+// renderComposeFiles 由冻结清单类型选择渲染器；不从当前集推断历史任务版本。
+func (s *DramaService) renderComposeFiles(ctx context.Context, job *model.DramaJob, input *dramaComposeInput, dir string) ([]string, *model.DramaComposeExportReport, error) {
+	if input.Manifest == nil && input.ManifestV2 == nil {
+		dst := filepath.Join(dir, "final.mp4")
+		return []string{dst}, nil, s.renderLegacyCompose(ctx, job, dir, dst, input)
+	}
+	destinations := make([]string, len(input.Variants))
+	for i := range destinations {
+		destinations[i] = filepath.Join(dir, fmt.Sprintf("final-%d.mp4", i))
+	}
+	if input.ManifestV2 == nil {
+		return destinations, nil, s.renderFrozenManifest(ctx, job.UserID, input, dir, destinations, nil)
+	}
+	width, height := composeDimensions(input.AspectRatio, input.Size)
+	outputs := make([]videoframe.ComposeProgramOutputSpec, 0, len(destinations))
+	for i, dst := range destinations {
+		outputs = append(outputs, videoframe.ComposeProgramOutputSpec{Destination: dst, Variant: input.Variants[i], Width: width, Height: height})
+	}
+	report, err := s.RenderProgramManifest(ctx, job.UserID, input.ManifestV2, dir, outputs, nil)
+	return destinations, &report, err
+}
+
+// prepareComposeExports 暂存对象，调用方负责未提交批次的清理。
+func (s *DramaService) prepareComposeExports(ctx context.Context, user uint64, destinations []string) ([]*model.Asset, error) {
 	assets := make([]*model.Asset, 0, len(destinations))
 	for _, dst := range destinations {
-		asset, err := s.assets.PrepareDramaVideo(ctx, job.UserID, dst)
+		asset, err := s.assets.PrepareDramaVideo(ctx, user, dst)
 		if err != nil {
-			return assets, &input, withCause(errcode.ErrInternal.WithMsg("转码失败：成片存储失败"), err, "compose_store")
+			return assets, withCause(errcode.ErrInternal.WithMsg("转码失败：成片存储失败"), err, "compose_store")
 		}
 		assets = append(assets, asset)
 	}
-	return assets, &input, nil
+	return assets, nil
 }
 
 // renderLegacyCompose 保留旧 edit_schema=0 的整段合成器与下载失败错误契约。
@@ -154,38 +183,37 @@ func (s *DramaService) renderLegacyCompose(ctx context.Context, job *model.Drama
 	return s.dramaProgress(ctx, job, 80)
 }
 
-// downloadCompose 从用户素材存储下载到临时目录，沿用素材转存的大小和取消约束。
+// downloadCompose 保留旧整段和 v1 探针的读取契约，这些调用没有冻结指纹。
 func (s *DramaService) downloadCompose(ctx context.Context, userID, assetID uint64, path string) error {
+	return s.downloadComposeVideo(ctx, userID, assetID, path, "")
+}
+
+// downloadComposeVideo 下载当前用户的视频，并验证冻结任务要求的字节指纹。
+func (s *DramaService) downloadComposeVideo(ctx context.Context, userID, assetID uint64, path, expected string) error {
 	file, err := s.assets.Open(ctx, userID, assetID)
 	if err != nil {
 		return err
 	}
+	if file == nil || file.Body == nil {
+		return errors.New("采用视频不可读取")
+	}
 	defer func() { _ = file.Body.Close() }()
-	if file.Asset == nil || file.Asset.ID != assetID || file.Asset.UserID != userID || file.Asset.Kind != "video" {
+	if !validProgramAsset(file.Asset, userID, assetID, model.KindVideo) {
 		return errors.New("采用素材不是当前用户的视频")
 	}
-	f, err := os.Create(path) //nolint:gosec // path 完全由服务端临时目录和序号组成。
-	if err != nil {
-		return err
-	}
-	n, copyErr := io.Copy(f, io.LimitReader(&assetSrcReader{ctx: ctx, r: file.Body}, defaultMaxResult+1))
-	closeErr := f.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	if n == 0 || n > defaultMaxResult {
-		return errors.New("采用视频为空或超过大小限制")
-	}
-	return closeErr
+	return copyComposeMedia(ctx, file.Body, path, expected)
 }
 
 // commitCompose 重新读取当前集版本，合成期间修改过片段时成片立即显示过期。
-func (s *DramaService) commitCompose(ctx context.Context, job *model.DramaJob, assets []*model.Asset, input *dramaComposeInput) (bool, error) {
+func (s *DramaService) commitCompose(ctx context.Context, job *model.DramaJob, assets []*model.Asset, input *dramaComposeInput, report *model.DramaComposeExportReport) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	committed := false
 	var completed *model.DramaJob
 	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
 		var err error
-		completed, committed, err = s.commitComposeTx(ctx, tx, job, assets, input)
+		completed, committed, err = s.commitComposeTx(ctx, tx, job, assets, input, report)
 		return err
 	})
 	if errors.Is(err, repository.ErrNotFound) {
@@ -201,7 +229,7 @@ func (s *DramaService) commitCompose(ctx context.Context, job *model.DramaJob, a
 }
 
 // commitComposeTx 在项目锁内登记素材、写集成片并结束任务；任务已被取消时什么都不写。
-func (s *DramaService) commitComposeTx(ctx context.Context, tx repository.DramaTx, job *model.DramaJob, assets []*model.Asset, input *dramaComposeInput) (*model.DramaJob, bool, error) {
+func (s *DramaService) commitComposeTx(ctx context.Context, tx repository.DramaTx, job *model.DramaJob, assets []*model.Asset, input *dramaComposeInput, report *model.DramaComposeExportReport) (*model.DramaJob, bool, error) {
 	if _, err := tx.Project(ctx, job.UserID, job.DramaID, true); err != nil {
 		return nil, false, err
 	}
@@ -216,7 +244,7 @@ func (s *DramaService) commitComposeTx(ctx context.Context, tx repository.DramaT
 	if ep.DramaID != job.DramaID {
 		return nil, false, repository.ErrNotFound
 	}
-	result, primary, err := s.registerComposeExports(ctx, tx, job, assets, input)
+	result, primary, err := s.registerComposeExports(ctx, tx, job, assets, input, report)
 	if err != nil {
 		return nil, false, err
 	}

@@ -40,6 +40,12 @@ func TestDramaHandler_Compose(t *testing.T) {
 		status, code int
 	}{
 		{"接受合成", `{"step":"compose","episodes":[1]}`, false, false, 202, 0},
+		{"匹配分集主键", `{"step":"compose","episodes":[1],"expected_episode_id":"` + idcodec.Encode(10) + `"}`, false, false, 202, 0},
+		{"显式 null 兼容旧客户端", `{"step":"compose","episodes":[1],"expected_episode_id":null}`, false, false, 202, 0},
+		{"空分集主键已过期", `{"step":"compose","episodes":[1],"expected_episode_id":""}`, false, false, 409, 91001},
+		{"不匹配分集主键先于任务资格校验", `{"step":"compose","episodes":[1],"expected_episode_id":"` + idcodec.Encode(11) + `"}`, true, true, 409, 91001},
+		{"无效分集主键", `{"step":"compose","episodes":[1],"expected_episode_id":"bad"}`, false, false, 400, 10001},
+		{"数字分集主键", `{"step":"compose","episodes":[1],"expected_episode_id":10}`, false, false, 400, 10001},
 		{"无片段", `{"step":"compose","episodes":[1]}`, true, false, 400, 67010},
 		{"已有任务", `{"step":"compose","episodes":[1]}`, false, true, 409, 67004},
 		{"缺少集号", `{"step":"compose"}`, false, false, 400, 10001},

@@ -149,6 +149,8 @@ func TestDramaHandler_Validation(t *testing.T) {
 		{"PATCH", base + "/episodes/1", `{"revision":1,"expected_episode_id":10}`},
 		{"POST", base + "/episodes", `{"title":1}`},
 		{"POST", base + "/estimate", `{"step":"compose"}`},
+		{"POST", base + "/estimate", `{"step":"compose","episodes":[1],"expected_episode_id":"bad"}`},
+		{"POST", base + "/estimate", `{"step":"scripts","expected_episode_id":10}`},
 		{"POST", base + "/jobs", `{"step":"breakdown","episodes":[0]}`},
 		{"POST", base + "/jobs/invalid/cancel", ""},
 		{"GET", base + "/jobs?status=typo", ""},
@@ -159,6 +161,18 @@ func TestDramaHandler_Validation(t *testing.T) {
 				t.Fatalf("status=%d body=%+v", status, body)
 			}
 		})
+	}
+}
+
+func TestDramaHandler_EstimateRejectsStaleEpisodeIdentity(t *testing.T) {
+	r := httpDramaRouter()
+	path := "/dramas/" + idcodec.Encode(7) + "/estimate"
+	for _, expected := range []string{"", idcodec.Encode(11)} {
+		status, body := characterCall(t, r, "POST", path,
+			`{"step":"compose","episodes":[1],"expected_episode_id":"`+expected+`"}`)
+		if status != 409 || responseCode(t, body) != 91001 {
+			t.Fatalf("stale identity %q: status=%d body=%+v", expected, status, body)
+		}
 	}
 }
 

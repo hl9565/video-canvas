@@ -3,8 +3,12 @@ package service_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"slices"
 	"strings"
@@ -14,15 +18,20 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
+	"video-canvas/internal/handler"
+	"video-canvas/internal/middleware"
 	"video-canvas/internal/migration"
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/jsonhash"
 	"video-canvas/internal/pkg/videoframe"
+	"video-canvas/internal/provider"
 	"video-canvas/internal/repository"
 	"video-canvas/internal/service"
 	"video-canvas/migrations"
@@ -70,10 +79,20 @@ func slice2cPG16(t *testing.T) *gorm.DB {
 const (
 	slice2cUpstream35Only         = false
 	slice2cUpstream35WithFork9001 = true
+	composeStageAMigration        = "9001_drama_edit.sql"
+	composeStageBMigration        = "9002_drama_frame_runs.sql"
 )
 
 // slice2cMigrationFiles 固定上游截至 0035，显式选择是否追加 Fork 9001，不纳入未来上游 0036/0037 或其他 Fork。
 func slice2cMigrationFiles(t *testing.T, source fs.FS, includeFork bool) fstest.MapFS {
+	t.Helper()
+	if includeFork {
+		return dramaComposeMigrationSubset(t, source, "0035", composeStageAMigration)
+	}
+	return dramaComposeMigrationSubset(t, source, "0035")
+}
+
+func dramaComposeMigrationSubset(t *testing.T, source fs.FS, lastUpstream string, forkFiles ...string) fstest.MapFS {
 	t.Helper()
 	subset := fstest.MapFS{}
 	names, err := fs.Glob(source, "*.sql")
@@ -82,8 +101,8 @@ func slice2cMigrationFiles(t *testing.T, source fs.FS, includeFork bool) fstest.
 	}
 	for _, name := range names {
 		prefix, _, ok := strings.Cut(name, "_")
-		upstream := ok && prefix >= "0001" && prefix <= "0035"
-		fork := includeFork && name == "9001_drama_edit.sql"
+		upstream := ok && prefix >= "0001" && prefix <= lastUpstream
+		fork := slices.Contains(forkFiles, name)
 		if !upstream && !fork {
 			continue
 		}
@@ -114,7 +133,7 @@ func TestDramaComposeMigrationFiles_FixtureStages(t *testing.T) {
 	source := fstest.MapFS{}
 	for _, name := range []string{
 		"0001_baseline.sql", "0035_marketing.sql", "0036_upstream.sql", "0037_upstream.sql",
-		"9001_drama_edit.sql", "9002_fork.sql",
+		"0038_upstream.sql", "9001_drama_edit.sql", "9002_drama_frame_runs.sql", "9003_drama_program.sql",
 	} {
 		source[name] = &fstest.MapFile{Data: []byte("SELECT 1;")}
 	}
@@ -130,6 +149,12 @@ func TestDramaComposeMigrationFiles_FixtureStages(t *testing.T) {
 		if !slices.Equal(names, want) {
 			t.Fatalf("includeFork=%v，得到 %v，期望 %v", includeFork, names, want)
 		}
+	}
+	stageB := dramaComposeMigrationSubset(t, source, "0037", composeStageAMigration, composeStageBMigration)
+	names, err := fs.Glob(stageB, "*.sql")
+	want := []string{"0001_baseline.sql", "0035_marketing.sql", "0036_upstream.sql", "0037_upstream.sql", "9001_drama_edit.sql", "9002_drama_frame_runs.sql"}
+	if err != nil || !slices.Equal(names, want) {
+		t.Fatalf("Stage B 夹具：得到 %v，期望 %v / %v", names, want, err)
 	}
 }
 
@@ -174,7 +199,7 @@ func TestDramaComposePG16_ConcurrentKeyAndSchemaStageBOnly(t *testing.T) {
 	fixture := newComposeMemory()
 	fixture.episodes[0].EditSchema = 1
 	seedComposePGTask(&fixture.tasks[0])
-	for _, value := range []any{&fixture.project, &fixture.episodes[0], &fixture.segments[0], &fixture.segments[1], &fixture.tasks[0], &model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: stringsRepeatA(), StorageKey: "source.mp4", Source: model.AssetSourceUpload}} {
+	for _, value := range []any{&fixture.project, &fixture.episodes[0], &fixture.segments[0], &fixture.segments[1], &fixture.tasks[0], &model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: verifiedVideoHash(), StorageKey: "source.mp4", Source: model.AssetSourceUpload}} {
 		if err := db.Create(value).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -184,7 +209,7 @@ func TestDramaComposePG16_ConcurrentKeyAndSchemaStageBOnly(t *testing.T) {
 	repo.SetEnqueuer(q)
 	_, files, _ := manifestService(fixture)
 	probeRepo := repository.NewAssetMediaProbeRepository(db)
-	if err := probeRepo.Upsert(context.Background(), &model.AssetMediaProbe{AssetID: 30, Sha256: files.sha, ProbeVersion: 1, FpsNum: 24, FpsDen: 1, NormalizedFrames24: 120}); err != nil {
+	if err := probeRepo.Upsert(context.Background(), &model.AssetMediaProbe{AssetID: 30, Sha256: files.sha, ProbeVersion: videoframe.NormalizedProbeVersion, FpsNum: 24, FpsDen: 1, NormalizedFrames24: 120}); err != nil {
 		t.Fatal(err)
 	}
 	svc := service.NewDramaService(service.DramaDeps{Repo: repo, Assets: files, Probes: probeRepo})
@@ -221,18 +246,25 @@ func TestDramaComposePG16_ConcurrentKeyAndSchemaStageBOnly(t *testing.T) {
 	if q.calls.Load() != 1 {
 		t.Fatalf("重复入队: %d", q.calls.Load())
 	}
-	var tables int64
-	if err := db.Raw(`SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND column_name IN ('program_json','visual_kind','still_asset_id','fx_json')`).Scan(&tables).Error; err != nil || tables != 0 {
-		t.Fatalf("越界 PR3 schema: %d %v", tables, err)
-	}
 	stored, err := repo.Job(context.Background(), 7, 1, id, false)
 	if err != nil || stored.RequestIntentSig == "" {
 		t.Fatalf("未持久化意图: %+v %v", stored, err)
 	}
+
+	t.Run("pinned_stage_b_schema", assertComposeStageBOnly)
 }
 
-func stringsRepeatA() string {
-	return "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+func assertComposeStageBOnly(t *testing.T) {
+	t.Helper()
+	db := slice2cPG16(t)
+	files := dramaComposeMigrationSubset(t, migrations.FS, "0037", composeStageAMigration, composeStageBMigration)
+	if err := migration.Run(context.Background(), db, migration.Options{FS: files, Logger: zap.NewNop()}); err != nil {
+		t.Fatal(err)
+	}
+	var columns int64
+	if err := db.Raw(`SELECT count(*) FROM information_schema.columns WHERE table_schema=current_schema() AND column_name IN ('program_json','visual_kind','still_asset_id','fx_json')`).Scan(&columns).Error; err != nil || columns != 0 {
+		t.Fatalf("Stage B schema 不应有 PR3 字段：%d / %v", columns, err)
+	}
 }
 
 func seedComposePGTask(t *model.GenerationTask) {
@@ -250,7 +282,7 @@ func TestDramaComposePG16_ProbeReleasesLocksAndTx2RejectsConcurrentEdit(t *testi
 	fixture := newComposeMemory()
 	fixture.episodes[0].EditSchema = 1
 	seedComposePGTask(&fixture.tasks[0])
-	for _, value := range []any{&fixture.project, &fixture.episodes[0], &fixture.segments[0], &fixture.segments[1], &fixture.tasks[0], &model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: stringsRepeatA(), StorageKey: "source.mp4", Source: model.AssetSourceUpload}} {
+	for _, value := range []any{&fixture.project, &fixture.episodes[0], &fixture.segments[0], &fixture.segments[1], &fixture.tasks[0], &model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: verifiedVideoHash(), StorageKey: "source.mp4", Source: model.AssetSourceUpload}} {
 		if err := db.Create(value).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -340,7 +372,7 @@ func TestDramaComposePG16_RatioChangeInvalidatesAndBlocksStaleSubmit(t *testing.
 		&fixture.segments[0],
 		&fixture.segments[1],
 		&fixture.tasks[0],
-		&model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: stringsRepeatA(), StorageKey: "source.mp4", Source: model.AssetSourceUpload},
+		&model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: verifiedVideoHash(), StorageKey: "source.mp4", Source: model.AssetSourceUpload},
 	} {
 		if err := db.Create(value).Error; err != nil {
 			t.Fatal(err)
@@ -493,7 +525,7 @@ func seedSchema0RatioPG16(t *testing.T, db *gorm.DB) {
 		&model.DramaSegment{BaseModel: model.BaseModel{ID: 8}, UserID: 7, EpisodeID: 5, Seq: 0, ChosenTaskID: &c22},
 		&model.DramaSegment{BaseModel: model.BaseModel{ID: 9}, UserID: 7, EpisodeID: 6, Seq: 0, ChosenTaskID: &c23},
 		&fixture.tasks[0], &task21, &task22, &task23,
-		&model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: stringsRepeatA(), StorageKey: "source.mp4", Source: model.AssetSourceUpload},
+		&model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: verifiedVideoHash(), StorageKey: "source.mp4", Source: model.AssetSourceUpload},
 	} {
 		if err := db.Create(value).Error; err != nil {
 			t.Fatal(err)
@@ -539,7 +571,7 @@ func TestDramaComposePG16_Schema0FrozenManifestRatioInvalidation(t *testing.T) {
 	repo := repository.NewDramaRepository(db)
 	q := &slice2cQueue{}
 	repo.SetEnqueuer(q)
-	_, files, _ := manifestService(newComposeMemory())
+	files, _ := verifiedManifestAssets(newComposeMemory())
 	proc := &manifestProcessor{}
 	svc := service.NewDramaService(service.DramaDeps{
 		Repo: repo, Assets: &pgUniqueComposeAssets{manifestFiles: files}, Probes: repository.NewAssetMediaProbeRepository(db), Compose: proc,
@@ -689,7 +721,7 @@ func TestDramaComposePG16_HistoricalFrozenJobDoesNotStaleNilManifestExport(t *te
 	repo := repository.NewDramaRepository(db)
 	q := &slice2cQueue{}
 	repo.SetEnqueuer(q)
-	_, files, _ := manifestService(newComposeMemory())
+	files, _ := verifiedManifestAssets(newComposeMemory())
 	proc := &manifestProcessor{}
 	svc := service.NewDramaService(service.DramaDeps{
 		Repo: repo, Assets: &pgUniqueComposeAssets{manifestFiles: files}, Probes: repository.NewAssetMediaProbeRepository(db), Compose: proc,
@@ -777,5 +809,575 @@ func TestDramaComposePG16_HistoricalFrozenJobDoesNotStaleNilManifestExport(t *te
 	}
 	if updated.Episodes[2].SegmentVersion != 2 || !updated.Episodes[2].FinalStale {
 		t.Fatalf("已发布冻结清单成片改画幅应递增版本号并标记过期: ep3=%+v", updated.Episodes[2])
+	}
+}
+
+// pgProgramAudio holds both requests after their unlocked snapshot reads and before either write transaction.
+type pgProgramAudio struct {
+	service.DramaComposeAssets
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (a pgProgramAudio) Get(ctx context.Context, user, id uint64) (*model.Asset, error) {
+	if a.entered != nil {
+		select {
+		case a.entered <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		select {
+		case <-a.proceed:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return &model.Asset{ID: id, UserID: user, Kind: model.KindAudio}, nil
+}
+
+func newProgramPG16(t *testing.T) (*gorm.DB, *repository.DramaRepository) {
+	t.Helper()
+	db := slice2cPG16(t)
+	migrateCurrentSchemaPG16(t, db)
+	fixture := newComposeMemory()
+	fixture.project.Ratio = "16:9"
+	fixture.episodes[0].SegmentVersion = 4
+	for _, row := range []any{
+		&fixture.project, &fixture.episodes[0],
+		&model.DramaEpisode{BaseModel: model.BaseModel{ID: 4}, DramaID: 1, UserID: 7, No: 2, SegmentVersion: 4},
+		&model.Asset{ID: 40, UserID: 7, Kind: model.KindAudio, Source: model.AssetSourceUpload, StorageKey: "stage-c-audio.m4a"},
+	} {
+		if err := db.Create(row).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	return db, repository.NewDramaRepository(db)
+}
+
+func programPGHTTP(svc *service.DramaService) *gin.Engine {
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set(middleware.CtxUserIDKey, uint(7)) })
+	r.PUT("/dramas/:id/episodes/:no/program", handler.NewDramaHandler(svc).PutProgram)
+	return r
+}
+
+func putProgramPG(ctx context.Context, r *gin.Engine, ep uint64, v, end int) *httptest.ResponseRecorder {
+	body := fmt.Sprintf(`{"expected_episode_id":%q,"expected_segment_version":%d,"program":{"v":1,"audio":[{"id":"voice","role":"narration","asset_id":40,"start_f":0,"end_f":%d}],"overlays":[]}}`,
+		idcodec.Encode(ep), v, end)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequestWithContext(ctx, http.MethodPut, "/dramas/"+idcodec.Encode(1)+"/episodes/1/program", strings.NewReader(body)))
+	return w
+}
+
+func requireProgramPGStale(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	var response struct {
+		Code int `json:"code"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || w.Code != http.StatusConflict || response.Code != 91001 {
+		t.Fatalf("expected stale 409/91001: %d %s %v", w.Code, w.Body.String(), err)
+	}
+}
+
+func waitProgramPGAsset(ctx context.Context, t *testing.T, a pgProgramAudio) {
+	t.Helper()
+	select {
+	case <-a.entered:
+	case <-ctx.Done():
+		t.Fatal("did not reach outside-lock asset read")
+	}
+}
+
+func TestDramaProgramPG16ConcurrentSameVersionPutAndNoOp(t *testing.T) {
+	_, repo := newProgramPG16(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	barrier := pgProgramAudio{entered: make(chan struct{}, 2), proceed: make(chan struct{})}
+	svc := service.NewDramaService(service.DramaDeps{Repo: repo, Assets: barrier})
+	r := programPGHTTP(svc)
+	type result struct {
+		response *httptest.ResponseRecorder
+		end      int
+	}
+	out := make(chan result, 2)
+	for _, end := range []int{12, 24} {
+		go func() { out <- result{putProgramPG(ctx, r, 3, 4, end), end} }()
+	}
+	waitProgramPGAsset(ctx, t, barrier)
+	waitProgramPGAsset(ctx, t, barrier)
+	close(barrier.proceed)
+
+	var wins, winnerEnd int
+	for range 2 {
+		select {
+		case res := <-out:
+			if res.response.Code == http.StatusOK {
+				wins++
+				winnerEnd = res.end
+			} else {
+				requireProgramPGStale(t, res.response)
+			}
+		case <-ctx.Done():
+			t.Fatal("concurrent requests did not complete")
+		}
+	}
+	if wins != 1 {
+		t.Fatalf("expected one winner, got %d", wins)
+	}
+	steady := programPGHTTP(service.NewDramaService(service.DramaDeps{Repo: repo, Assets: pgProgramAudio{}}))
+	w := putProgramPG(ctx, steady, 3, 5, winnerEnd)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"segment_version":5`) {
+		t.Fatalf("no-op changed segment version: %d %s", w.Code, w.Body.String())
+	}
+	requireProgramPGStale(t, putProgramPG(ctx, steady, 3, 4, winnerEnd))
+	view, err := svc.GetProgram(ctx, 7, 1, 1)
+	if err != nil || view.SegmentVersion != 5 || *view.Program.Audio[0].EndF != int32(winnerEnd) {
+		t.Fatalf("winner was overwritten: %+v %v", view, err)
+	}
+}
+
+func TestDramaProgramCASRenumberRace(t *testing.T) {
+	db, repo := newProgramPG16(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	barrier := pgProgramAudio{entered: make(chan struct{}, 1), proceed: make(chan struct{})}
+	svc := service.NewDramaService(service.DramaDeps{Repo: repo, Assets: barrier})
+	r := programPGHTTP(svc)
+	result := make(chan *httptest.ResponseRecorder, 1)
+	go func() { result <- putProgramPG(ctx, r, 3, 4, 12) }()
+	waitProgramPGAsset(ctx, t, barrier)
+	canvas := repository.NewDramaCanvasRepository(db)
+	if err := canvas.WithTx(ctx, func(tx repository.DramaCanvasTx) error {
+		if err := tx.LockProject(ctx, 7, 1); err != nil {
+			return err
+		}
+		return tx.DeleteEpisode(ctx, 7, 1, 1)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	close(barrier.proceed)
+	select {
+	case w := <-result:
+		requireProgramPGStale(t, w)
+	case <-ctx.Done():
+		t.Fatal("save raced with renumber without returning")
+	}
+	requireProgramPGStale(t, putProgramPG(ctx, r, 3, 4, 12))
+	view, err := svc.GetProgram(ctx, 7, 1, 1)
+	if err != nil || view.EpisodeID != 4 || view.SegmentVersion != 4 || len(view.Program.Audio) != 0 {
+		t.Fatalf("renumbered episode was overwritten: %+v %v", view, err)
+	}
+}
+
+type slice5PGAssets struct {
+	*composeFiles
+	repo *repository.DramaRepository
+	seq  int
+}
+
+func (a *slice5PGAssets) Get(ctx context.Context, user, id uint64) (*model.Asset, error) {
+	return a.repo.ComposeAsset(ctx, user, id)
+}
+
+func (a *slice5PGAssets) Open(ctx context.Context, user, id uint64) (*provider.AssetFile, error) {
+	asset, err := a.Get(ctx, user, id)
+	if err != nil {
+		return nil, err
+	}
+	body := "audio"
+	if asset.Kind == model.KindVideo {
+		body = "video"
+	}
+	return &provider.AssetFile{Asset: asset, Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+
+func (a *slice5PGAssets) PrepareDramaVideo(ctx context.Context, user uint64, path string) (*model.Asset, error) {
+	asset, err := a.composeFiles.PrepareDramaVideo(ctx, user, path)
+	if err != nil {
+		return nil, err
+	}
+	a.seq++
+	asset.StorageKey = fmt.Sprintf("slice5-out-%d.mp4", a.seq)
+	return asset, nil
+}
+
+func newSlice5PGCompose(t *testing.T, version int, configure func(*service.DramaDeps)) (*gorm.DB, *service.DramaService, *slice2cQueue) {
+	t.Helper()
+	db, repo := newProgramPG16(t)
+	queue := &slice2cQueue{}
+	repo.SetEnqueuer(queue)
+	fixture := newComposeMemory()
+	segment := &fixture.segments[0]
+	if version == 2 {
+		stageCSegment(segment, model.DramaVisualBlack, 24)
+	} else {
+		seedComposePGTask(&fixture.tasks[0])
+		for _, row := range []any{
+			&fixture.tasks[0],
+			&model.Asset{ID: 30, UserID: 7, Kind: model.KindVideo, Sha256: verifiedVideoHash(), StorageKey: "slice5-source.mp4", Source: model.AssetSourceUpload},
+		} {
+			if err := db.Create(row).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := db.Create(segment).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&model.Asset{}).Where("id = ?", 40).Update("sha256", jsonhash.SHA256Hex([]byte("audio"))).Error; err != nil {
+		t.Fatal(err)
+	}
+	deps := service.DramaDeps{
+		Repo: repo, Assets: &slice5PGAssets{composeFiles: &composeFiles{r: fixture}, repo: repo},
+		Probes: repository.NewAssetMediaProbeRepository(db),
+		ProbeVideo: func(context.Context, string) (videoframe.NormalizedProbe, error) {
+			return videoframe.NormalizedProbe{FpsNum: 24, FpsDen: 1, NormalizedFrames24: 120}, nil
+		},
+		ProbeAudio: func(context.Context, string) (videoframe.AudioProbe, error) {
+			return videoframe.AudioProbe{DecodedAudioSamples: 8000}, nil
+		},
+	}
+	configure(&deps)
+	svc := service.NewDramaService(deps)
+	t.Cleanup(svc.ClosePreviews)
+	return db, svc, queue
+}
+
+func waitSlice5PGGate(ctx context.Context, t *testing.T, entered <-chan struct{}, early <-chan error) {
+	t.Helper()
+	select {
+	case <-entered:
+	case err := <-early:
+		t.Fatalf("operation ended before the gate: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+func waitSlice5PGRelease(ctx context.Context, entered, release chan struct{}) error {
+	close(entered)
+	select {
+	case <-release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestDramaProgramComposePG16PreservesConcurrentProgramEdit(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			entered, release := make(chan struct{}), make(chan struct{})
+			db, svc, _ := newSlice5PGCompose(t, version, func(d *service.DramaDeps) {
+				renderer := &slice5ProgramRenderer{}
+				renderer.during = func(ctx context.Context, _ videoframe.ComposeProgramInput) error {
+					return waitSlice5PGRelease(ctx, entered, release)
+				}
+				renderer.duringManifest = func() { _ = waitSlice5PGRelease(ctx, entered, release) }
+				d.Compose = renderer
+			})
+			router, frozenVersion := programPGHTTP(svc), 4
+			if version == 2 {
+				if w := putProgramPG(ctx, router, 3, frozenVersion, 12); w.Code != http.StatusOK {
+					t.Fatalf("initial program: %d %s", w.Code, w.Body.String())
+				}
+				frozenVersion++
+			}
+			job, err := svc.CreateJob(ctx, 7, 1, composeReq(t, `,"compose":{"variants":["packaged","clean"]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- svc.HandleDrama(ctx, 7, 1, uint64(job.ID)) }()
+			waitSlice5PGGate(ctx, t, entered, done)
+			w := putProgramPG(ctx, router, 3, frozenVersion, 20)
+			if w.Code != http.StatusOK {
+				t.Fatalf("concurrent PUT: %d %s", w.Code, w.Body.String())
+			}
+			close(release)
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			assertSlice5PGComposePublication(ctx, t, db, svc, uint64(job.ID), frozenVersion, version)
+		})
+	}
+}
+
+func assertSlice5PGComposePublication(ctx context.Context, t *testing.T, db *gorm.DB, svc *service.DramaService, jobID uint64, frozenVersion, rendererVersion int) {
+	t.Helper()
+	view, err := svc.Get(ctx, 7, 1)
+	if err != nil || len(view.Episodes) == 0 || !view.Episodes[0].FinalStale ||
+		view.Episodes[0].FinalComposeJobID == nil || uint64(*view.Episodes[0].FinalComposeJobID) != jobID {
+		t.Fatalf("snapshot should publish as stale with its job reference: %+v %v", view, err)
+	}
+	var ep model.DramaEpisode
+	if err := db.First(&ep, 3).Error; err != nil {
+		t.Fatal(err)
+	}
+	if ep.SegmentVersion != int64(frozenVersion+1) || ep.FinalSegmentVersion != int64(frozenVersion) {
+		t.Fatalf("wrong snapshot versions: %+v", ep)
+	}
+	program, err := svc.GetProgram(ctx, 7, 1, 1)
+	if err != nil || len(program.Program.Audio) != 1 || program.Program.Audio[0].EndF == nil || *program.Program.Audio[0].EndF != 20 {
+		t.Fatalf("compose overwrote committed PUT: %+v %v", program, err)
+	}
+	jobs, err := svc.ListJobs(ctx, 7, 1, false)
+	if err != nil || len(jobs) != 1 || jobs[0].Status != "succeeded" || jobs[0].Result == nil || len(jobs[0].Result.Exports) != 2 {
+		t.Fatalf("variants not committed together: %+v %v", jobs, err)
+	}
+	for _, export := range jobs[0].Result.Exports {
+		if (export.DramaComposeExportReport != nil) != (rendererVersion == 2) {
+			t.Fatalf("wrong renderer report: %+v", export)
+		}
+	}
+}
+
+func TestDramaProgramComposePG16RejectsHashChangedDuringProbe(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	entered, release := make(chan struct{}), make(chan struct{})
+	db, svc, queue := newSlice5PGCompose(t, 2, func(d *service.DramaDeps) {
+		d.ProbeAudio = func(ctx context.Context, _ string) (videoframe.AudioProbe, error) {
+			err := waitSlice5PGRelease(ctx, entered, release)
+			return videoframe.AudioProbe{DecodedAudioSamples: 8000}, err
+		}
+	})
+	if w := putProgramPG(ctx, programPGHTTP(svc), 3, 4, 12); w.Code != http.StatusOK {
+		t.Fatalf("initial program: %d %s", w.Code, w.Body.String())
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.CreateJob(ctx, 7, 1, composeReq(t, ""))
+		done <- err
+	}()
+	waitSlice5PGGate(ctx, t, entered, done)
+	if err := db.WithContext(ctx).Model(&model.Asset{}).Where("id = ?", 40).Update("sha256", strings.Repeat("e", 64)).Error; err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case err := <-done:
+		dramaCheckCode(t, err, 91001)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	jobs, err := svc.ListJobs(ctx, 7, 1, false)
+	if err != nil || len(jobs) != 0 || queue.calls.Load() != 0 {
+		t.Fatalf("stale probe enqueued a job: %+v %v", jobs, err)
+	}
+}
+
+func TestDramaComposePG16_ExpectedEpisodeIDRejectsReplacementDuringProbeWindow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	db := slice2cPG16(t)
+	migrateCurrentSchemaPG16(t, db)
+	seedSchema0RatioPG16(t, db)
+
+	repo := repository.NewDramaRepository(db)
+	q := &slice2cQueue{}
+	repo.SetEnqueuer(q)
+	files, _ := verifiedManifestAssets(newComposeMemory())
+	entered, release := make(chan struct{}), make(chan struct{})
+	svc := service.NewDramaService(service.DramaDeps{
+		Repo:    repo,
+		Assets:  &pgUniqueComposeAssets{manifestFiles: files},
+		Probes:  repository.NewAssetMediaProbeRepository(db),
+		Compose: &manifestProcessor{},
+		ProbeVideo: func(ctx context.Context, _ string) (videoframe.NormalizedProbe, error) {
+			err := waitSlice5PGRelease(ctx, entered, release)
+			return videoframe.NormalizedProbe{FpsNum: 24, FpsDen: 1, NormalizedFrames24: 120}, err
+		},
+	})
+
+	expectedID := uint64(3) // seed 中 no=1 初始对应 ID=3，no=2 对应 ID=4
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.CreateJob(ctx, 7, 1, &model.DramaJobReq{
+			Step:              "compose",
+			Episodes:          []int{1},
+			ExpectedEpisodeID: &expectedID,
+			ComposeRequestKey: "ep-replace-window",
+			Compose:           &model.DramaComposeReq{Size: "720p", Variants: []string{"clean"}},
+		})
+		done <- err
+	}()
+	waitSlice5PGGate(ctx, t, entered, done)
+
+	// 在 tx1 校验通过后的锁外探测窗口中，按真实 DeleteEpisode 语义删除原第 1 集（ID=3）并让原第 2 集（ID=4）补位为 no=1
+	if err := db.WithContext(ctx).Where("user_id = ? AND episode_id = ?", 7, 3).Delete(&model.DramaSegment{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithContext(ctx).Unscoped().Delete(&model.DramaEpisode{}, 3).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.WithContext(ctx).Model(&model.DramaEpisode{}).Where("id = ?", 4).Update("no", 1).Error; err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+
+	select {
+	case err := <-done:
+		dramaCheckCode(t, err, 91001)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	jobs, err := svc.ListJobs(ctx, 7, 1, false)
+	if err != nil || len(jobs) != 0 || q.calls.Load() != 0 {
+		t.Fatalf("补位集被误提交了合成任务: jobs=%+v err=%v", jobs, err)
+	}
+}
+
+func TestDramaRepositoryPG16_WithSnapshotTxRepeatableReadReadOnly(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	db := slice2cPG16(t)
+	migrateCurrentSchemaPG16(t, db)
+	seedSchema0RatioPG16(t, db)
+
+	repo := repository.NewDramaRepository(db)
+	var beforeVer int64
+	var beforeCount int
+	var isolation, readOnly string
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- repo.WithSnapshotTx(ctx, func(tx repository.DramaTx) error {
+			// 在第一次查询之后并发插入并发提交新分段并升级版本号，验证同一 snapshot 内前后一致
+			eps, err := tx.Episodes(ctx, 7, 1)
+			if err != nil {
+				return err
+			}
+			beforeVer = eps[0].SegmentVersion
+			rows, err := tx.Segments(ctx, 7, 3)
+			if err != nil {
+				return err
+			}
+			beforeCount = len(rows)
+			close(entered)
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			epsAfter, err := tx.Episodes(ctx, 7, 1)
+			if err != nil {
+				return err
+			}
+			rowsAfter, err := tx.Segments(ctx, 7, 3)
+			if err != nil {
+				return err
+			}
+			if epsAfter[0].SegmentVersion != beforeVer || len(rowsAfter) != beforeCount {
+				return fmt.Errorf("snapshot 内部看到跨事务提交: before=(v=%d n=%d) after=(v=%d n=%d)", beforeVer, beforeCount, epsAfter[0].SegmentVersion, len(rowsAfter))
+			}
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("WithSnapshotTx 提前失败: %v", err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	if err := db.WithContext(ctx).Create(&model.DramaSegment{
+		BaseModel: model.BaseModel{ID: 999}, UserID: 7, EpisodeID: 3, Seq: 9, Seconds: 5, Revision: 1,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.BumpSegmentVersion(ctx, 7, 3); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Raw("SHOW transaction_isolation").Scan(&isolation).Error; err != nil {
+			return err
+		}
+		return tx.Raw("SHOW transaction_read_only").Scan(&readOnly).Error
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true}); err != nil {
+		t.Fatal(err)
+	}
+	if isolation != "repeatable read" || readOnly != "on" {
+		t.Fatalf("unexpected snapshot tx options: isolation=%q read_only=%q", isolation, readOnly)
+	}
+}
+
+func TestDramaComposePG16_StaleIdentityPrecedesReplacementState(t *testing.T) {
+	ctx := t.Context()
+	db := slice2cPG16(t)
+	migrateCurrentSchemaPG16(t, db)
+	seedSchema0RatioPG16(t, db)
+	repo := repository.NewDramaRepository(db)
+	queue := &slice2cQueue{}
+	repo.SetEnqueuer(queue)
+	svc := service.NewDramaService(service.DramaDeps{Repo: repo})
+	old := uint64(3)
+	req := &model.DramaJobReq{Step: "compose", Episodes: []int{1}, ExpectedEpisodeID: &old}
+	checkStale := func() {
+		t.Helper()
+		_, err := svc.CreateJob(ctx, 7, 1, req)
+		dramaCheckCode(t, err, 91001)
+	}
+	// Move the original episode away; the old number is now missing.
+	if err := db.Model(&model.DramaEpisode{}).Where("id = ?", 3).Update("no", 5).Error; err != nil {
+		t.Fatal(err)
+	}
+	checkStale()
+	// An unlocked replacement and its busy compose must both lose to the old identity.
+	if err := db.Model(&model.DramaEpisode{}).Where("id = ?", 4).Updates(map[string]any{
+		"no": 1, "locked_at": nil,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	checkStale()
+	if err := db.Create(&model.DramaJob{
+		UserID: 7, DramaID: 1, Step: "compose", Episodes: []int{1}, Status: "queued", Lane: "user",
+		InputJSON: []byte(`{"episode_id":4}`), Output: []byte(`{}`),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	checkStale()
+	if queue.calls.Load() != 0 {
+		t.Fatal("stale request enqueued a job")
+	}
+}
+
+func TestDramaSegmentPG16_ListEpisodeContinuesWhileProjectLocked(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	db := slice2cPG16(t)
+	migrateCurrentSchemaPG16(t, db)
+	seedSchema0RatioPG16(t, db)
+	repo := repository.NewDramaRepository(db)
+	svc := service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: repo, Assets: pgTakeAssets{db: db}})
+	err := repo.WithTx(ctx, func(tx repository.DramaTx) error {
+		if _, err := tx.Project(ctx, 7, 1, true); err != nil {
+			return err
+		}
+		readCtx, readCancel := context.WithTimeout(ctx, time.Second)
+		defer readCancel()
+		ep, views, err := svc.ListEpisode(readCtx, 7, 1, 1)
+		if err != nil {
+			return err
+		}
+		if ep.ID != 3 || len(views) != 2 || views[0].EpisodeID != idcodec.Encode(3) {
+			return fmt.Errorf("episode or membership mismatch: ep=%+v views=%+v", ep, views)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("read-only ListEpisode waited on a project write lock: %v", err)
 	}
 }

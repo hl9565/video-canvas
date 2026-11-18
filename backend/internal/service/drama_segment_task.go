@@ -9,68 +9,15 @@ import (
 	"strconv"
 	"strings"
 
-	"go.uber.org/zap"
-
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
-	"video-canvas/internal/pkg/logger"
 	"video-canvas/internal/repository"
 )
 
 // segmentNode 与对外片段ID共用编码，避免将数据库主键直接暴露给节点。
 func segmentNode(sid uint64) string {
 	return "seg:" + idcodec.Encode(sid)
-}
-
-// readView 读入口与回调、恢复共用锁内对账，避免绕过准入或显式清空。
-func (s *DramaSegmentService) readView(ctx context.Context, userID, sid uint64) (*model.DramaSegmentView, *model.DramaProject, *model.DramaEpisode, bool, error) {
-	return s.readSegmentView(ctx, userID, sid, true)
-}
-
-// readSegmentView 可选择只读快照，QC 和非采用导入的响应不能隐式递增采用版本。
-func (s *DramaSegmentService) readSegmentView(ctx context.Context, userID, sid uint64, reconcile bool) (*model.DramaSegmentView, *model.DramaProject, *model.DramaEpisode, bool, error) {
-	var p *model.DramaProject
-	var ep *model.DramaEpisode
-	var row *model.DramaSegment
-	var takes []resolvedSegmentTake
-	var runs []model.DramaSegmentFrameRun
-	var changed bool
-	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
-		var err error
-		p, ep, row, err = lockSegment(ctx, tx, userID, sid)
-		if err != nil {
-			return err
-		}
-		takes, err = ResolveSegmentTakes(ctx, tx, s.assets, p, row)
-		if err != nil {
-			return err
-		}
-		if reconcile {
-			changed, err = s.reconcileSegment(ctx, tx, p, row, takes)
-			if err != nil {
-				return err
-			}
-			ep, err = tx.SegmentEpisode(ctx, userID, row.EpisodeID)
-			if err != nil {
-				return err
-			}
-		}
-		runs, err = tx.FrameRunsBySegment(ctx, userID, sid)
-		return err
-	})
-	if err != nil {
-		return nil, nil, nil, false, segmentError(err)
-	}
-	v, err := s.segmentView(ctx, row, ep.No, ep.SegmentVersion, takes)
-	if v != nil {
-		v.FrameRun = latestSegmentFrameRun(runs)
-		if err == nil && v.FrameRun != nil && s.frameRuns != nil {
-			index := slices.IndexFunc(runs, func(run model.DramaSegmentFrameRun) bool { return run.ID == uint64(v.FrameRun.ID) })
-			err = s.frameRuns.EnrichFrameRunView(ctx, userID, &runs[index], v.FrameRun)
-		}
-	}
-	return v, p, ep, changed, err
 }
 
 // reconcileSegment 先推进可用视频的关系，再独立执行自动采用；只推进流程不改变段/集版本。
@@ -83,7 +30,7 @@ func (s *DramaSegmentService) reconcileSegment(ctx context.Context, tx repositor
 		}
 		changed = changed || promoted
 	}
-	if row.ChosenTaskID != nil || row.ChosenCleared {
+	if !canAutoAdoptSegment(row) {
 		return changed, nil
 	}
 	for _, take := range takes {
@@ -99,7 +46,7 @@ func (s *DramaSegmentService) reconcileSegment(ctx context.Context, tx repositor
 
 // Get 返回单段最新视图，并复用统一候选对账。
 func (s *DramaSegmentService) Get(ctx context.Context, userID, sid uint64) (*model.DramaSegmentView, error) {
-	// 1. 所有读入口都执行同一个父链锁和流程推进路径。
+	// 1. 先读取一致快照，只在发现遗漏的写回时加锁恢复。
 	v, p, ep, changed, err := s.readView(ctx, userID, sid)
 	if err == nil && changed {
 		s.publishSegment(ctx, p, ep, v)
@@ -185,31 +132,36 @@ func segmentOutputAsset(task *model.GenerationTask, kind string) (uint64, error)
 	return 0, nil
 }
 
+// bareSegmentView 从已提交行投影变更结果，独立于候选和流程读取。
+func bareSegmentView(row *model.DramaSegment, ep *model.DramaEpisode) *model.DramaSegmentView {
+	v := &model.DramaSegmentView{
+		ID: idcodec.ID(row.ID), EpisodeID: idcodec.Encode(ep.ID), EpisodeNo: ep.No,
+		Seq: row.Seq, Seconds: row.Seconds, Prompt: row.Prompt, Revision: row.Revision,
+		SegmentVersion: ep.SegmentVersion, UpdatedAt: row.UpdatedAt, ChosenCleared: row.ChosenCleared,
+		Adaptations: map[string]model.DramaSegmentAdaptation{}, Takes: []model.DramaSegmentTakeView{}, Status: "idle",
+		VisualKind: dramaVisualKind(*row), StillAssetID: cloneUint64Ptr(row.StillAssetID),
+	}
+	v.Edit = model.DramaSegmentEditView{SourceInF: row.SourceInF, SourceOutF: row.SourceOutF, MuteOriginal: row.MuteOriginal, AudioGainDB: row.AudioGainDB, NativeIsDialogue: row.NativeIsDialogue, AvPtsOffsetMs: row.AvPtsOffsetMs}
+	if v.VisualKind == model.DramaVisualVideo && row.ChosenTaskID != nil {
+		v.ChosenTaskID = idcodec.Encode(*row.ChosenTaskID)
+	}
+	return v
+}
+
 // segmentView 只展示合格候选；有效进行态可显示 running，失格 I2V 的迟到状态不得污染片段。
-func (s *DramaSegmentService) segmentView(ctx context.Context, row *model.DramaSegment, no int, segVersion int64, takes []resolvedSegmentTake) (*model.DramaSegmentView, error) {
+func segmentView(row *model.DramaSegment, ep *model.DramaEpisode, takes []resolvedSegmentTake) (*model.DramaSegmentView, error) {
 	adaptations, err := segmentAdaptations(row)
 	if err != nil {
 		return nil, err
 	}
-	v := &model.DramaSegmentView{ID: idcodec.ID(row.ID), EpisodeNo: no, Seq: row.Seq, Seconds: row.Seconds, Prompt: row.Prompt, Adaptations: adaptations, Takes: []model.DramaSegmentTakeView{}, Status: "idle", Revision: row.Revision, SegmentVersion: segVersion, UpdatedAt: row.UpdatedAt, ChosenCleared: row.ChosenCleared}
-	v.Edit = model.DramaSegmentEditView{SourceInF: row.SourceInF, SourceOutF: row.SourceOutF, MuteOriginal: row.MuteOriginal, AudioGainDB: row.AudioGainDB, NativeIsDialogue: row.NativeIsDialogue, AvPtsOffsetMs: row.AvPtsOffsetMs}
-	tasks := make([]model.GenerationTask, 0, len(takes))
-	for _, take := range takes {
-		if take.Usable {
-			tasks = append(tasks, take.Task)
-		}
+	v := bareSegmentView(row, ep)
+	v.Adaptations = adaptations
+	fx, err := model.DecodeDramaSegmentFX(row.FXJSON)
+	if err != nil {
+		return nil, err
 	}
-	frames, probeErr := s.resolveSegmentSourceFrames(ctx, row.UserID, row.ChosenTaskID, tasks)
-	if probeErr != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		logger.Warn("片段读取探测源帧数失败，降级为未知帧数", zap.Uint64("segment_id", row.ID), zap.Error(probeErr))
-	} else {
-		v.SourceFrameCount = frames
-	}
-	if row.ChosenTaskID != nil {
-		v.ChosenTaskID = idcodec.Encode(*row.ChosenTaskID)
+	if fx != (model.DramaSegmentFX{}) {
+		v.FX = &fx
 	}
 	for _, take := range takes {
 		if !visibleSegmentTake(row, take) {
@@ -355,16 +307,16 @@ func (s *DramaSegmentService) callbackTakeVisible(ctx context.Context, task *mod
 }
 
 // latestSegmentFrameRun 优先展示当前活跃流程，没有活跃流程时展示最近一次历史流程。
-func latestSegmentFrameRun(runs []model.DramaSegmentFrameRun) *model.DramaSegmentFrameRunView {
+func latestSegmentFrameRun(runs []model.DramaSegmentFrameRun) *model.DramaSegmentFrameRun {
 	if len(runs) == 0 {
 		return nil
 	}
 	for i := len(runs) - 1; i >= 0; i-- {
 		if slices.Contains([]model.DramaFrameRunState{model.FrameRunStateDraft, model.FrameRunStateFramePending, model.FrameRunStateFrameReady, model.FrameRunStateConfirmed, model.FrameRunStateSubmitting, model.FrameRunStateVideoPending}, runs[i].State) {
-			return frameRunView(&runs[i])
+			return &runs[i]
 		}
 	}
-	return frameRunView(&runs[len(runs)-1])
+	return &runs[len(runs)-1]
 }
 
 // replayFrameRun 要求创建意图和目标片段均一致，允许图片提交中断后继续原任务。

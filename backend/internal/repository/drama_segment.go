@@ -1,10 +1,12 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"math"
 	"time"
 
+	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -67,7 +69,10 @@ func segmentMaterialChanged(prev, cur *model.DramaSegment) bool {
 	if prev.Seq != cur.Seq || prev.ChosenCleared != cur.ChosenCleared || !sameChosenTask(prev.ChosenTaskID, cur.ChosenTaskID) {
 		return true
 	}
-	return prev.SourceInF != cur.SourceInF ||
+	return prev.EffectiveVisualKind() != cur.EffectiveVisualKind() ||
+		!sameChosenTask(prev.StillAssetID, cur.StillAssetID) ||
+		!bytes.Equal(model.CanonicalDramaSegmentFXJSON(prev.FXJSON), model.CanonicalDramaSegmentFXJSON(cur.FXJSON)) ||
+		prev.SourceInF != cur.SourceInF ||
 		!sameNullableInt32(prev.SourceOutF, cur.SourceOutF) ||
 		prev.MuteOriginal != cur.MuteOriginal ||
 		math.Round(prev.AudioGainDB*100) != math.Round(cur.AudioGainDB*100) ||
@@ -89,6 +94,8 @@ func (r *DramaRepository) SaveSegmentNoBump(ctx context.Context, row *model.Dram
 	if _, err := r.SegmentEpisode(ctx, row.UserID, row.EpisodeID); err != nil {
 		return false, err
 	}
+	row.VisualKind = row.EffectiveVisualKind()
+	row.FXJSON = datatypes.JSON(model.CanonicalDramaSegmentFXJSON(row.FXJSON))
 	if row.ID == 0 {
 		if err := r.db.WithContext(ctx).Create(row).Error; err != nil {
 			return false, err
@@ -110,6 +117,7 @@ func (r *DramaRepository) SaveSegmentNoBump(ctx context.Context, row *model.Dram
 		"source_in_f": row.SourceInF, "source_out_f": sourceOutF,
 		"mute_original": row.MuteOriginal, "audio_gain_db": row.AudioGainDB,
 		"native_is_dialogue": row.NativeIsDialogue, "av_pts_offset_ms": row.AvPtsOffsetMs,
+		"visual_kind": row.VisualKind, "still_asset_id": row.StillAssetID, "fx_json": row.FXJSON,
 		"revision": gorm.Expr("revision + 1"), "updated_at": now,
 	})
 	if res.Error != nil {

@@ -18,6 +18,8 @@ type DramaSegmentRepo interface {
 	DramaTakeReader
 	// WithTx 原子执行片段变更，锁顺序为项目后片段。
 	WithTx(context.Context, func(repository.DramaTx) error) error
+	// WithSnapshotTx 在只读可重复读事务中组装所有视图输入。
+	WithSnapshotTx(context.Context, func(repository.DramaTx) error) error
 	// Project 校验项目归属和存活状态。
 	Project(context.Context, uint64, uint64, bool) (*model.DramaProject, error)
 	// Episodes 返回项目分集。
@@ -111,28 +113,56 @@ func NewDramaSegmentService(d DramaSegmentDeps) *DramaSegmentService {
 
 // List 校验用户项目后按顺序返回片段，并恢复漏处理的成功任务写回。
 func (s *DramaSegmentService) List(ctx context.Context, userID, dramaID uint64, no int) ([]model.DramaSegmentView, error) {
-	// 1. 项目和集必须都存活且属于当前用户。
-	_, ep, err := s.episode(ctx, userID, dramaID, no)
+	_, items, err := s.ListEpisode(ctx, userID, dramaID, no)
+	return items, err
+}
+
+// ListEpisode 从一个只读快照返回集身份、版本、成员、候选和流程；只为待恢复片段加锁。
+func (s *DramaSegmentService) ListEpisode(ctx context.Context, userID, dramaID uint64, no int) (model.DramaEpisode, []model.DramaSegmentView, error) {
+	// 1. 仅在只读快照发现待推进的流程或待采用的视频时执行恢复。
+	p, ep, reads, err := s.readEpisodeSegments(ctx, userID, dramaID, no)
 	if err != nil {
-		return nil, err
+		return model.DramaEpisode{}, nil, err
 	}
-	rows, err := s.repo.Segments(ctx, userID, ep.ID)
+	changed, attempted, err := s.recoverEpisodeSegments(ctx, reads)
 	if err != nil {
-		return nil, err
+		return model.DramaEpisode{}, nil, err
 	}
-	// 2. 与观察者共用事务恢复逻辑，通知失败后读接口仍能自动采用与更新首帧。
-	out := make([]model.DramaSegmentView, 0, len(rows))
-	for i := range rows {
-		v, p, episode, changed, err := s.readView(ctx, userID, rows[i].ID)
+	// 2. 恢复后重读整集；不把分别读取的片段拼进同一个响应。
+	if attempted {
+		p, ep, reads, err = s.readEpisodeSegments(ctx, userID, dramaID, no)
 		if err != nil {
-			return nil, err
-		}
-		out = append(out, *v)
-		if changed {
-			s.publishSegment(ctx, p, episode, v)
+			return model.DramaEpisode{}, nil, err
 		}
 	}
-	return out, nil
+	views, err := s.projectSegmentReads(ctx, &ep, reads)
+	if err != nil {
+		return model.DramaEpisode{}, nil, err
+	}
+	for i := range views {
+		if changed[uint64(views[i].ID)] {
+			s.publishSegment(ctx, p, &ep, &views[i])
+		}
+	}
+	return ep, views, nil
+}
+
+func (s *DramaSegmentService) recoverEpisodeSegments(ctx context.Context, reads []segmentRead) (map[uint64]bool, bool, error) {
+	changed := make(map[uint64]bool)
+	attempted := false
+	for i := range reads {
+		read := &reads[i]
+		if !read.needsRecovery() {
+			continue
+		}
+		attempted = true
+		wrote, err := s.reconcileReadSegment(ctx, read.row.UserID, read.row.ID)
+		if err != nil && !isSegmentMissing(err) {
+			return nil, false, err
+		}
+		changed[read.row.ID] = wrote
+	}
+	return changed, attempted, nil
 }
 
 // Summary 返回某集片段数、总秒数和已采用数，计数之前恢复任务写回。
@@ -158,11 +188,20 @@ func (s *DramaSegmentService) Summary(ctx context.Context, userID, episodeID uin
 
 // episode 根据项目ID和集号定位，其他用户和父项目删除统一为短剧不存在。
 func (s *DramaSegmentService) episode(ctx context.Context, userID, dramaID uint64, no int) (*model.DramaProject, *model.DramaEpisode, error) {
-	p, err := s.repo.Project(ctx, userID, dramaID, false)
+	return locateEpisode(ctx, s.repo, userID, dramaID, no)
+}
+
+type segmentEpisodeLocator interface {
+	Project(context.Context, uint64, uint64, bool) (*model.DramaProject, error)
+	Episodes(context.Context, uint64, uint64) ([]model.DramaEpisode, error)
+}
+
+func locateEpisode(ctx context.Context, reader segmentEpisodeLocator, userID, dramaID uint64, no int) (*model.DramaProject, *model.DramaEpisode, error) {
+	p, err := reader.Project(ctx, userID, dramaID, false)
 	if err != nil {
 		return nil, nil, dramaError(err)
 	}
-	rows, err := s.repo.Episodes(ctx, userID, dramaID)
+	rows, err := reader.Episodes(ctx, userID, dramaID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -246,21 +285,27 @@ func (s *DramaFrameRunService) EnrichFrameRunView(ctx context.Context, userID ui
 	if run == nil || view == nil || run.UserID != userID {
 		return errcode.ErrDramaFrameRunNotFound
 	}
-	view.FrameSHA256, view.CanvasTicket = "", ""
+	var asset *model.Asset
 	if run.FrameAssetID != nil {
-		asset, err := s.assets.Get(ctx, userID, *run.FrameAssetID)
+		var err error
+		asset, err = s.assets.Get(ctx, userID, *run.FrameAssetID)
 		if err != nil && !isFrameInvalid(frameAssetError(err)) {
 			return err
 		}
-		if err == nil && asset != nil && asset.ID == *run.FrameAssetID && asset.UserID == userID && asset.Kind == model.KindImage {
-			view.FrameSHA256 = asset.Sha256
-		}
 	}
-	// 2. 终态不再签发可写票据；票据本身仍需 SetFrame 校验实时来源画布。
+	s.projectFrameRunDetails(run, asset, view)
+	return nil
+}
+
+// projectFrameRunDetails 使用调用方已读取的素材元数据，签名只在本地进行。
+func (s *DramaFrameRunService) projectFrameRunDetails(run *model.DramaSegmentFrameRun, asset *model.Asset, view *model.DramaSegmentFrameRunView) {
+	view.FrameSHA256, view.CanvasTicket = "", ""
+	if run.FrameAssetID != nil && asset != nil && asset.ID == *run.FrameAssetID && asset.UserID == run.UserID && asset.Kind == model.KindImage {
+		view.FrameSHA256 = asset.Sha256
+	}
 	if run.FrameSource == model.FrameSourceCanvas && run.OriginCanvasID != nil && !terminalFrameRun(run.State) {
 		view.CanvasTicket = s.signFrameCanvasTicket(run)
 	}
-	return nil
 }
 
 // terminalFrameRun 终态释放唯一活跃槽位，并禁止继续更新首帧。

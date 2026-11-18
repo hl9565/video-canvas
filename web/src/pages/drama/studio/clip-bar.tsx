@@ -14,6 +14,7 @@ import { VideoPoster } from "@/components/canvas/media-preview";
 import { SegmentTrimDrawer } from "@/components/drama/segment-trim-drawer";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { isVideoVisual, programTimeline, visualBadges } from "@/utils/drama/program";
 import { hasNonDefaultSegmentEdit, segmentEditOf } from "@/utils/drama/segment-trim";
 import { applyOrder, clipWidth, orderIds, playableTake, sameOrder } from "@/utils/drama/segments";
 
@@ -34,9 +35,11 @@ function Clip({
   onSelect: () => void;
 }) {
   const { submitting } = useStudio();
-  const take = playableTake(segment);
+  const video = isVideoVisual(segment);
+  const take = video ? playableTake(segment) : null;
+  const seconds = video ? segment.seconds : programTimeline([segment]).totalFrames / 24;
   const running = segment.status === "running" || submitting.has(segment.id);
-  const trimmed = hasNonDefaultSegmentEdit(segmentEditOf(segment));
+  const trimmed = video && hasNonDefaultSegmentEdit(segmentEditOf(segment));
   return (
     <Reorder.Item
       value={segment}
@@ -44,8 +47,8 @@ function Clip({
       role="button"
       tabIndex={0}
       aria-current={selected}
-      aria-label={`片段 ${segment.seq + 1}，${segment.seconds} 秒`}
-      style={{ width: clipWidth(segment.seconds) }}
+      aria-label={`片段 ${segment.seq + 1}，${seconds} 秒`}
+      style={{ width: clipWidth(seconds) }}
       // 点击（不是拖动）才选中：拖动结束不会误触
       onTap={onSelect}
       onKeyDown={(event) => {
@@ -63,7 +66,9 @@ function Clip({
           : "ring-border hover:ring-foreground/30 ring-1",
       )}
     >
-      {take?.asset ? (
+      {segment.visualKind === "black" ? (
+        <div className="size-full bg-black" />
+      ) : take?.asset ? (
         <VideoPoster src={take.asset.url} />
       ) : (
         <div className="text-muted-foreground grid size-full place-items-center pb-4">
@@ -76,6 +81,13 @@ function Clip({
           )}
         </div>
       )}
+      <span className="pointer-events-none absolute top-1 left-1 flex gap-1">
+        {visualBadges(segment).map((label) => (
+          <span key={label} className="bg-background/80 text-foreground rounded px-1 text-[10px]">
+            {label}
+          </span>
+        ))}
+      </span>
       {trimmed && (
         <span
           title="该片段已有精裁或原声调整"
@@ -91,7 +103,7 @@ function Clip({
         )}
       >
         <span>{String(segment.seq + 1).padStart(2, "0")}</span>
-        <span>{segment.seconds}s</span>
+        <span>{video ? seconds : Number(seconds.toFixed(2))}s</span>
       </div>
     </Reorder.Item>
   );
@@ -103,8 +115,16 @@ function Clip({
  * 连播：按 seq 依次播采用的视频，播放头随时间移动，点片段跳到该段开头。
  */
 export function ClipBar() {
-  const { segments, selected, select, actions, trimDrawer, frameRunDrawer, importTakesModal } =
-    useStudio();
+  const {
+    segments,
+    selected,
+    select,
+    actions,
+    trimDrawer,
+    visualDrawer,
+    frameRunDrawer,
+    importTakesModal,
+  } = useStudio();
   const playback = usePlaybackContext();
   const { bindPlayhead } = playback;
   // 拖动过程中只改本地顺序，松手再提交；store 里的片段一变（推送、服务端确认）就回到 store 的版本
@@ -112,10 +132,10 @@ export function ClipBar() {
   const [localTrimId, setLocalTrimId] = useState<string | null>(null);
   const [localTrimConflict, setLocalTrimConflict] = useState<string | null>(null);
   const shown = local && local.base === segments ? local.list : segments;
-  const canTrim = !!selected && !!playableTake(selected);
+  const canTrim = !!selected && isVideoVisual(selected) && !!playableTake(selected);
 
   const openSelectedTrim = () => {
-    if (!selected || !playableTake(selected)) return;
+    if (!selected || !canTrim) return;
     if (trimDrawer) {
       trimDrawer.open(selected.id);
     } else {
@@ -125,7 +145,9 @@ export function ClipBar() {
   };
 
   const localTrimSegment =
-    !trimDrawer && localTrimId ? (segments.find((item) => item.id === localTrimId) ?? null) : null;
+    !trimDrawer && localTrimId
+      ? (segments.find((item) => item.id === localTrimId && isVideoVisual(item)) ?? null)
+      : null;
 
   const handleLocalSave = async (input: Omit<UpdateSegmentInput, "revision">) => {
     if (!localTrimSegment) return;
@@ -196,6 +218,17 @@ export function ClipBar() {
         >
           导入画布视频
         </Button>
+        {visualDrawer && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            disabled={!selected}
+            onClick={() => selected && visualDrawer.open(selected.id)}
+          >
+            画面与特效
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="sm"

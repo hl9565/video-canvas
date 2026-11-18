@@ -6,12 +6,28 @@ import type {
   DramaJob,
   DramaJobInput,
   DramaManifestView,
+  DramaManifestV2Response,
   EpisodeSummary,
   Segment,
 } from "@/api/drama/type";
 
 import { isActiveJob } from "./jobs";
-import { hasVideo } from "./segments";
+import {
+  hasRenderableVisual,
+  programDiagnosticText,
+  usesProgramFeatures,
+  VISUAL_RATIO_MESSAGE,
+} from "./program";
+
+export { hasPlayableTake, hasRenderableVisual } from "./program";
+
+export type ComposeManifest = DramaManifestView | DramaManifestV2Response;
+
+export const manifestProgramDiagnostics = (manifest?: ComposeManifest | null) =>
+  manifest && "programDiagnostics" in manifest ? (manifest.programDiagnostics ?? []) : [];
+
+export const previewProgramDiagnostics = (manifest?: ComposeManifest | null) =>
+  manifestProgramDiagnostics(manifest).map(programDiagnosticText);
 
 /** 后端 PR1 支持的合成尺寸与变体（sample 只是前端显示别名，不发给接口） */
 export const COMPOSE_SIZES = ["720p", "1080p"] as const satisfies readonly DramaComposeSize[];
@@ -85,6 +101,7 @@ export interface BuildComposeJobInputArgs {
   size?: DramaComposeSize;
   variants?: readonly DramaComposeVariant[];
   composeRequestKey?: string;
+  expectedEpisodeId?: string;
 }
 
 /** 构造提交合成任务的输入：仅当带有新版清单 / 档位 / 变体字段时附带 compose 对象 */
@@ -106,6 +123,7 @@ export function buildComposeJobInput(args: BuildComposeJobInputArgs): DramaJobIn
     episodes: [args.episodeNo],
     ...(compose ? { compose } : {}),
     ...(args.composeRequestKey ? { composeRequestKey: args.composeRequestKey } : {}),
+    ...(args.expectedEpisodeId ? { expectedEpisodeId: args.expectedEpisodeId } : {}),
   };
 }
 
@@ -158,8 +176,21 @@ export type ComposeCheck = { enabled: boolean; reason: string | null };
 export function composeCheck(
   segments: readonly Segment[],
   busyReason: string | null,
+  options?: { manifestV2?: ComposeManifest | null; ratio?: string; programAudioCount?: number },
 ): ComposeCheck {
-  if (!segments.some(hasVideo)) {
+  if (
+    options?.ratio &&
+    options.ratio !== "16:9" &&
+    usesProgramFeatures(
+      segments,
+      options.programAudioCount ?? options.manifestV2?.manifest?.program.audio.length,
+    )
+  ) {
+    return { enabled: false, reason: VISUAL_RATIO_MESSAGE };
+  }
+  const diagnostics = previewProgramDiagnostics(options?.manifestV2);
+  if (diagnostics.length) return { enabled: false, reason: `节目单需要修复：${diagnostics[0]}` };
+  if (!segments.some(hasRenderableVisual)) {
     return { enabled: false, reason: "至少要有一个片段采用了视频才能合成" };
   }
   if (busyReason) return { enabled: false, reason: busyReason };
@@ -179,10 +210,14 @@ export function composeCheckEpisode(
 }
 
 /** 没有采用视频的片段（合成时会被跳过）的 seq，按顺序；seq 从 0 起 */
-export const missingVideoSeqs = (segments: readonly Segment[]): number[] =>
+export const missingVideoSeqs = (
+  segments: readonly Segment[],
+  manifest?: Pick<ComposeManifest, "skippedSeqs"> | null,
+): number[] =>
+  manifest?.skippedSeqs ??
   [...segments]
     .sort((a, b) => a.seq - b.seq)
-    .filter((segment) => !hasVideo(segment))
+    .filter((segment) => !hasRenderableVisual(segment))
     .map((segment) => segment.seq);
 
 /** 把 seq 列表写成界面上的序号：`[1, 3]` → 「02、04」 */

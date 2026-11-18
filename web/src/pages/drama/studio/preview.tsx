@@ -2,7 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Clapperboard, Film, Loader2, RefreshCw, Scissors, TriangleAlert } from "lucide-react";
 
-import { createEpisodePreview, getEpisodeManifest, getEpisodePreview } from "@/api/drama";
+import {
+  createEpisodePreview,
+  getEpisodeManifest,
+  getEpisodeManifestV2,
+  getEpisodePreview,
+} from "@/api/drama";
 import {
   DRAMA_ERR,
   dramaErrorMessage,
@@ -13,7 +18,8 @@ import {
 } from "@/api/drama/errors";
 import type {
   DramaComposeVariant,
-  DramaManifestView,
+  DramaPreviewRange,
+  ProgramDiagnostic,
   EpisodePreviewView,
   Segment,
   UpdateSegmentInput,
@@ -25,8 +31,24 @@ import { Button } from "@/components/ui/button";
 import { EASE_OUT } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 import { useDramaJobsStore } from "@/store/drama";
-import { COMPOSE_VARIANT_LABEL, COMPOSE_VARIANTS, skippedText } from "@/utils/drama/compose";
-import { waitForEpisodeManifest } from "@/utils/drama/manifest";
+import { segmentKey, useDramaSegmentsStore } from "@/store/drama-segments";
+import {
+  COMPOSE_VARIANT_LABEL,
+  COMPOSE_VARIANTS,
+  type ComposeManifest,
+  manifestProgramDiagnostics,
+  skippedText,
+} from "@/utils/drama/compose";
+import { waitForEpisodeManifest, waitForEpisodeManifestV2 } from "@/utils/drama/manifest";
+import {
+  clampPreviewRange,
+  isVideoVisual,
+  programDiagnosticsFrom,
+  programDiagnosticText,
+  usesProgramFeatures,
+  VISUAL_RATIO_MESSAGE,
+} from "@/utils/drama/program";
+import { reloadSegments } from "@/utils/drama/segment-events";
 import { hasNonDefaultSegmentEdit, segmentEditOf } from "@/utils/drama/segment-trim";
 import { playableTake } from "@/utils/drama/segments";
 import { ApiError } from "@/utils/requests/request";
@@ -100,7 +122,8 @@ type PreviewErrorSource = "init" | "poll" | "failed" | "stream";
 
 type CpuPreviewSnapshot = {
   key: string;
-  manifest: DramaManifestView | null;
+  manifest: ComposeManifest | null;
+  programDiagnostics?: ProgramDiagnostic[];
   preview: EpisodePreviewView | null;
   failedObservedAtMs: number | null;
   loading: boolean;
@@ -223,13 +246,18 @@ const resetInactiveBaseline = (
 
 function failedSnapshotPatch(
   preview: EpisodePreviewView,
+  previous: CpuPreviewSnapshot,
 ): Partial<Omit<CpuPreviewSnapshot, "key">> {
   return {
     preview,
     failedObservedAtMs: Date.now(),
     loading: false,
-    error: "CPU 预览生成失败，请检查片段视频并重试",
+    error: preview.errorMessage?.trim() || "CPU 预览生成失败，请检查片段视频并重试",
     errorSource: "failed",
+    programDiagnostics: preview.programDiagnostics?.length
+      ? preview.programDiagnostics
+      : previous.programDiagnostics,
+    staleNotice: preview.errorCode === DRAMA_ERR.manifestStale || previous.staleNotice,
   };
 }
 
@@ -377,18 +405,33 @@ function CpuEpisodePreview({
   no,
   ratio,
   invalidationKey,
+  useV2,
+  selectedSegmentId,
+  onManifestStale,
   onClose,
 }: {
   dramaId: string;
   no: number;
   ratio: string;
   invalidationKey: string;
+  useV2: boolean;
+  selectedSegmentId?: string;
+  onManifestStale?: () => Promise<void> | void;
   onClose: () => void;
 }) {
+  const onManifestStaleRef = useRef(onManifestStale);
+  useEffect(() => {
+    onManifestStaleRef.current = onManifestStale;
+  }, [onManifestStale]);
   const [variant, setVariant] = useState<DramaComposeVariant>("clean");
   const [refreshTick, setRefreshTick] = useState(0);
   const [cooldownTickMs, setCooldownTickMs] = useState(() => Date.now());
-  const intentKey = `${dramaId}:${no}:${invalidationKey}:${variant}`;
+  const [range, setRange] = useState<DramaPreviewRange | "segment" | null>(null);
+  const [inText, setInText] = useState("0");
+  const [outText, setOutText] = useState("");
+  const previewRange = useV2 ? range : null;
+  const rangeSegment = previewRange === "segment" ? selectedSegmentId : undefined;
+  const intentKey = `${dramaId}:${no}:${invalidationKey}:${variant}:${useV2}:${JSON.stringify(previewRange)}:${rangeSegment ?? ""}`;
   const activeRunKey = `${intentKey}::${refreshTick}`;
   const [snapshot, setSnapshot] = useState<CpuPreviewSnapshot | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -400,9 +443,11 @@ function CpuEpisodePreview({
   const rebuildCountRef = useRef(0);
   const pendingStaleNoticeRef = useRef(false);
   const manualRefreshInFlightRef = useRef(false);
+  const cooldownV1EmptyCheckedRef = useRef<string | null>(null);
 
   const current = snapshot?.key === activeRunKey ? snapshot : null;
   const manifest = current?.manifest ?? null;
+  const programDiagnostics = current?.programDiagnostics ?? manifestProgramDiagnostics(manifest);
   const preview = current?.preview ?? null;
   const loading = current ? current.loading : true;
   const error = current?.error ?? null;
@@ -500,7 +545,10 @@ function CpuEpisodePreview({
         return;
       }
       rebuildCountRef.current += 1;
-      if (stale) pendingStaleNoticeRef.current = true;
+      if (stale) {
+        pendingStaleNoticeRef.current = true;
+        onManifestStaleRef.current?.();
+      }
       setRefreshTick((n) => n + 1);
     },
     [applySnapshot],
@@ -517,6 +565,7 @@ function CpuEpisodePreview({
           applySnapshot(runKey, { staleNotice: true });
         }
         let staleRetries = 0;
+        let checkedV1Empty = false;
         let expiredRetries = 0;
         let ticketToPoll = startTicket ?? null;
 
@@ -549,7 +598,7 @@ function CpuEpisodePreview({
                 });
                 return;
               }
-              applySnapshot(runKey, failedSnapshotPatch(polled.preview));
+              applySnapshot(runKey, (prev) => failedSnapshotPatch(polled.preview, prev));
               return;
             }
             if (polled.kind === "ticket_invalid") {
@@ -578,6 +627,9 @@ function CpuEpisodePreview({
                 });
                 return;
               }
+              await onManifestStaleRef.current?.();
+              await controller.sleep(0);
+              if (controller.cancelled) return;
               continue;
             }
             // fatal 或 transient_exhausted：保留已创建的 ticket，允许用户点击重试直接继续查询 GET
@@ -590,7 +642,9 @@ function CpuEpisodePreview({
           }
 
           try {
-            const manifestResult = await waitForEpisodeManifest(dramaId, no, {
+            const manifestResult = await (
+              useV2 ? waitForEpisodeManifestV2 : waitForEpisodeManifest
+            )(dramaId, no, {
               signal: controller.signal,
               isCancelled: () =>
                 controller.cancelled || activeControllerRef.current?.controller !== controller,
@@ -609,12 +663,43 @@ function CpuEpisodePreview({
             if (controller.cancelled || activeControllerRef.current?.controller !== controller) {
               return;
             }
-            applySnapshot(runKey, { manifest: currentManifest });
+            const diagnostics = manifestProgramDiagnostics(currentManifest);
+            applySnapshot(runKey, { manifest: currentManifest, programDiagnostics: diagnostics });
+            if (diagnostics.length || (useV2 && !currentManifest.manifestHash)) {
+              applySnapshot(runKey, {
+                loading: false,
+                error: diagnostics.length ? "请修复节目单后再预览" : "暂无可预览的片段",
+                errorSource: "init",
+              });
+              return;
+            }
+            const clip =
+              previewRange === "segment"
+                ? currentManifest.manifest?.clips.find((item) => item.segmentId === rangeSegment)
+                : null;
+            if (previewRange === "segment" && !clip) {
+              applySnapshot(runKey, {
+                loading: false,
+                error: "当前镜头不在预览清单中",
+                errorSource: "init",
+              });
+              return;
+            }
+            const requested = clip
+              ? { inF: clip.masterInF, outF: clip.masterOutF }
+              : previewRange === "segment"
+                ? null
+                : previewRange;
+            const rangeF =
+              requested && currentManifest.manifest
+                ? clampPreviewRange(requested, currentManifest.manifest.totalFrames)
+                : undefined;
 
             const created = await createEpisodePreview(dramaId, no, {
               segmentVersion: currentManifest.segmentVersion,
               manifestHash: currentManifest.manifestHash,
               variant,
+              ...(rangeF ? { rangeF } : {}),
             });
             if (controller.cancelled) return;
 
@@ -632,7 +717,7 @@ function CpuEpisodePreview({
               continue;
             }
             if (created.status === "failed") {
-              applySnapshot(runKey, failedSnapshotPatch(created));
+              applySnapshot(runKey, (prev) => failedSnapshotPatch(created, prev));
               return;
             }
             applySnapshot(runKey, {
@@ -645,9 +730,19 @@ function CpuEpisodePreview({
             return;
           } catch (err) {
             if (controller.cancelled) return;
-            if (isManifestStaleError(err)) {
-              staleRetries += 1;
-              applySnapshot(runKey, { preview: null, staleNotice: true, loading: true });
+            const v1EmptyRetry =
+              !useV2 && !checkedV1Empty && isDramaError(err, DRAMA_ERR.nothingToCompose);
+            if (isManifestStaleError(err) || v1EmptyRetry) {
+              if (v1EmptyRetry) {
+                checkedV1Empty = true;
+              } else {
+                staleRetries += 1;
+              }
+              applySnapshot(runKey, {
+                preview: null,
+                staleNotice: !v1EmptyRetry,
+                loading: true,
+              });
               if (staleRetries > PREVIEW_MAX_STALE_RETRIES) {
                 applySnapshot(runKey, {
                   preview: null,
@@ -658,11 +753,15 @@ function CpuEpisodePreview({
                 });
                 return;
               }
+              await onManifestStaleRef.current?.();
+              await controller.sleep(0);
+              if (controller.cancelled) return;
               continue;
             }
             applySnapshot(runKey, {
               loading: false,
               error: dramaErrorMessage(err, "CPU 预览加载失败，请稍后重试"),
+              programDiagnostics: programDiagnosticsFrom(err),
               errorSource: "init",
             });
             return;
@@ -672,7 +771,7 @@ function CpuEpisodePreview({
         controller.lifecycleRunning = false;
       }
     },
-    [applySnapshot, dramaId, no, variant],
+    [applySnapshot, dramaId, no, previewRange, rangeSegment, useV2, variant],
   );
 
   useEffect(() => {
@@ -729,7 +828,7 @@ function CpuEpisodePreview({
             });
             void runLifecycle(controller, expectedRunKey, res.preview.ticket);
           } else if (res.preview.status === "failed") {
-            applySnapshot(expectedRunKey, failedSnapshotPatch(res.preview));
+            applySnapshot(expectedRunKey, (prev) => failedSnapshotPatch(res.preview, prev));
           }
           return;
         }
@@ -837,7 +936,7 @@ function CpuEpisodePreview({
           });
           void runLifecycle(controller, expectedRunKey, res.preview.ticket);
         } else {
-          applySnapshot(expectedRunKey, failedSnapshotPatch(res.preview));
+          applySnapshot(expectedRunKey, (prev) => failedSnapshotPatch(res.preview, prev));
         }
         return;
       }
@@ -1094,6 +1193,7 @@ function CpuEpisodePreview({
   const triggerManualRebuild = () => {
     rebuildCountRef.current = 0;
     pendingStaleNoticeRef.current = false;
+    cooldownV1EmptyCheckedRef.current = null;
     setRefreshTick((n) => n + 1);
   };
 
@@ -1112,7 +1212,9 @@ function CpuEpisodePreview({
         return;
       }
       manualRefreshInFlightRef.current = true;
-      void getEpisodeManifest(dramaId, no, { signal: activeEntry?.controller.signal })
+      void (useV2 ? getEpisodeManifestV2 : getEpisodeManifest)(dramaId, no, {
+        signal: activeEntry?.controller.signal,
+      })
         .then((fresh) => {
           if (
             activeControllerRef.current?.runKey !== expectedRunKey ||
@@ -1131,12 +1233,32 @@ function CpuEpisodePreview({
           }
           setCooldownTickMs(Date.now());
         })
-        .catch(() => {
+        .catch((err: unknown) => {
           if (
             activeControllerRef.current?.runKey !== expectedRunKey ||
             activeControllerRef.current?.controller !== activeEntry?.controller ||
             activeEntry?.controller.cancelled
           ) {
+            return;
+          }
+          if (
+            !useV2 &&
+            isDramaError(err, DRAMA_ERR.nothingToCompose) &&
+            cooldownV1EmptyCheckedRef.current !== expectedRunKey &&
+            onManifestStaleRef.current
+          ) {
+            cooldownV1EmptyCheckedRef.current = expectedRunKey;
+            void Promise.resolve(onManifestStaleRef.current())
+              .catch(() => {})
+              .finally(() => {
+                if (
+                  activeControllerRef.current?.runKey === expectedRunKey &&
+                  activeControllerRef.current?.controller === activeEntry?.controller &&
+                  !activeEntry?.controller.cancelled
+                ) {
+                  setCooldownTickMs(Date.now());
+                }
+              });
             return;
           }
           setCooldownTickMs(Date.now());
@@ -1186,7 +1308,7 @@ function CpuEpisodePreview({
           {manifest && (
             <span className="bg-muted text-muted-foreground rounded px-1.5 py-0.5 font-mono text-[11px]">
               v{manifest.segmentVersion} · #{manifest.manifestHash.slice(0, 8)} ·{" "}
-              {manifest.manifest.totalFrames}f
+              {manifest.manifest?.totalFrames ?? 0}f
             </span>
           )}
         </div>
@@ -1230,9 +1352,11 @@ function CpuEpisodePreview({
           role="status"
           className="border-amber-500/40 bg-amber-500/10 rounded-lg border px-3 py-2 text-xs text-amber-900 dark:text-amber-200"
         >
-          {error
-            ? `分镜清单版本已变更（${DRAMA_ERR.manifestStale}），已拉取最新清单。`
-            : `分镜清单版本已变更（${DRAMA_ERR.manifestStale}），已自动拉取最新清单重新构建预览。`}
+          {preview?.status === "failed" && preview.errorCode === DRAMA_ERR.manifestStale
+            ? `分镜清单版本已变更（${DRAMA_ERR.manifestStale}），请刷新预览。`
+            : error
+              ? `分镜清单版本已变更（${DRAMA_ERR.manifestStale}），已拉取最新清单。`
+              : `分镜清单版本已变更（${DRAMA_ERR.manifestStale}），已自动拉取最新清单重新构建预览。`}
         </div>
       )}
 
@@ -1243,6 +1367,89 @@ function CpuEpisodePreview({
         >
           <TriangleAlert className="size-3.5 shrink-0 text-amber-500" />
           <span>{skippedText(manifest.skippedSeqs)} 暂无采用视频，预览中已跳过。</span>
+        </div>
+      )}
+
+      {useV2 && (
+        <form
+          aria-label="预览帧范围"
+          className="flex flex-wrap items-end gap-1.5"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!inText.trim() || !outText.trim()) return;
+            setRange({ inF: Number(inText), outF: Number(outText) });
+          }}
+        >
+          <Button
+            type="button"
+            variant={range === null ? "secondary" : "outline"}
+            size="sm"
+            onClick={() => setRange(null)}
+          >
+            整集
+          </Button>
+          <Button
+            type="button"
+            variant={range === "segment" ? "secondary" : "outline"}
+            size="sm"
+            disabled={!selectedSegmentId}
+            onClick={() => setRange("segment")}
+          >
+            当前镜头
+          </Button>
+          <label className="text-muted-foreground grid gap-0.5 text-[11px]">
+            入点帧
+            <input
+              className="border-input w-20 rounded border px-1 py-1"
+              type="number"
+              step={1}
+              value={inText}
+              onChange={(event) => setInText(event.target.value)}
+            />
+          </label>
+          <label className="text-muted-foreground grid gap-0.5 text-[11px]">
+            出点帧（不含）
+            <input
+              className="border-input w-20 rounded border px-1 py-1"
+              type="number"
+              step={1}
+              value={outText}
+              onChange={(event) => setOutText(event.target.value)}
+            />
+          </label>
+          <Button
+            type="submit"
+            variant={range && range !== "segment" ? "secondary" : "outline"}
+            size="sm"
+            disabled={!outText.trim()}
+          >
+            预览帧范围
+          </Button>
+        </form>
+      )}
+
+      {programDiagnostics.length > 0 && (
+        <div
+          role="alert"
+          className="border-status-warning/30 bg-status-warning/10 rounded-lg border p-2 text-xs"
+        >
+          <div className="text-status-warning font-medium">节目单诊断</div>
+          <ul className="mt-1 list-disc pl-4">
+            {programDiagnostics.map((issue, idx) => (
+              <li key={`${issue.cue_id ?? issue.segment_id}:${issue.reason}:${idx}`}>
+                {programDiagnosticText(issue)}
+                <span className="text-muted-foreground ml-1">
+                  {[
+                    issue.cue_id && `条目 ${issue.cue_id}`,
+                    issue.segment_id && `分镜 ${issue.segment_id}`,
+                    `${issue.field} · ${issue.reason}`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 
@@ -1324,7 +1531,19 @@ function CpuEpisodePreview({
  * 连播用的两个 video 一直挂着（轮播时只是藏起来），否则开始连播时拿不到它们。
  */
 export function Preview() {
-  const { drama, episode, no, selected, actions, submitting, segments, trimDrawer } = useStudio();
+  const {
+    drama,
+    episode,
+    no,
+    selected,
+    actions,
+    submitting,
+    segments,
+    trimDrawer,
+    program,
+    assets,
+    refresh: refreshStudio,
+  } = useStudio();
   const playback = usePlaybackContext();
   const settledCount = useDramaJobsStore((state) => state.settled[drama.id] ?? 0);
   const [cpuPreviewOpen, setCpuPreviewOpen] = useState(false);
@@ -1334,8 +1553,28 @@ export function Preview() {
   } | null>(null);
   const [trimConflict, setTrimConflict] = useState<string | null>(null);
 
+  const epKey = segmentKey(drama.id, no);
+  const [staleSegments, setStaleSegments] = useState<{
+    key: string;
+    base: readonly Segment[];
+    items: Segment[];
+  } | null>(null);
+  const effectiveSegments =
+    staleSegments && staleSegments.key === epKey && staleSegments.base === segments
+      ? staleSegments.items
+      : segments;
+
+  const stageC = usesProgramFeatures(effectiveSegments, program?.savedDocument?.audio?.length);
+  const useV2 = drama.ratio === "16:9" && stageC;
+  const blockedPreview =
+    stageC && !useV2
+      ? VISUAL_RATIO_MESSAGE
+      : !useV2 && program && !program.savedDocument && !program.error
+        ? "正在读取节目单"
+        : null;
   const activeTrimTarget = trimDrawer ? trimDrawer.target : localTrimTarget;
   const openTrim = (segment: Segment, pendingTaskId?: string | null) => {
+    if (!isVideoVisual(segment)) return;
     setTrimConflict(null);
     if (trimDrawer) trimDrawer.open(segment.id, pendingTaskId ?? null);
     else setLocalTrimTarget({ segmentId: segment.id, pendingTaskId: pendingTaskId ?? null });
@@ -1347,7 +1586,9 @@ export function Preview() {
   };
 
   const trimSegment = activeTrimTarget
-    ? (segments.find((item) => item.id === activeTrimTarget.segmentId) ?? null)
+    ? (effectiveSegments.find(
+        (item) => item.id === activeTrimTarget.segmentId && isVideoVisual(item),
+      ) ?? null)
     : null;
 
   const handleSaveTrim = async (
@@ -1373,13 +1614,28 @@ export function Preview() {
 
   // 连播时预览跟着当前片段（选中也会跟过去，这里直接按连播的当前片段取，不等选中更新）
   const current = segments.find((item) => item.id === playback.currentId) ?? selected;
-  const take = selected ? playableTake(selected) : null;
-  const shownTake = playback.active && current ? playableTake(current) : take;
+  const take = selected && isVideoVisual(selected) ? playableTake(selected) : null;
+  const shownTake =
+    playback.active && current && isVideoVisual(current) ? playableTake(current) : take;
   const running = !!selected && (selected.status === "running" || submitting.has(selected.id));
-  const carousel = !playback.active && !cpuPreviewOpen && !!selected && selected.takes.length > 0;
+  const carousel =
+    !playback.active &&
+    !cpuPreviewOpen &&
+    !!selected &&
+    isVideoVisual(selected) &&
+    selected.takes.length > 0;
   const canTrim = !!selected && !!take && !playback.active;
-  const selectedTrimmed = !!selected && hasNonDefaultSegmentEdit(segmentEditOf(selected));
-  const invalidationKey = `${drama.id}:${no}:${drama.ratio}:${episode?.segmentVersion ?? 0}:${settledCount}:${segments.map((s) => `${s.id}:${s.revision}:${s.chosenTaskId}`).join("|")}`;
+  const selectedTrimmed =
+    !!selected && isVideoVisual(selected) && hasNonDefaultSegmentEdit(segmentEditOf(selected));
+  const stillSrc =
+    selected?.visualKind === "still" && typeof selected.stillAssetId === "number"
+      ? assets.find(
+          (asset) =>
+            asset.kind === "image" &&
+            asset.assetId === (selected.stillAssetIdText ?? String(selected.stillAssetId)),
+        )?.src
+      : null;
+  const invalidationKey = `${drama.id}:${no}:${drama.ratio}:${episode?.segmentVersion ?? 0}:${settledCount}:${effectiveSegments.map((s) => `${s.id}:${s.revision}:${s.visualKind ?? "video"}:${s.stillAssetIdText ?? s.stillAssetId ?? ""}:${s.chosenTaskId}`).join("|")}`;
 
   return (
     <section
@@ -1416,9 +1672,9 @@ export function Preview() {
             type="button"
             variant={cpuPreviewOpen ? "default" : "outline"}
             size="sm"
-            disabled={playback.active}
+            disabled={playback.active || (!cpuPreviewOpen && !!blockedPreview)}
             aria-pressed={cpuPreviewOpen}
-            title="拉取冻结清单并在服务端生成整集 CPU 预览流"
+            title={blockedPreview ?? "拉取冻结清单并在服务端生成整集 CPU 预览流"}
             onClick={() => setCpuPreviewOpen((prev) => !prev)}
           >
             <Film />
@@ -1435,7 +1691,23 @@ export function Preview() {
               no={no}
               ratio={drama.ratio}
               invalidationKey={invalidationKey}
-              onClose={() => setCpuPreviewOpen(false)}
+              useV2={useV2}
+              selectedSegmentId={selected?.id}
+              onManifestStale={async () => {
+                const [, reloaded] = await Promise.all([
+                  refreshStudio?.(),
+                  reloadSegments(drama.id, no),
+                  program?.sync?.(),
+                ]);
+                if (reloaded) {
+                  const next = useDramaSegmentsStore.getState().byEpisode[epKey];
+                  if (next) setStaleSegments({ key: epKey, base: segments, items: next });
+                }
+              }}
+              onClose={() => {
+                setStaleSegments(null);
+                setCpuPreviewOpen(false);
+              }}
             />
           </div>
         )}
@@ -1492,6 +1764,14 @@ export function Preview() {
               </span>
               <span>{current?.seconds}s</span>
             </div>
+          ) : selected?.visualKind === "black" ? (
+            <span className="text-xs text-white/70">黑场</span>
+          ) : selected?.visualKind === "still" ? (
+            stillSrc ? (
+              <img src={stillSrc} alt="静帧" className="size-full object-cover" />
+            ) : (
+              <span className="text-xs text-white/70">静帧</span>
+            )
           ) : running ? (
             <TaskGenerationStatus className="size-full" />
           ) : (

@@ -2,8 +2,10 @@
 package dramasegmentfake
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"math"
 	"slices"
 	"strings"
@@ -37,6 +39,10 @@ type Repo struct {
 	SegmentVersion  int64
 	EditSchema      int16
 	EpisodeRevision int64
+	Ratio           string
+	ProgramJSON     json.RawMessage
+	Assets          map[uint64]model.Asset
+	MediaProbes     map[uint64]model.AssetMediaProbe
 	// Credit 是用户 1 的积分账户（nil 表示没有账户）；Ledger 记录写入的流水
 	Credit *model.UserCredit
 	Ledger []model.CreditLedger
@@ -44,7 +50,7 @@ type Repo struct {
 }
 
 // New 返回用户1、项目7、画布9、集10的独立测试仓储。
-func New() *Repo { return &Repo{nextID: 1} }
+func New() *Repo { return &Repo{nextID: 1, Ratio: "16:9"} }
 
 // WithTx 在错误时恢复片段快照，防止非法重排造成部分写入。
 func (r *Repo) WithTx(_ context.Context, fn func(repository.DramaTx) error) error {
@@ -65,6 +71,11 @@ func (r *Repo) WithTx(_ context.Context, fn func(repository.DramaTx) error) erro
 	return err
 }
 
+// WithSnapshotTx 在只读一致性快照中运行读闭包，默认沿用内存测试仓储的事务克隆隔离。
+func (r *Repo) WithSnapshotTx(ctx context.Context, fn func(repository.DramaTx) error) error {
+	return r.WithTx(ctx, fn)
+}
+
 // Project 只返回当前用户的存活项目。
 func (r *Repo) Project(_ context.Context, userID, id uint64, _ bool) (*model.DramaProject, error) {
 	if r.Err != nil {
@@ -73,7 +84,7 @@ func (r *Repo) Project(_ context.Context, userID, id uint64, _ bool) (*model.Dra
 	if r.ProjectDeleted || userID != 1 || id != 7 {
 		return nil, repository.ErrNotFound
 	}
-	return &model.DramaProject{BaseModel: model.BaseModel{ID: 7}, UserID: 1, CanvasID: 9, Revision: 1}, nil
+	return &model.DramaProject{BaseModel: model.BaseModel{ID: 7}, UserID: 1, CanvasID: 9, Ratio: r.Ratio, Revision: 1}, nil
 }
 
 // Episodes 返回存活项目的一集。
@@ -86,7 +97,7 @@ func (r *Repo) Episodes(ctx context.Context, userID, id uint64) ([]model.DramaEp
 		v := time.Now()
 		lockedAt = &v
 	}
-	return []model.DramaEpisode{{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1, LockedAt: lockedAt, Revision: max(r.EpisodeRevision, 1), EditSchema: r.EditSchema, SegmentVersion: r.SegmentVersion}}, nil
+	return []model.DramaEpisode{{BaseModel: model.BaseModel{ID: 10}, UserID: 1, DramaID: 7, No: 1, LockedAt: lockedAt, Revision: max(r.EpisodeRevision, 1), EditSchema: r.EditSchema, SegmentVersion: r.SegmentVersion, ProgramJSON: []byte(slices.Clone(r.ProgramJSON))}}, nil
 }
 
 // GetByID 返回用户 1 的画布 9；模拟软删后来源画布不再可读。
@@ -153,6 +164,8 @@ func (r *Repo) SaveSegmentNoBump(ctx context.Context, row *model.DramaSegment, r
 	if _, err := r.SegmentEpisode(ctx, row.UserID, row.EpisodeID); err != nil {
 		return false, err
 	}
+	row.VisualKind = row.EffectiveVisualKind()
+	row.FXJSON = model.CanonicalDramaSegmentFXJSON(row.FXJSON)
 	if row.ID == 0 {
 		row.ID, row.CreatedAt, row.UpdatedAt = r.nextID, time.Now(), time.Now()
 		r.nextID++
@@ -201,6 +214,32 @@ func (r *Repo) BumpSegmentVersion(ctx context.Context, userID, episodeID uint64)
 	}
 	r.SegmentVersion++
 	return nil
+}
+
+// ReplaceSegments 软删用户的全集片段并替换，任务与素材保留，集版本只递增一次。
+func (r *Repo) ReplaceSegments(ctx context.Context, userID, episodeID uint64, rows []model.DramaSegment) error {
+	if _, err := r.SegmentEpisode(ctx, userID, episodeID); err != nil {
+		return err
+	}
+	if err := r.CancelEpisodeFrameRuns(ctx, userID, episodeID); err != nil {
+		return err
+	}
+	now := time.Now()
+	for i := range r.Rows {
+		row := &r.Rows[i]
+		if row.UserID == userID && row.EpisodeID == episodeID && !row.DeletedAt.Valid {
+			row.DeletedAt.Time, row.DeletedAt.Valid = now, true
+		}
+		r.nextID = max(r.nextID, row.ID+1)
+	}
+	for i := range rows {
+		rows[i].BaseModel = model.BaseModel{}
+		rows[i].UserID, rows[i].EpisodeID, rows[i].Seq, rows[i].Revision = userID, episodeID, i, 1
+		if _, err := r.SaveSegmentNoBump(ctx, &rows[i], 0); err != nil {
+			return err
+		}
+	}
+	return r.BumpSegmentVersion(ctx, userID, episodeID)
 }
 
 // SegmentTasks 按用户、画布、节点过滤正式任务，并稳定按创建时间和ID排序。
@@ -396,6 +435,54 @@ func (r *Repo) LockSegments(ctx context.Context, userID uint64, ids []uint64) ([
 	return rows, nil
 }
 
+// List 返回测试用户唯一的项目。
+func (r *Repo) List(ctx context.Context, userID uint64, _ string, _, _ int) ([]model.DramaProject, int64, error) {
+	p, err := r.Project(ctx, userID, 7, false)
+	if err != nil {
+		return nil, 0, err
+	}
+	return []model.DramaProject{*p}, 1, nil
+}
+
+// Get 返回当前用户的素材元数据。
+func (r *Repo) Get(ctx context.Context, userID, id uint64) (*model.Asset, error) {
+	return r.ComposeAsset(ctx, userID, id)
+}
+
+// ComposeAsset 仅读取当前用户的素材快照。
+func (r *Repo) ComposeAsset(_ context.Context, userID, id uint64) (*model.Asset, error) {
+	asset, ok := r.Assets[id]
+	if !ok || asset.UserID != userID {
+		return nil, repository.ErrNotFound
+	}
+	return &asset, nil
+}
+
+// SegmentVideoProbe 只返回匹配快照素材指纹与版本的探测缓存。
+func (r *Repo) SegmentVideoProbe(_ context.Context, id uint64, sha256 string, version int16) (*model.AssetMediaProbe, error) {
+	probe, ok := r.MediaProbes[id]
+	if !ok || probe.Sha256 != sha256 || probe.ProbeVersion != version {
+		return nil, repository.ErrNotFound
+	}
+	return &probe, nil
+}
+
+// SaveEpisodeProgram 模拟集主键和片段版本 CAS，节目单保存不影响其他集字段。
+func (r *Repo) SaveEpisodeProgram(ctx context.Context, userID, dramaID, epID uint64, expectedSegmentVersion int64, editSchema int16, programJSON json.RawMessage, materialChange bool) error {
+	if _, err := r.Project(ctx, userID, dramaID, false); err != nil || epID != 10 || expectedSegmentVersion != r.SegmentVersion {
+		return repository.ErrStateConflict
+	}
+	r.ProgramJSON = slices.Clone(programJSON)
+	r.EpisodeRevision = max(r.EpisodeRevision, 1) + 1
+	if editSchema > 0 {
+		r.EditSchema = editSchema
+	}
+	if materialChange {
+		r.SegmentVersion++
+	}
+	return nil
+}
+
 // SaveEpisode 模拟集级版本校验与精裁标记保存，不额外递增片段版本。
 func (r *Repo) SaveEpisode(_ context.Context, ep *model.DramaEpisode, revision int64) error {
 	if revision != max(r.EpisodeRevision, 1) {
@@ -409,7 +496,10 @@ func (r *Repo) SaveEpisode(_ context.Context, ep *model.DramaEpisode, revision i
 // segmentMaterialChanged 判断需要递增集版本的采用、顺序或精裁变更。
 func segmentMaterialChanged(a, b model.DramaSegment) bool {
 	sameOut := a.SourceOutF == nil && b.SourceOutF == nil || a.SourceOutF != nil && b.SourceOutF != nil && *a.SourceOutF == *b.SourceOutF
-	return a.Seq != b.Seq || a.ChosenCleared != b.ChosenCleared || !sameChosen(a.ChosenTaskID, b.ChosenTaskID) || a.SourceInF != b.SourceInF || !sameOut || a.MuteOriginal != b.MuteOriginal || math.Round(a.AudioGainDB*100) != math.Round(b.AudioGainDB*100) || a.NativeIsDialogue != b.NativeIsDialogue || a.AvPtsOffsetMs != b.AvPtsOffsetMs
+	return a.EffectiveVisualKind() != b.EffectiveVisualKind() ||
+		!sameChosen(a.StillAssetID, b.StillAssetID) ||
+		!bytes.Equal(model.CanonicalDramaSegmentFXJSON(a.FXJSON), model.CanonicalDramaSegmentFXJSON(b.FXJSON)) ||
+		a.Seq != b.Seq || a.ChosenCleared != b.ChosenCleared || !sameChosen(a.ChosenTaskID, b.ChosenTaskID) || a.SourceInF != b.SourceInF || !sameOut || a.MuteOriginal != b.MuteOriginal || math.Round(a.AudioGainDB*100) != math.Round(b.AudioGainDB*100) || a.NativeIsDialogue != b.NativeIsDialogue || a.AvPtsOffsetMs != b.AvPtsOffsetMs
 }
 
 func clonePointer[T any](p *T) *T {

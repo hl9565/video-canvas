@@ -246,6 +246,8 @@ func New(mode, jwtSecret string, h Handlers) *gin.Engine {
 		dramas.POST("/:id/episodes", h.Drama.CreateEpisode)
 		dramas.PATCH("/:id/episodes/:no", h.Drama.UpdateEpisode)
 		dramas.DELETE("/:id/episodes/:no", h.Drama.DeleteEpisode)
+		dramas.GET("/:id/episodes/:no/program", h.Drama.GetProgram)
+		dramas.PUT("/:id/episodes/:no/program", h.Drama.PutProgram)
 		dramas.GET("/:id/episodes/:no/manifest", h.Drama.Manifest)
 		dramas.POST("/:id/episodes/:no/preview", h.Drama.CreatePreview)
 		dramas.GET("/:id/episodes/:no/preview/:ticket", h.Drama.GetPreview)

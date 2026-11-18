@@ -196,6 +196,7 @@ const toBackendSegment = (seg: Segment) => ({
   seq: seg.seq,
   seconds: seg.seconds,
   prompt: seg.prompt,
+  visual_kind: seg.visualKind,
   takes: seg.takes.map((t) => ({
     task_id: t.taskId,
     status: t.status,
@@ -488,6 +489,133 @@ describe("片场 quote-then-generate、单段粘滞隔离、单镜约束与版�
       await mounted.unmount();
     }
   });
+
+  for (const visualKind of ["still", "black"] as const) {
+    for (const phase of ["initial", "flush", "adapt-flush", "dialog", "assets"] as const) {
+      test(`批量转写生成跳过 ${phase} 阶段切换的 ${visualKind}，保留 video`, async () => {
+        const genericModel = {
+          ...modelInfo,
+          capabilities: { ...modelInfo.capabilities, prompt_format: "generic" },
+        };
+        useModelsStore.setState({
+          byKind: { video: { status: "ready", models: [genericModel], loadedAt: Date.now() } },
+        });
+        let switched = makeSegment("switch", 0, {
+          chosenTaskId: "",
+          takes: [],
+          status: "idle",
+          visualKind: phase === "initial" ? visualKind : "video",
+        });
+        const valid = makeSegment("valid", 1, {
+          chosenTaskId: "",
+          takes: [],
+          status: "idle",
+          visualKind: "video",
+        });
+        const setList = () =>
+          useDramaSegmentsStore.getState().setList("d-studio", 1, [switched, valid]);
+        const switchMode = () => {
+          switched = { ...switched, visualKind, revision: switched.revision + 1 };
+          setList();
+        };
+        setList();
+        const adapted: string[] = [];
+        const generated: string[] = [];
+        let switchOnAssets = false;
+        spies.push(
+          spyOn(service, "get").mockImplementation(async (url: string) => {
+            if (url.startsWith("/canvas/")) {
+              if (switchOnAssets) switchMode();
+              return { id: "c-studio", graph: { nodes: [], edges: [] } } as never;
+            }
+            if (url.endsWith("/segments"))
+              return { items: [switched, valid].map(toBackendSegment) } as never;
+            return {} as never;
+          }),
+          spyOn(service, "post").mockImplementation(async (url: string, body?: unknown) => {
+            const sid = url.split("/")[2]!;
+            if (url.endsWith("/adapt")) {
+              adapted.push(sid);
+              const segment = sid === switched.id ? switched : valid;
+              return {
+                ...toBackendSegment(segment),
+                visual_kind: segment.visualKind,
+                adaptations: {
+                  generic: { prompt: "A close-up shot", source_hash: "hash", edited: false },
+                },
+              } as never;
+            }
+            if (url.endsWith("/quote"))
+              return {
+                effective_input: (body as { input: unknown }).input,
+                raw_size: "720p",
+                credits: 10,
+                quote_token: "qt",
+                expires_at: "2099-01-01T00:00:00Z",
+              } as never;
+            if (url.endsWith("/generate")) {
+              generated.push(sid);
+              return { task: { id: `task-${sid}`, status: "queued", outputs: [] } } as never;
+            }
+            return {} as never;
+          }),
+        );
+        let studio!: Studio;
+        const mounted = await dom.mount(
+          <StudioTestHarness
+            drama={makeDrama()}
+            onStudio={(s) => (studio = s)}
+            renderControls={false}
+          />,
+        );
+        let unregister: (() => void) | undefined;
+        try {
+          await dom.flush(30);
+          let flushes = 0;
+          unregister = studio.registerEditor({
+            flush: async () => {
+              flushes += 1;
+              if (
+                (phase === "flush" && flushes === 1) ||
+                (phase === "adapt-flush" && flushes === 2)
+              )
+                switchMode();
+            },
+          });
+          let done = false;
+          let running!: Promise<void>;
+          await dom.act(async () => {
+            running = studio.actions.batch().finally(() => {
+              done = true;
+            });
+          });
+          const deadline = Date.now() + 1500;
+          let chosen = false;
+          while (!done && Date.now() < deadline) {
+            await dom.flush(10);
+            const button = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+              (b) => b.textContent === "转写后生成",
+            );
+            if (button && !chosen) {
+              chosen = true;
+              await dom.act(async () => {
+                if (phase === "dialog") switchMode();
+                switchOnAssets = phase === "assets";
+                button.click();
+              });
+            }
+          }
+          expect(done).toBe(true);
+          await running;
+          expect(adapted).toEqual(phase === "assets" ? ["switch", "valid"] : ["valid"]);
+          expect(generated).toEqual(["valid"]);
+        } finally {
+          unregister?.();
+          await mounted.unmount();
+        }
+      });
+    }
+  }
 
   test("单段生成遇 91002 自动刷新一次 quote 并重试成功；持续 91002 时展示「刷新报价」且不误当 revision 冲突", async () => {
     const s1 = makeSegment("s1", 0);

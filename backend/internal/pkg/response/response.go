@@ -40,13 +40,16 @@ func NoContent(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// Fail 把 error 转成统一响应；非 *errcode.Error 的错误视为内部错误，记录日志后只返回通用提示。
+// Fail 返回业务错误及其公开数据；其余错误记日志并只返回通用提示。
 func Fail(c *gin.Context, err error) {
 	var e *errcode.Error
+	var data any
 	if !errors.As(err, &e) {
 		// 带上请求的关联字段（request_id、user_id、请求里的运行），和访问日志、业务日志能用同一个编号串起来
 		logger.Ctx(c.Request.Context()).Error("internal error", zap.Error(err), zap.String("path", c.Request.URL.Path))
 		e = errcode.ErrInternal
+	} else {
+		data = e.Data
 	}
-	c.AbortWithStatusJSON(e.HTTPStatus(), Body{Code: e.Code, Msg: e.Msg, RequestID: utils.GetRequestID(c)})
+	c.AbortWithStatusJSON(e.HTTPStatus(), Body{Code: e.Code, Msg: e.Msg, Data: data, RequestID: utils.GetRequestID(c)})
 }

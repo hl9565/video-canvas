@@ -8,6 +8,7 @@ import (
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
 	"video-canvas/internal/pkg/idcodec"
+	"video-canvas/internal/pkg/jsonhash"
 	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/repository"
 	"video-canvas/internal/service"
@@ -52,7 +53,7 @@ func TestDramaSegmentService_EditProbeCacheAndRollback(t *testing.T) {
 	taskID, canvasID := uint64(31), uint64(9)
 	repo.Rows = []model.DramaSegment{{BaseModel: model.BaseModel{ID: 11}, UserID: 1, EpisodeID: 10, Seconds: 5, Revision: 1, ChosenTaskID: &taskID}}
 	repo.Tasks = []model.GenerationTask{{ID: taskID, UserID: 1, CanvasProjectID: &canvasID, NodeID: "seg:" + idcodec.Encode(11), Kind: model.KindVideo, Status: model.TaskSucceeded, OutputJSON: []byte(`[{"asset_id":17,"media_type":"video"}]`)}}
-	assets := &segEditAssets{assets: map[uint64]*model.Asset{17: {ID: 17, UserID: 1, Kind: model.KindVideo, Sha256: "hash", StorageKey: "video.mp4"}}}
+	assets := &segEditAssets{assets: map[uint64]*model.Asset{17: {ID: 17, UserID: 1, Kind: model.KindVideo, Sha256: jsonhash.SHA256Hex([]byte("fake-video")), StorageKey: "video.mp4"}}}
 	cache := &segmentProbeCache{}
 	calls := 0
 	svc := service.NewDramaSegmentService(service.DramaSegmentDeps{Repo: repo, Tasks: repo.Repo, Assets: assets, Probes: cache,
@@ -95,6 +96,46 @@ func TestDramaSegmentService_EditProbeCacheAndRollback(t *testing.T) {
 			t.Fatalf("重复 0.004 不应递增版本: err=%v view=%+v ver=%d", gErr, gView, repo.SegmentVersion)
 		}
 		rev = gView.Revision
+	}
+}
+
+func TestDramaSegmentService_ProbeRejectsTamperedBytesAndIgnoresV1Cache(t *testing.T) {
+	ctx := context.Background()
+	repo := dramasegmentfake.New()
+	taskID, canvasID := uint64(31), uint64(9)
+	repo.Rows = []model.DramaSegment{{BaseModel: model.BaseModel{ID: 11}, UserID: 1, EpisodeID: 10, Seconds: 5, Revision: 1, ChosenTaskID: &taskID}}
+	repo.Tasks = []model.GenerationTask{{ID: taskID, UserID: 1, CanvasProjectID: &canvasID, NodeID: "seg:" + idcodec.Encode(11), Kind: model.KindVideo, Status: model.TaskSucceeded, OutputJSON: []byte(`[{"asset_id":17,"media_type":"video"}]`)}}
+
+	// 1. Mismatched downloaded bytes must fail before ProbeVideo or probes.Upsert can poison cache.
+	mismatchAssets := &segEditAssets{assets: map[uint64]*model.Asset{17: {ID: 17, UserID: 1, Kind: model.KindVideo, Sha256: jsonhash.SHA256Hex([]byte("other-video")), StorageKey: "video.mp4"}}}
+	probes := &versionedProbeCache{rows: map[int16]*model.AssetMediaProbe{}}
+	calls := 0
+	mismatchSvc := service.NewDramaSegmentService(service.DramaSegmentDeps{
+		Repo: repo, Tasks: repo, Assets: mismatchAssets, Probes: probes,
+		ProbeVideo: func(context.Context, string) (videoframe.NormalizedProbe, error) {
+			calls++
+			return videoframe.NormalizedProbe{FpsNum: 24, FpsDen: 1, NormalizedFrames24: 120}, nil
+		},
+	})
+	in := int32(1)
+	if _, err := mismatchSvc.Update(ctx, 1, 11, &model.UpdateDramaSegmentReq{Revision: 1, Edit: &model.DramaSegmentEditPatch{SourceInF: &in}}); err == nil || calls != 0 || len(probes.rows) != 0 {
+		t.Fatalf("tampered segment bytes must not reach ProbeVideo or seed probe cache: err=%v calls=%d rows=%+v", err, calls, probes.rows)
+	}
+
+	// 2. Legacy v1 cached probe must be ignored; verified bytes re-probe under NormalizedProbeVersion (v3).
+	sha := jsonhash.SHA256Hex([]byte("fake-video"))
+	validAssets := &segEditAssets{assets: map[uint64]*model.Asset{17: {ID: 17, UserID: 1, Kind: model.KindVideo, Sha256: sha, StorageKey: "video.mp4"}}}
+	probes.rows[1] = &model.AssetMediaProbe{AssetID: 17, Sha256: sha, ProbeVersion: 1, NormalizedFrames24: 999}
+	verifiedSvc := service.NewDramaSegmentService(service.DramaSegmentDeps{
+		Repo: repo, Tasks: repo, Assets: validAssets, Probes: probes,
+		ProbeVideo: func(context.Context, string) (videoframe.NormalizedProbe, error) {
+			calls++
+			return videoframe.NormalizedProbe{FpsNum: 24, FpsDen: 1, NormalizedFrames24: 100}, nil
+		},
+	})
+	view, err := verifiedSvc.Update(ctx, 1, 11, &model.UpdateDramaSegmentReq{Revision: 1, Edit: &model.DramaSegmentEditPatch{SourceInF: &in}})
+	if err != nil || calls != 1 || view.SourceFrameCount == nil || *view.SourceFrameCount != 100 || probes.rows[videoframe.NormalizedProbeVersion] == nil {
+		t.Fatalf("verified probe must bypass legacy v1 entry: err=%v calls=%d view=%+v rows=%+v", err, calls, view, probes.rows)
 	}
 }
 

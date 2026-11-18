@@ -8,8 +8,8 @@ import (
 	"math"
 )
 
-// NormalizedProbeVersion 是当前 24fps/48kHz 规范化媒体探测缓存的结构版本号。
-const NormalizedProbeVersion int16 = 1
+// NormalizedProbeVersion 是当前 24fps/48kHz 规范化媒体探测缓存的结构版本号（v3 起要求写入前校验下载字节 SHA-256；v2 为独立音频探针）。
+const NormalizedProbeVersion int16 = 3
 
 // 规范化 24fps/48kHz 探测与清单校验常量。
 const (

@@ -72,13 +72,14 @@ type DramaManifestPrepareView struct {
 
 // DramaComposeExport 描述一个已原子发布的合成变体。
 type DramaComposeExport struct {
-	Sha256       string    `json:"sha256"`
-	Variant      string    `json:"variant"`
-	Size         string    `json:"size"`
-	Width        int       `json:"width"`
-	Height       int       `json:"height"`
-	ManifestHash string    `json:"manifest_hash"`
-	Asset        AssetView `json:"asset"`
+	*DramaComposeExportReport           // v1 不带响度报告；v2 的静音测量值序列化为 null。
+	Sha256                    string    `json:"sha256"`
+	Variant                   string    `json:"variant"`
+	Size                      string    `json:"size"`
+	Width                     int       `json:"width"`
+	Height                    int       `json:"height"`
+	ManifestHash              string    `json:"manifest_hash"`
+	Asset                     AssetView `json:"asset"`
 }
 
 // DramaPreviewRange 是母版帧的半开预览区间。
@@ -97,8 +98,20 @@ type DramaPreviewReq struct {
 
 // DramaPreviewView 是不含存储路径的 CPU 预览票据。
 type DramaPreviewView struct {
-	Ticket    string `json:"ticket"`
-	Status    string `json:"status"`
-	StreamURL string `json:"stream_url,omitempty"`
-	ExpiresAt int64  `json:"expires_at"`
+	Ticket             string                   `json:"ticket"`
+	Status             string                   `json:"status"`
+	StreamURL          string                   `json:"stream_url,omitempty"`
+	ExpiresAt          int64                    `json:"expires_at"`
+	ErrorCode          int                      `json:"error_code,omitempty"`
+	ErrorMessage       string                   `json:"error_message,omitempty"`
+	ProgramDiagnostics []DramaPreviewDiagnostic `json:"program_diagnostics,omitempty"`
+}
+
+// DramaPreviewDiagnostic 仅携带公开诊断，分镜 ID 由服务层预先编码。
+type DramaPreviewDiagnostic struct {
+	CueID     string `json:"cue_id,omitempty"`
+	SegmentID string `json:"segment_id,omitempty"`
+	Field     string `json:"field"`
+	Reason    string `json:"reason"`
+	Severity  string `json:"severity"`
 }

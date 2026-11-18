@@ -30,6 +30,9 @@ type DramaSegment struct {
 	AudioGainDB      float64        `gorm:"type:numeric(5,2);not null;default:0;check:ck_ds_gain,audio_gain_db BETWEEN -60 AND 12"`
 	NativeIsDialogue bool           `gorm:"not null;default:false"`
 	AvPtsOffsetMs    int32          `gorm:"type:integer;not null;default:0;check:ck_ds_pts,av_pts_offset_ms BETWEEN -10000 AND 10000"`
+	VisualKind       string         `gorm:"size:8;not null;default:video;check:ck_ds_visual_kind,visual_kind IN ('video','still','black')"`
+	StillAssetID     *uint64        `gorm:"type:bigint;check:ck_ds_visual,(visual_kind = 'video' AND still_asset_id IS NULL) OR (visual_kind = 'still' AND still_asset_id IS NOT NULL AND chosen_task_id IS NULL AND source_in_f = 0 AND source_out_f IS NOT NULL) OR (visual_kind = 'black' AND still_asset_id IS NULL AND chosen_task_id IS NULL AND source_in_f = 0 AND source_out_f IS NOT NULL)"`
+	FXJSON           datatypes.JSON `gorm:"column:fx_json;type:jsonb;not null;default:'{}'::jsonb;check:ck_ds_fx_obj,jsonb_typeof(fx_json) = 'object'"`
 	Revision         int64          `gorm:"not null;default:1"`
 }
 
@@ -41,6 +44,14 @@ type DramaSegmentAdaptation struct {
 	Seconds    int       `json:"seconds,omitempty"`
 	Edited     bool      `json:"edited"`
 	UpdatedAt  time.Time `json:"updated_at"`
+}
+
+// EffectiveVisualKind 将旧片段的空视觉模式视为视频。
+func (r DramaSegment) EffectiveVisualKind() string {
+	if r.VisualKind == "" {
+		return DramaVisualVideo
+	}
+	return r.VisualKind
 }
 
 // TableName 返回片段表名。
@@ -117,12 +128,12 @@ type DramaSegmentEditPatch struct {
 	AvPtsOffsetMs    *int32        `json:"av_pts_offset_ms"`
 }
 
-// DramaProgramAudio 表示整集音频条目（PR1 默认为空切片，PR3 展开详细结构）。
+// DramaProgramAudio 是 v1 清单的音频占位项，JSON 结构保留以维持历史哈希。
 type DramaProgramAudio struct {
 	ID string `json:"id"`
 }
 
-// DramaProgramOverlay 表示整集文字/角标叠层条目（PR1 默认为空切片，PR3 展开详细结构）。
+// DramaProgramOverlay 是 v1 清单的叠层占位项。
 type DramaProgramOverlay struct {
 	ID string `json:"id"`
 }
@@ -137,6 +148,7 @@ type DramaEpisodeProgram struct {
 // DramaSegmentView 是片段工作区和 WebSocket 共用视图。
 type DramaSegmentView struct {
 	ID               idcodec.ID                        `json:"id"`
+	EpisodeID        string                            `json:"episode_id"`
 	EpisodeNo        int                               `json:"episode_no"`
 	Seq              int                               `json:"seq"`
 	Seconds          int                               `json:"seconds"`
@@ -148,10 +160,28 @@ type DramaSegmentView struct {
 	FrameRun         *DramaSegmentFrameRunView         `json:"frame_run,omitempty"`
 	SourceFrameCount *int32                            `json:"source_frame_count"`
 	Edit             DramaSegmentEditView              `json:"edit"`
+	VisualKind       string                            `json:"visual_kind"`
+	StillAssetID     *uint64                           `json:"still_asset_id,omitempty"`
+	FX               *DramaSegmentFX                   `json:"fx,omitempty"`
 	Status           string                            `json:"status"`
 	Revision         int64                             `json:"revision"`
 	SegmentVersion   int64                             `json:"segment_version"`
 	UpdatedAt        time.Time                         `json:"updated_at"`
+}
+
+// MarshalJSON 补齐旧调用方的默认模式，并省略无特效的空对象。
+func (v DramaSegmentView) MarshalJSON() ([]byte, error) {
+	type plain DramaSegmentView
+	if v.VisualKind == "" {
+		v.VisualKind = DramaVisualVideo
+	}
+	if v.VisualKind == DramaVisualStill || v.VisualKind == DramaVisualBlack {
+		v.SourceFrameCount = nil
+	}
+	if v.FX != nil && *v.FX == (DramaSegmentFX{}) {
+		v.FX = nil
+	}
+	return json.Marshal(plain(v))
 }
 
 // CreateDramaSegmentReq 新增片段，after_seq 未传则追加到末尾。
@@ -171,20 +201,31 @@ type UpdateDramaSegmentReq struct {
 	ExpectedTaskID        *idcodec.ID `json:"expected_task_id"`
 	ResetEditOnTaskChange *bool       `json:"reset_edit_on_task_change"`
 	// Edit 更新逐镜裁剪和原声设置
-	Edit *DramaSegmentEditPatch `json:"edit"`
+	Edit         *DramaSegmentEditPatch `json:"edit"`
+	VisualKind   *string                `json:"visual_kind"`
+	StillAssetID OptionalAssetID        `json:"still_asset_id,omitzero"`
+	FX           *DramaSegmentFX        `json:"fx"`
 	// Adaptation 手改某个格式的转写稿；该格式必须已经转写过
 	Adaptation *DramaSegmentAdaptationEdit `json:"adaptation"`
 }
 
-// UnmarshalJSON 将显式 null / 空串采用值规范为清空；采用与清空同时出现时留给业务层拒绝。
+// UnmarshalJSON 拒绝未知字段，并将显式 null / 空串采用值规范为清空。
 func (r *UpdateDramaSegmentReq) UnmarshalJSON(data []byte) error {
 	if r == nil {
 		return errors.New("UpdateDramaSegmentReq: UnmarshalJSON on nil pointer")
 	}
 	type plain UpdateDramaSegmentReq
-	var decoded plain
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	var decoded *plain
+	if err := DecodeDramaJSON(bytes.NewReader(data), &decoded); err != nil {
 		return err
+	}
+	if decoded == nil {
+		return errors.New("分镜更新请求必须是 JSON 对象")
+	}
+	if decoded.VisualKind != nil {
+		if err := validateDramaVisualKind(*decoded.VisualKind); err != nil {
+			return err
+		}
 	}
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
@@ -195,7 +236,7 @@ func (r *UpdateDramaSegmentReq) UnmarshalJSON(data []byte) error {
 			decoded.ChosenTaskID, decoded.ClearChosen = nil, true
 		}
 	}
-	*r = UpdateDramaSegmentReq(decoded)
+	*r = UpdateDramaSegmentReq(*decoded)
 	return nil
 }
 

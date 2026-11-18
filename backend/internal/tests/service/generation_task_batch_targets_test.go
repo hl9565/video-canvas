@@ -113,3 +113,32 @@ func TestGenerationTaskService_BatchPreResolvedMissingGap(t *testing.T) {
 		t.Fatal("只有预解析有效的项可入库与推送")
 	}
 }
+
+func TestGenerationTaskService_BatchRejectsSyntheticDramaTargets(t *testing.T) {
+	env := newTaskSvcEnv(&fakeLimits{initial: 100, defMax: 10})
+	env.registry.snap = v21MultiRegistry(10).snap
+	repo := &batchTargetRepo{fakeTaskRepo: env.repo}
+	repo.drama = &batchDramaTargets{Repo: dramasegmentfake.New(), store: repo, t: t}
+	repo.drama.Rows = []model.DramaSegment{
+		{BaseModel: model.BaseModel{ID: 1}, UserID: 1, EpisodeID: 10, Seconds: 5, Revision: 1},
+		{BaseModel: model.BaseModel{ID: 2}, UserID: 1, EpisodeID: 10, Seconds: 5, Revision: 1, VisualKind: "still", StillAssetID: new(uint64(41)), SourceOutF: new(int32(13))},
+		{BaseModel: model.BaseModel{ID: 3}, UserID: 1, EpisodeID: 10, Seconds: 5, Revision: 1, VisualKind: "black", SourceOutF: new(int32(13))},
+	}
+	svc := service.NewGenerationTaskService(service.GenerationTaskDeps{Repo: repo, Registry: env.registry, Assets: env.assets, Broadcaster: env.bc, Limits: &fakeLimits{initial: 100, defMax: 10}})
+	resp, err := svc.Create(t.Context(), 1, "synthetic-batch", &model.CreateGenerationTaskReq{
+		Kind: model.KindVideo, ModelID: "m1", CanvasID: 9,
+		NodeIDs: []string{"seg:" + idcodec.Encode(1), "seg:" + idcodec.Encode(2), "seg:" + idcodec.Encode(3)},
+		Input:   map[string]any{"prompt": "镜头", "count": 3},
+	})
+	if err != nil || len(resp.Items) != 3 || resp.Items[0].Task == nil {
+		t.Fatalf("eligible video sibling failed: %+v %v", resp, err)
+	}
+	for _, item := range resp.Items[1:] {
+		if item.Task != nil || item.Error == nil || item.Error.Code != 91011 {
+			t.Fatalf("generic batch bypass: %+v", item)
+		}
+	}
+	if len(repo.tasks) != 1 || len(env.bc.msgs) != 1 {
+		t.Fatal("synthetic target produced a task or notification")
+	}
+}

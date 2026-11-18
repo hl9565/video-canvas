@@ -50,6 +50,10 @@ func ResolveSegmentTakes(ctx context.Context, reader DramaTakeReader, assets Dra
 	if err != nil {
 		return nil, err
 	}
+	return resolveSegmentTakeSources(ctx, assets, p, seg, source)
+}
+
+func resolveSegmentTakeSources(ctx context.Context, assets DramaSegmentAssetReader, p *model.DramaProject, seg *model.DramaSegment, source segmentTakeSources) ([]resolvedSegmentTake, error) {
 	out := make([]resolvedSegmentTake, 0, len(source.tasks))
 	for _, task := range source.tasks {
 		take := classifySegmentTake(task, source)
@@ -224,7 +228,7 @@ func takeLinkFor(p *model.DramaProject, seg *model.DramaSegment, take *resolvedS
 
 // PromoteSegmentVideoPendingRun 在父链锁内补缺候选并 CAS 推进 bound，不执行自动采用。
 func PromoteSegmentVideoPendingRun(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, seg *model.DramaSegment, take *resolvedSegmentTake) (bool, error) {
-	if !take.IsFrameRun || !take.Usable || take.Run.State != model.FrameRunStateVideoPending {
+	if !pendingSegmentPromotion(take) {
 		return false, nil
 	}
 	run, err := tx.FrameRun(ctx, seg.UserID, take.Run.ID, true)
@@ -282,9 +286,9 @@ func (s *DramaSegmentService) PatchTakeQC(ctx context.Context, userID, sid, tid 
 	return s.takeMutationView(ctx, userID, sid, true)
 }
 
-// resolveReplacementFrames 在锁外探测驳回替换并保留剪辑时的目标源帧数。
+// resolveReplacementFrames 在锁外探测驳回替换时的目标源帧数。
 func (s *DramaSegmentService) resolveReplacementFrames(ctx context.Context, userID, sid, tid uint64, req *model.PatchDramaTakeQCReq) (*int32, error) {
-	if req.QC != model.TakeQCRejected || req.ReplacementTaskID == nil || req.ResetEditOnTaskChange == nil || *req.ResetEditOnTaskChange {
+	if req.ReplacementTaskID == nil {
 		return nil, nil
 	}
 	_, _, seg, err := s.segmentSource(ctx, userID, sid)
@@ -294,7 +298,13 @@ func (s *DramaSegmentService) resolveReplacementFrames(ctx context.Context, user
 	if seg.Revision != req.Revision {
 		return nil, errcode.ErrCanvasConflict
 	}
-	if seg.ChosenTaskID == nil || *seg.ChosenTaskID != tid {
+	if err := requireDramaVideoSegment(seg); err != nil {
+		return nil, err
+	}
+	if req.QC != model.TakeQCRejected || seg.ChosenTaskID == nil || *seg.ChosenTaskID != tid {
+		return nil, nil
+	}
+	if !needsTakeSelectionFrames(seg, req.ResetEditOnTaskChange) {
 		return nil, nil
 	}
 	targetID := uint64(*req.ReplacementTaskID)
@@ -303,6 +313,11 @@ func (s *DramaSegmentService) resolveReplacementFrames(ctx context.Context, user
 
 // patchTakeQCLocked 把 QC 行与段 CAS 放在同一事务；驳回已采用结果必须显式决定替换或清空。
 func (s *DramaSegmentService) patchTakeQCLocked(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, seg *model.DramaSegment, tid uint64, req *model.PatchDramaTakeQCReq, frames *int32) error {
+	if req.ReplacementTaskID != nil {
+		if err := requireDramaVideoSegment(seg); err != nil {
+			return err
+		}
+	}
 	takes, err := ResolveSegmentTakes(ctx, tx, s.assets, p, seg)
 	if err != nil {
 		return err
@@ -347,7 +362,7 @@ func applyRejectedTakeDisposition(ctx context.Context, tx repository.DramaTx, p 
 		return err
 	}
 	if req.ReplacementTaskID == nil {
-		return nil
+		return validateTakeSelectionEdit(seg, nil, frames)
 	}
 	replacement, err := findUsableSegmentTake(takes, uint64(*req.ReplacementTaskID), false)
 	if err != nil {
@@ -356,10 +371,7 @@ func applyRejectedTakeDisposition(ctx context.Context, tx repository.DramaTx, p 
 	if _, err := PromoteSegmentVideoPendingRun(ctx, tx, p, seg, replacement); err != nil {
 		return err
 	}
-	if req.ResetEditOnTaskChange != nil && !*req.ResetEditOnTaskChange && frames != nil {
-		return validateSegmentEdit(seg, frames)
-	}
-	return nil
+	return validateTakeSelectionEdit(seg, req.ResetEditOnTaskChange, frames)
 }
 
 // replaceRejectedTake 缺少明确处置时拒绝驳回，避免静默丢失当前采用。
@@ -406,12 +418,9 @@ func (s *DramaSegmentService) ImportTakes(ctx context.Context, userID, sid uint6
 	if err != nil {
 		return nil, err
 	}
-	var adoptFrames *int32
-	if req.Adopt && len(ids) == 1 && req.ResetEditOnTaskChange != nil && !*req.ResetEditOnTaskChange {
-		adoptFrames, err = s.resolveSegmentSourceFrames(ctx, userID, &ids[0], nil)
-		if err != nil {
-			return nil, segmentError(err)
-		}
+	adoptFrames, err := s.resolveImportAdoptFrames(ctx, userID, sid, req, ids[0])
+	if err != nil {
+		return nil, segmentError(err)
 	}
 	changed := false
 	// 2. 只关联时不触碰段/集版本；采用时段 CAS 和集媒体版本只保存一次。
@@ -453,6 +462,11 @@ func importTakeIDs(req *model.ImportDramaTakesReq) ([]uint64, error) {
 
 // importTakesLocked 逐条核验当前用户可读视频，任何失败都回滚整批补缺关联。
 func (s *DramaSegmentService) importTakesLocked(ctx context.Context, tx repository.DramaTx, p *model.DramaProject, seg *model.DramaSegment, req *model.ImportDramaTakesReq, ids []uint64, frames *int32) (bool, error) {
+	if req.Adopt {
+		if err := requireDramaVideoSegment(seg); err != nil {
+			return false, err
+		}
+	}
 	tasks, err := tx.TasksByIDs(ctx, seg.UserID, ids)
 	if err != nil {
 		return false, err
@@ -490,10 +504,8 @@ func (s *DramaSegmentService) importTakesLocked(ctx context.Context, tx reposito
 		return false, err
 	}
 	adoptSegmentTake(seg, ids[0], req.ResetEditOnTaskChange)
-	if req.ResetEditOnTaskChange != nil && !*req.ResetEditOnTaskChange && frames != nil {
-		if err := validateSegmentEdit(seg, frames); err != nil {
-			return false, err
-		}
+	if err := validateTakeSelectionEdit(seg, req.ResetEditOnTaskChange, frames); err != nil {
+		return false, err
 	}
 	return changed, tx.SaveSegment(ctx, seg, req.Revision)
 }

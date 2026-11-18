@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -11,10 +12,144 @@ import (
 	"time"
 
 	"video-canvas/internal/model"
+	"video-canvas/internal/pkg/errcode"
+	"video-canvas/internal/pkg/idcodec"
 	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/provider"
 	"video-canvas/internal/service"
 )
+
+func TestDramaPreviewV2PublicFailures(t *testing.T) {
+	diagnostic := model.DramaProgramDiagnostic{CueID: "voice", SegmentID: 5, Field: "asset_id", Reason: "media_unavailable", Severity: "error"}
+	cases := []struct {
+		name        string
+		err         error
+		code        int
+		message     string
+		diagnostics int
+	}{
+		{"business diagnostics", fmt.Errorf("private /tmp/wrapper: %w", errcode.ErrDramaMediaUnavailable.WithData(service.DramaProgramDiagnosticsData{Diagnostics: []service.DramaProgramDiagnostic{{CueID: "voice", SegmentID: 5, Field: "asset_id", Reason: "media_unavailable", Severity: "error"}}})), 91012, errcode.ErrDramaMediaUnavailable.Msg, 1},
+		{"domain diagnostics", errcode.ErrDramaMediaUnavailable.WithData([]model.DramaProgramDiagnostic{diagnostic}), 91012, errcode.ErrDramaMediaUnavailable.Msg, 1},
+		{"loudness", fmt.Errorf("/tmp/loudnorm: %w", videoframe.ErrLoudnessAcceptance), 91013, errcode.ErrDramaLoudnessInvalid.Msg, 0},
+		{"program", &model.DramaProgramError{Msg: "节目素材校验失败", Diagnostics: []model.DramaProgramDiagnostic{diagnostic}, Cause: errors.New("private bound_source")}, 91009, "节目素材校验失败", 1},
+		{"timeout", fmt.Errorf("/tmp/timeout: %w", context.DeadlineExceeded), 10000, "CPU 预览生成超时，请缩小范围或重试", 0},
+		{"internal", errors.New("open /tmp/vc-drama-preview-private/source.mp4: permission denied SQL bound_source https://private/asset"), 10000, "CPU 预览生成失败，请检查片段视频并重试", 0},
+		{"internal business", errcode.ErrInternal.WithMsg("/tmp/private SQL details"), 10000, "CPU 预览生成失败，请检查片段视频并重试", 0},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			renderer := &slice5ProgramRenderer{during: func(context.Context, videoframe.ComposeProgramInput) error { return tt.err }}
+			r, svc, _ := newSlice5ProgramFixture(t, renderer, nil)
+			stageCSegment(&r.segments[0], model.DramaVisualBlack, 24)
+			manifest, err := svc.ResolveEpisodeManifestV2(t.Context(), 7, 1, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := &model.DramaPreviewReq{ManifestHash: manifest.ManifestHash, Variant: "clean"}
+			ticket, _, err := svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			failed := waitPreviewFailed(t, svc, ticket.Ticket)
+			if failed.ErrorCode != tt.code || failed.ErrorMessage != tt.message || len(failed.ProgramDiagnostics) != tt.diagnostics || failed.StreamURL != "" {
+				t.Fatalf("unsafe or missing failure: %+v", failed)
+			}
+			if tt.diagnostics > 0 && failed.ProgramDiagnostics[0].SegmentID != idcodec.Encode(5) {
+				t.Fatalf("unencoded segment: %+v", failed)
+			}
+			reused, _, err := svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+			if err != nil || reused.Ticket != ticket.Ticket || reused.ErrorCode != tt.code {
+				t.Fatalf("cached failure lost: %+v %v", reused, err)
+			}
+		})
+	}
+}
+
+func waitPreviewFailed(t *testing.T, svc *service.DramaService, ticket string) *model.DramaPreviewView {
+	t.Helper()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		view, err := svc.GetEpisodePreview(t.Context(), 7, 1, 1, ticket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if view.Status == "failed" {
+			return view
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("preview did not fail")
+	return nil
+}
+
+type previewUnavailableFiles struct {
+	*slice5ProgramFiles
+	armed   atomic.Bool
+	assetID uint64
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f *previewUnavailableFiles) Open(ctx context.Context, user, id uint64) (*provider.AssetFile, error) {
+	if f.armed.Load() && id == f.assetID {
+		close(f.entered)
+		select {
+		case <-f.release:
+			return nil, errors.New("open /tmp/vc-drama-preview-private/source: missing")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return f.slice5ProgramFiles.Open(ctx, user, id)
+}
+
+func TestDramaPreviewV2MediaUnavailableAfterReservation(t *testing.T) {
+	for _, kind := range []string{"video", "still", "audio"} {
+		t.Run(kind, func(t *testing.T) { checkPreviewMediaUnavailable(t, kind) })
+	}
+}
+
+func checkPreviewMediaUnavailable(t *testing.T, kind string) {
+	t.Helper()
+	files := &previewUnavailableFiles{assetID: 30, entered: make(chan struct{}), release: make(chan struct{})}
+	r, svc, _ := newSlice5ProgramFixture(t, &slice5ProgramRenderer{}, nil, func(d *service.DramaDeps) {
+		files.slice5ProgramFiles, d.Assets = d.Assets.(*slice5ProgramFiles), files
+	})
+	field, cueID, segmentID := "asset_id", "", idcodec.Encode(r.segments[0].ID)
+	switch kind {
+	case "video":
+		r.segments[0].FXJSON = []byte(`{"fade_in_f":1}`)
+	case "still":
+		stageCSegment(&r.segments[0], model.DramaVisualStill, 24)
+		files.assetID, field = 32, "still_asset_id"
+	case "audio":
+		stageCSegment(&r.segments[0], model.DramaVisualBlack, 24)
+		saveProgramAudioFixture(t, r, absoluteProgramCue("voice", model.DramaAudioNarration, 0, 24))
+		files.assetID, cueID, segmentID = 40, "voice", ""
+	}
+	manifest, err := svc.ResolveEpisodeManifestV2(t.Context(), 7, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files.armed.Store(true)
+	ticket, _, err := svc.CreateEpisodePreview(t.Context(), 7, 1, 1, &model.DramaPreviewReq{ManifestHash: manifest.ManifestHash, Variant: "clean"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-files.entered:
+	case <-time.After(time.Second):
+		t.Fatal("render did not download frozen media")
+	}
+	close(files.release)
+	failed := waitPreviewFailed(t, svc, ticket.Ticket)
+	if failed.ErrorCode != 91012 || failed.ErrorMessage != errcode.ErrDramaMediaUnavailable.Msg || len(failed.ProgramDiagnostics) != 1 {
+		t.Fatalf("media failure lost: %+v", failed)
+	}
+	d := failed.ProgramDiagnostics[0]
+	if d.SegmentID != segmentID || d.CueID != cueID || d.Field != field || d.Reason != "media_unavailable" {
+		t.Fatalf("missing safe media location: %+v", d)
+	}
+}
 
 type manifestProcessor struct {
 	composeProcessor
@@ -73,10 +208,10 @@ func waitPreviewReady(ctx context.Context, t *testing.T, s *service.DramaService
 	return nil
 }
 func previewService(r *composeMemory) (*service.DramaService, *manifestProcessor) {
-	_, a, probes := manifestService(r)
+	a, probes := verifiedManifestAssets(r)
 	probes.rows[a.sha] = &model.AssetMediaProbe{AssetID: 30, Sha256: a.sha, ProbeVersion: 1, NormalizedFrames24: 120}
 	p := &manifestProcessor{}
-	return service.NewDramaService(service.DramaDeps{Repo: r, Assets: a, Probes: probes, Compose: p, PreviewSecret: "test-preview-secret"}), p
+	return service.NewDramaService(service.DramaDeps{Repo: &verifiedComposeMemory{r}, Assets: a, Probes: probes, Compose: p, PreviewSecret: "test-preview-secret"}), p
 }
 func TestDramaPreview_CookieTokenOwnershipAndCache(t *testing.T) {
 	r := newComposeMemory()
@@ -143,14 +278,13 @@ func TestDramaPreview_DeletedEpisodeCannotReuseTicketAfterRenumber(t *testing.T)
 	v = waitPreviewReady(ctx, t, s, 7, 1, 1, v.Ticket)
 	token := strings.Split(v.StreamURL, "token=")[1]
 	r.episodes[0].ID = 77 // 删除原集后，另一集补位到相同 no。
-	if _, err = s.GetEpisodePreview(ctx, 7, 1, 1, v.Ticket); err == nil {
-		t.Fatal("补位集继承了已删除集的预览")
-	}
+	_, err = s.GetEpisodePreview(ctx, 7, 1, 1, v.Ticket)
+	dramaCheckCode(t, err, 91001)
 	f, err := s.OpenEpisodePreview(ctx, 1, 1, v.Ticket, cookie, token)
-	if err == nil {
+	if f != nil {
 		_ = f.Close()
-		t.Fatal("已删除集预览仍可播放")
 	}
+	dramaCheckCode(t, err, 91001)
 }
 
 func TestDramaPreview_ConcurrentSameIntentRendersOnce(t *testing.T) {
@@ -185,7 +319,7 @@ func TestDramaPreview_ConcurrentSameIntentRendersOnce(t *testing.T) {
 func TestDramaPreview_ColdProbeInBackgroundAndInitialPendingOnFastFailure(t *testing.T) {
 	t.Run("cold probe runs in background task instead of blocking POST", func(t *testing.T) {
 		r := newComposeMemory()
-		_, baseAssets, emptyProbes := manifestService(r)
+		baseAssets, emptyProbes := verifiedManifestAssets(r)
 		openCalls := atomic.Int32{}
 		probeCalls := atomic.Int32{}
 		probeEntered, releaseProbe := make(chan struct{}), make(chan struct{})
@@ -226,8 +360,11 @@ func TestDramaPreview_ColdProbeInBackgroundAndInitialPendingOnFastFailure(t *tes
 		deadline := time.Now().Add(2 * time.Second)
 		for time.Now().Before(deadline) {
 			st, getErr := s.GetEpisodePreview(context.Background(), 7, 1, 1, v.Ticket)
-			if getErr == nil && st.Status == "failed" {
+			if errors.Is(getErr, errcode.ErrDramaManifestStale) {
 				break
+			}
+			if getErr != nil || st.Status != "pending" {
+				t.Fatalf("expected stale conflict after cold probe: %+v %v", st, getErr)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -254,7 +391,7 @@ func TestDramaPreview_ColdProbeInBackgroundAndInitialPendingOnFastFailure(t *tes
 
 	t.Run("initial POST returns pending even when background fails immediately", func(t *testing.T) {
 		r := newComposeMemory()
-		_, a, probes := manifestService(r)
+		a, probes := verifiedManifestAssets(r)
 		probes.rows[a.sha] = &model.AssetMediaProbe{AssetID: 30, Sha256: a.sha, ProbeVersion: 1, NormalizedFrames24: 120}
 		failProc := &failingManifestProcessor{err: errors.New("boom")}
 		s := service.NewDramaService(service.DramaDeps{
@@ -330,7 +467,7 @@ func TestDramaPreview_UnifiedDeadlineDuplicateCancellationAndTerminalTTL(t *test
 
 		// 失败分支验证：排队 4 分钟后失败，冷却期从第 4 分钟起算 1 分钟；冷却内重 POST 不重复转码，冷却后可重触发。
 		r2 := newComposeMemory()
-		_, a2, probes2 := manifestService(r2)
+		a2, probes2 := verifiedManifestAssets(r2)
 		probes2.rows[a2.sha] = &model.AssetMediaProbe{AssetID: 30, Sha256: a2.sha, ProbeVersion: 1, NormalizedFrames24: 120}
 		failEntered, releaseFail := make(chan struct{}), make(chan struct{})
 		failProc := &hookedFailManifestProcessor{
@@ -388,7 +525,7 @@ func TestDramaPreview_UnifiedDeadlineDuplicateCancellationAndTerminalTTL(t *test
 
 	t.Run("queue timeout unified with render cancels task and duplicate POST cancels expired old task cleanly", func(t *testing.T) {
 		r := newComposeMemory()
-		_, a, probes := manifestService(r)
+		a, probes := verifiedManifestAssets(r)
 		probes.rows[a.sha] = &model.AssetMediaProbe{AssetID: 30, Sha256: a.sha, ProbeVersion: 1, NormalizedFrames24: 120}
 
 		gate := make(chan struct{})
@@ -452,7 +589,7 @@ func TestDramaPreview_UnifiedDeadlineDuplicateCancellationAndTerminalTTL(t *test
 
 		// 验证过期覆盖时取消旧任务：时钟跨越旧任务 deadline 后再发重复 POST，旧渲染必须收到 cancel 并让新票就绪。
 		r2 := newComposeMemory()
-		_, a2, probes2 := manifestService(r2)
+		a2, probes2 := verifiedManifestAssets(r2)
 		probes2.rows[a2.sha] = &model.AssetMediaProbe{AssetID: 30, Sha256: a2.sha, ProbeVersion: 1, NormalizedFrames24: 120}
 		firstEntered, firstDone := make(chan struct{}), make(chan struct{})
 		swComp := &supersedeComposer{firstEntered: firstEntered, firstDone: firstDone}
@@ -571,4 +708,118 @@ func (c *supersedeComposer) ComposeManifest(ctx context.Context, in videoframe.C
 		return ctx.Err()
 	}
 	return os.WriteFile(in.Outputs[0].Destination, []byte("fresh-preview"), 0600)
+}
+
+func TestDramaPreviewV2UsesProgramRangeAndRejectsStaleTickets(t *testing.T) {
+	renderer := &slice5ProgramRenderer{during: func(_ context.Context, input videoframe.ComposeProgramInput) error {
+		if input.RangeF == nil || input.RangeF.InF != 5 || input.RangeF.OutF != 14 ||
+			len(input.Clips) != 1 || input.Clips[0].SourceOutF != 24 ||
+			len(input.Audio) != 1 || input.Audio[0].StartF != 0 || input.Audio[0].EndF != 24 ||
+			len(input.Outputs) != 1 || input.Outputs[0].Variant != "packaged" || input.Outputs[0].WithOverlays {
+			return errors.New("V2 preview must pass the whole timeline and a separate range, without overlays")
+		}
+		return nil
+	}}
+	r, svc, _ := newSlice5ProgramFixture(t, renderer, nil)
+	r.segments[0].VisualKind = model.DramaVisualBlack
+	r.segments[0].ChosenTaskID = nil
+	r.segments[0].SourceOutF = new(int32(24))
+	saveProgramAudioFixture(t, r, absoluteProgramCue("voice", model.DramaAudioNarration, 0, 24))
+	view, err := svc.ResolveEpisodeManifestV2(t.Context(), 7, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &model.DramaPreviewReq{ManifestHash: view.ManifestHash, Variant: "packaged", RangeF: &model.DramaPreviewRange{InF: 5, OutF: 14}}
+	ticket, cookie, err := svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := waitPreviewReady(t.Context(), t, svc, 7, 1, 1, ticket.Ticket)
+	token := strings.Split(ready.StreamURL, "token=")[1]
+	again, _, err := svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+	if err != nil || again.Ticket != ready.Ticket {
+		t.Fatalf("same V2 preview should reuse the ticket: %+v %v", again, err)
+	}
+	if _, err := svc.PutProgram(t.Context(), 7, 1, 1, &service.PutDramaProgramReq{
+		ExpectedEpisodeID: 3, ExpectedSegmentVersion: new(int64),
+		Program: service.DramaProgramInput{Version: 1, Audio: []service.DramaProgramAudioInput{absoluteProgramCue("voice", model.DramaAudioNarration, 0, 23)}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = svc.GetEpisodePreview(t.Context(), 7, 1, 1, ready.Ticket)
+	dramaCheckCode(t, err, 91001)
+	f, err := svc.OpenEpisodePreview(t.Context(), 1, 1, ready.Ticket, cookie, token)
+	if f != nil {
+		_ = f.Close()
+	}
+	dramaCheckCode(t, err, 91001)
+}
+
+func TestDramaPreviewV2RejectsKnownDiagnosticsBeforeColdProbe(t *testing.T) {
+	var probed atomic.Int32
+	r, svc, _ := newSlice5ProgramFixture(t, &slice5ProgramRenderer{}, func(*programMemory) { probed.Add(1) })
+	if _, err := svc.PutProgram(t.Context(), 7, 1, 1, anchoredProgram(0, 5, 10)); err != nil {
+		t.Fatal(err)
+	}
+	replaceProgramTake(r)
+	before := probed.Load()
+	req := &model.DramaPreviewReq{ManifestHash: strings.Repeat("a", 64), SegmentVersion: 2, Variant: "clean"}
+	v, cookie, err := svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+	requireProgramError(t, err, 91010, "anchor_source_replaced")
+	if v != nil || cookie != "" || probed.Load() != before {
+		t.Fatal("broken program reserved a preview or performed a cold probe")
+	}
+}
+
+func TestDramaPreviewV2ColdTicketCannotReuseV1Cache(t *testing.T) {
+	renderer := &slice5ProgramRenderer{during: func(context.Context, videoframe.ComposeProgramInput) error {
+		t.Error("V1 hash must never render a V2 preview")
+		return nil
+	}}
+	r, svc, _ := newSlice5ProgramFixture(t, renderer, nil)
+	v1, err := svc.ResolveEpisodeManifest(t.Context(), 7, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &model.DramaPreviewReq{ManifestHash: v1.ManifestHash, Variant: "clean"}
+	old, _, err := svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitPreviewReady(t.Context(), t, svc, 7, 1, 1, old.Ticket)
+	// Simulate the same request identity with a different renderer and a cold audio probe.
+	saveProgramAudioFixture(t, r, absoluteProgramCue("voice", model.DramaAudioNarration, 0, 24))
+	v2, _, err := svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+	if err != nil || v2.Ticket == old.Ticket || v2.Status != "pending" {
+		t.Fatalf("cold V2 returned a V1 ticket: %+v %v", v2, err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		ticket, err := svc.GetEpisodePreview(t.Context(), 7, 1, 1, v2.Ticket)
+		if err != nil {
+			dramaCheckCode(t, err, 91001)
+			return
+		}
+		if ticket.Status != "pending" {
+			t.Fatalf("cold V2 returned %q instead of stale conflict for a V1 hash", ticket.Status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("cold V2 ticket did not reject the stale hash")
+}
+
+func TestDramaPreviewV2RejectsWarmOutOfRangeAndStaleHash(t *testing.T) {
+	r, svc, _ := newSlice5ProgramFixture(t, nil, nil)
+	stageCSegment(&r.segments[0], model.DramaVisualBlack, 24)
+	view, err := svc.ResolveEpisodeManifestV2(t.Context(), 7, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &model.DramaPreviewReq{ManifestHash: view.ManifestHash, Variant: "clean", RangeF: &model.DramaPreviewRange{OutF: 25}}
+	_, _, err = svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+	dramaCheckCode(t, err, 91003)
+	req.RangeF.OutF--
+	req.ManifestHash = strings.Repeat("a", 64)
+	_, _, err = svc.CreateEpisodePreview(t.Context(), 7, 1, 1, req)
+	dramaCheckCode(t, err, 91001)
 }

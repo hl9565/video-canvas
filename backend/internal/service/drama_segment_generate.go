@@ -41,6 +41,9 @@ func (s *DramaSegmentService) Generate(ctx context.Context, userID, sid uint64, 
 			return err
 		}
 		p, ep, row = lockedP, lockedEp, lockedRow
+		if err := requireDramaVideoSegment(row); err != nil {
+			return err
+		}
 		if ep.LockedAt == nil {
 			return errcode.ErrDramaStepNotReady.WithMsg("媒体任务只允许已锁定的集")
 		}
@@ -76,14 +79,17 @@ func (s *DramaFrameRunService) Confirm(ctx context.Context, userID, sid, rid uin
 	if err != nil {
 		return nil, err
 	}
+	p, _, seg, err := s.segments.segmentSource(ctx, userID, sid)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireDramaVideoSegment(seg); err != nil {
+		return nil, err
+	}
 	if run.State != model.FrameRunStateFrameReady && run.State != model.FrameRunStateConfirmed {
 		return nil, errcode.ErrDramaFrameRunConflict
 	}
 	input, err := s.frameConfirmInput(ctx, run, req)
-	if err != nil {
-		return nil, err
-	}
-	p, _, seg, err := s.segments.segmentSource(ctx, userID, sid)
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +200,9 @@ func (s *DramaFrameRunService) saveFrameConfirmation(ctx context.Context, before
 		if err != nil {
 			return err
 		}
+		if err := requireDramaVideoSegment(seg); err != nil {
+			return err
+		}
 		if seg.Revision != segRev {
 			return errcode.ErrCanvasConflict
 		}
@@ -232,6 +241,9 @@ func (s *DramaFrameRunService) Submit(ctx context.Context, userID, sid, rid uint
 	}
 	run, err := s.loadFrameRun(ctx, userID, sid, rid)
 	if err != nil {
+		return nil, nil, err
+	}
+	if err := s.checkFrameRunVideoSegment(ctx, userID, sid); err != nil {
 		return nil, nil, err
 	}
 	if run.ConfirmedVersion != req.ConfirmedVersion {
@@ -275,8 +287,11 @@ func (s *DramaFrameRunService) Submit(ctx context.Context, userID, sid, rid uint
 func (s *DramaFrameRunService) beginFrameSubmit(ctx context.Context, userID, sid, rid uint64, req *model.SubmitFrameRunReq) (*model.DramaSegmentFrameRun, error) {
 	var run *model.DramaSegmentFrameRun
 	err := s.repo.WithTx(ctx, func(tx repository.DramaTx) error {
-		p, ep, _, err := lockSegment(ctx, tx, userID, sid)
+		p, ep, seg, err := lockSegment(ctx, tx, userID, sid)
 		if err != nil {
+			return err
+		}
+		if err := requireDramaVideoSegment(seg); err != nil {
 			return err
 		}
 		run, err = tx.FrameRun(ctx, userID, rid, true)
@@ -306,8 +321,11 @@ func (s *DramaFrameRunService) beginFrameSubmit(ctx context.Context, userID, sid
 
 // createFrameVideo 读取原始确认 JSON 时保留整数精度，跨重启重放时输入哈希和幂等意图不变。
 func (s *DramaFrameRunService) createFrameVideo(ctx context.Context, run *model.DramaSegmentFrameRun) (*model.GenerationTaskView, error) {
-	p, _, _, err := s.segments.segmentSource(ctx, run.UserID, run.SegmentID)
+	p, _, seg, err := s.segments.segmentSource(ctx, run.UserID, run.SegmentID)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireDramaVideoSegment(seg); err != nil {
 		return nil, err
 	}
 	var input map[string]any
@@ -362,7 +380,27 @@ func (s *DramaSegmentService) Quote(ctx context.Context, userID, sid uint64, req
 	if err != nil {
 		return nil, err
 	}
+	if err := requireDramaVideoSegment(row); err != nil {
+		return nil, err
+	}
 	return s.tasks.Quote(ctx, userID, &model.QuoteGenerationTaskReq{Kind: model.KindVideo, ModelID: req.ModelID, CanvasID: idcodec.ID(p.CanvasID), NodeID: segmentNode(sid), Input: req.Input}, QuoteTaskOptions{SegmentID: sid, SegmentRevision: row.Revision, SingleShotOnly: ep.EditSchema == 1})
+}
+
+// requireDramaVideoSegment 拒绝对静帧和黑场执行视频生成或采用。
+func requireDramaVideoSegment(row *model.DramaSegment) error {
+	if dramaVisualKind(*row) != model.DramaVisualVideo {
+		return errcode.ErrDramaVisualInvalid.WithMsg("静帧和黑场不能生成或采用视频镜头")
+	}
+	return nil
+}
+
+// checkFrameRunVideoSegment 在执行流程变更前读取段归属和实时视觉模式。
+func (s *DramaFrameRunService) checkFrameRunVideoSegment(ctx context.Context, userID, sid uint64) error {
+	_, _, row, err := s.segments.segmentSource(ctx, userID, sid)
+	if err != nil {
+		return err
+	}
+	return requireDramaVideoSegment(row)
 }
 
 // segmentSource 无锁读取存活的段、集和项目，统一隐藏越权资源。

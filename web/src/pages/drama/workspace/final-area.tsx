@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   Check,
   Clapperboard,
@@ -11,7 +11,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 
-import { listJobs } from "@/api/drama";
+import { getEpisodeProgram, listJobs } from "@/api/drama";
 import { DRAMA_ERR, dramaErrorMessage } from "@/api/drama/errors";
 import type {
   DramaComposeExport,
@@ -41,11 +41,20 @@ import {
   DEFAULT_COMPOSE_VARIANTS,
   finalState,
   latestComposeExports,
+  manifestProgramDiagnostics,
   missingVideoSeqs,
   normalizeComposeVariants,
   skippedText,
 } from "@/utils/drama/compose";
 import { jobConflictReason, mergeJob } from "@/utils/drama/jobs";
+import {
+  hasRenderableVisual,
+  isVideoVisual,
+  programDiagnosticText,
+  programTimeline,
+  usesProgramFeatures,
+  visualBadges,
+} from "@/utils/drama/program";
 import { reloadSegments } from "@/utils/drama/segment-events";
 import { playableTake } from "@/utils/drama/segments";
 import type { WorkspaceStage } from "@/utils/drama/stages";
@@ -88,12 +97,18 @@ export function FinalArea({
   ep: number;
   onGo: (stage: WorkspaceStage, ep?: number) => void;
 }) {
-  const { drama, jobs } = useWorkspace();
+  const { drama, jobs, refresh: refreshWorkspace } = useWorkspace();
   const episode = drama.episodes.find((item) => item.no === ep) ?? drama.episodes[0];
   const no = episode?.no ?? 0;
-  const segments =
-    useDramaSegmentsStore((state) => state.byEpisode[segmentKey(drama.id, no)]) ?? NO_SEGMENTS;
-  const { compose, pending, manifests, loadManifest } = useCompose(drama.id);
+  const episodeId = episode?.id;
+  const cachedSegments = useDramaSegmentsStore((state) => {
+    const cachedId = state.snapshotOf(drama.id, no)?.episodeId;
+    return episodeId && cachedId && episodeId !== cachedId
+      ? undefined
+      : state.byEpisode[segmentKey(drama.id, no)];
+  });
+  const segments = cachedSegments ?? NO_SEGMENTS;
+  const { compose, pending, manifests, loadManifest } = useCompose(drama.id, no, episodeId);
   const [saving, setSaving] = useState(false);
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [size, setSize] = useState<DramaComposeSize>(DEFAULT_COMPOSE_SIZE);
@@ -121,10 +136,60 @@ export function FinalArea({
   const [finalJobRetrySeq, setFinalJobRetrySeq] = useState(0);
   const attemptedJobFetchRef = useRef<Set<string>>(new Set());
 
-  const manifestEnabled = canUseManifestCompose(drama.ratio, episode);
+  const legacyManifestEnabled = canUseManifestCompose(drama.ratio, episode);
+  const programKey = JSON.stringify([drama.id, episodeId, no]);
+  const segmentVersion = episode?.segmentVersion ?? 0;
+  const stageCVisual = usesProgramFeatures(segments);
+  const [programInfo, setProgramInfo] = useState<{
+    key: string;
+    version: number;
+    status: "ready" | "error" | "stale_episode";
+    audioCount: number | null;
+  } | null>(null);
+  const autoWorkspaceRefreshKeyRef = useRef<string | null>(null);
+  const activeScopeRef = useRef({ key: programKey, version: segmentVersion });
+  const discoverySeqByKeyRef = useRef(new Map<string, number>());
+  useLayoutEffect(() => {
+    activeScopeRef.current = { key: programKey, version: segmentVersion };
+  }, [programKey, segmentVersion]);
+  useEffect(
+    () => () => {
+      activeScopeRef.current = { key: "", version: -1 };
+    },
+    [],
+  );
+  const nextDiscoverySeq = (scopeKeyStr: string) => {
+    const next = (discoverySeqByKeyRef.current.get(scopeKeyStr) ?? 0) + 1;
+    discoverySeqByKeyRef.current.set(scopeKeyStr, next);
+    return next;
+  };
+  const isActiveDiscovery = (scopeKeyStr: string, seq: number, version: number) =>
+    activeScopeRef.current.key === scopeKeyStr &&
+    activeScopeRef.current.version === version &&
+    discoverySeqByKeyRef.current.get(scopeKeyStr) === seq;
+  const skipNextAutoLoadRef = useRef<{
+    key: string;
+    version: number;
+    useV2: boolean;
+    segmentsKey: string;
+  } | null>(null);
+  const shouldReadProgram = stageCVisual || Boolean(episodeId);
+  const currentProgramInfo =
+    programInfo?.key === programKey && programInfo.version === segmentVersion ? programInfo : null;
+  const programPending = shouldReadProgram && currentProgramInfo === null;
+  const episodeIdentityStale = shouldReadProgram && currentProgramInfo?.status === "stale_episode";
+  const programError =
+    shouldReadProgram &&
+    !stageCVisual &&
+    drama.ratio === "16:9" &&
+    currentProgramInfo?.status === "error";
+  const programAudioCount =
+    currentProgramInfo?.status === "ready" ? (currentProgramInfo.audioCount ?? 0) : 0;
+  const stageC = usesProgramFeatures(segments, programAudioCount);
+  const useV2 = stageC && drama.ratio === "16:9";
+  const manifestEnabled = legacyManifestEnabled || useV2;
   const ratioSupported = drama.ratio in COMPOSE_ASPECT_BASE;
   const finalComposeJobId = episode?.finalComposeJobId;
-  const segmentVersion = episode?.segmentVersion ?? 0;
   const segmentsVersionKey = segments
     .map((s) => `${s.id}:${s.revision}:${s.chosenTaskId}`)
     .join("|");
@@ -169,15 +234,182 @@ export function FinalArea({
 
   // 片段读自片段接口：进到成片页（或换集）时拉一次，之后靠推送保持新鲜
   useEffect(() => {
-    if (no > 0) void reloadSegments(drama.id, no);
-  }, [drama.id, no]);
+    if (no > 0) void reloadSegments(drama.id, no, episodeId, { activate: true });
+  }, [drama.id, episodeId, no]);
 
-  const adopted = segments.filter((segment) => playableTake(segment)).length;
+  const applyProgramView = useCallback(
+    (
+      startKey: string,
+      startVersion: number,
+      view: Awaited<ReturnType<typeof getEpisodeProgram>>,
+    ) => {
+      if (episodeId && view.episodeId !== episodeId) {
+        setProgramInfo({
+          key: startKey,
+          version: startVersion,
+          status: "stale_episode",
+          audioCount: null,
+        });
+        const refreshTag = `${startKey}:${startVersion}`;
+        if (autoWorkspaceRefreshKeyRef.current !== refreshTag) {
+          autoWorkspaceRefreshKeyRef.current = refreshTag;
+          void refreshWorkspace?.();
+        }
+        return null;
+      }
+      const audioCount = view.program?.audio?.length ?? 0;
+      setProgramInfo({
+        key: startKey,
+        version: startVersion,
+        status: "ready",
+        audioCount,
+      });
+      return audioCount;
+    },
+    [episodeId, refreshWorkspace],
+  );
 
   useEffect(() => {
-    if (no <= 0 || adopted === 0 || !manifestEnabled) return;
-    void loadManifest(no);
-  }, [adopted, loadManifest, manifestEnabled, no, segmentVersion, segmentsVersionKey]);
+    if (!shouldReadProgram) return;
+    const startKey = programKey;
+    const startVersion = segmentVersion;
+    const seq = nextDiscoverySeq(startKey);
+    const controller = new AbortController();
+    void getEpisodeProgram(drama.id, no, { signal: controller.signal, silent: true })
+      .then((view) => {
+        if (controller.signal.aborted || !isActiveDiscovery(startKey, seq, startVersion)) return;
+        applyProgramView(startKey, startVersion, view);
+      })
+      .catch(() => {
+        if (controller.signal.aborted || !isActiveDiscovery(startKey, seq, startVersion)) return;
+        setProgramInfo({
+          key: startKey,
+          version: startVersion,
+          status: "error",
+          audioCount: null,
+        });
+      });
+    return () => controller.abort();
+  }, [applyProgramView, drama.id, no, programKey, segmentVersion, shouldReadProgram]);
+
+  const adopted = segments.filter(hasRenderableVisual).length;
+
+  useEffect(() => {
+    if (
+      no <= 0 ||
+      (!adopted && !useV2) ||
+      !manifestEnabled ||
+      episodeIdentityStale ||
+      ((programPending || programError) && !useV2)
+    ) {
+      return;
+    }
+    const skippedLoad = skipNextAutoLoadRef.current;
+    if (
+      skippedLoad &&
+      skippedLoad.key === programKey &&
+      skippedLoad.version === segmentVersion &&
+      skippedLoad.useV2 === useV2 &&
+      skippedLoad.segmentsKey === segmentsVersionKey
+    ) {
+      skipNextAutoLoadRef.current = null;
+      return;
+    }
+    skipNextAutoLoadRef.current = null;
+    void loadManifest(no, useV2);
+  }, [
+    adopted,
+    episodeIdentityStale,
+    loadManifest,
+    manifestEnabled,
+    no,
+    programError,
+    programKey,
+    programPending,
+    segmentVersion,
+    segmentsVersionKey,
+    useV2,
+  ]);
+
+  const refreshDiscovery = useCallback(
+    async (refreshManifest = loadManifest) => {
+      const startKey = programKey;
+      const startVersion = segmentVersion;
+      if (
+        no <= 0 ||
+        activeScopeRef.current.key !== startKey ||
+        activeScopeRef.current.version !== startVersion
+      ) {
+        return;
+      }
+      const seq = nextDiscoverySeq(startKey);
+      await reloadSegments(drama.id, no, episodeId);
+      if (!isActiveDiscovery(startKey, seq, startVersion)) return;
+      let resolvedAudioCount = programAudioCount;
+      let programReadFailed = false;
+      let episodeReplaced = false;
+      if (shouldReadProgram) {
+        try {
+          const view = await getEpisodeProgram(drama.id, no, { silent: true });
+          if (!isActiveDiscovery(startKey, seq, startVersion)) return;
+          const count = applyProgramView(startKey, startVersion, view);
+          if (count === null) {
+            episodeReplaced = true;
+          } else {
+            resolvedAudioCount = count;
+          }
+        } catch {
+          if (!isActiveDiscovery(startKey, seq, startVersion)) return;
+          programReadFailed = true;
+          setProgramInfo({
+            key: startKey,
+            version: startVersion,
+            status: "error",
+            audioCount: null,
+          });
+        }
+      }
+      if (episodeReplaced) return;
+      const freshSegments =
+        useDramaSegmentsStore.getState().byEpisode[segmentKey(drama.id, no)] ?? segments;
+      const freshStageCVisual = usesProgramFeatures(freshSegments);
+      if (programReadFailed && drama.ratio === "16:9" && !freshStageCVisual) return;
+      const freshUseV2 =
+        drama.ratio === "16:9" && usesProgramFeatures(freshSegments, resolvedAudioCount);
+      const freshManifestEnabled = legacyManifestEnabled || freshUseV2;
+      const freshAdopted = freshSegments.filter(hasRenderableVisual).length;
+      if (!freshManifestEnabled || (!freshAdopted && !freshUseV2)) return;
+      const freshSegmentsVersionKey = freshSegments
+        .map((s) => `${s.id}:${s.revision}:${s.chosenTaskId}`)
+        .join("|");
+      if (freshUseV2 !== useV2 || freshSegmentsVersionKey !== segmentsVersionKey) {
+        skipNextAutoLoadRef.current = {
+          key: startKey,
+          version: startVersion,
+          useV2: freshUseV2,
+          segmentsKey: freshSegmentsVersionKey,
+        };
+      }
+      if (!isActiveDiscovery(startKey, seq, startVersion)) return;
+      await refreshManifest(no, freshUseV2);
+    },
+    [
+      applyProgramView,
+      drama.id,
+      drama.ratio,
+      episodeId,
+      legacyManifestEnabled,
+      loadManifest,
+      no,
+      programAudioCount,
+      programKey,
+      segmentVersion,
+      segments,
+      segmentsVersionKey,
+      shouldReadProgram,
+      useV2,
+    ],
+  );
 
   // 刷新页面后 store 仅含进行中任务：若当前分集绑定了已完成的 final_compose_job_id 且本地缺失，仅补拉目标已成功任务
   useEffect(() => {
@@ -251,22 +483,38 @@ export function FinalArea({
   const final = episode.final;
   const state = finalState(episode);
   const running = activeComposeJob(jobs, no);
-  const check = composeCheck(segments, jobConflictReason(jobs, "compose", [no]));
   const manifestState = manifestEnabled ? manifests[no] : undefined;
-  const manifest = manifestEnabled ? (manifestState?.data ?? null) : null;
-  const localSkipped = missingVideoSeqs(segments);
-  const skipped = manifest && manifest.skippedSeqs.length > 0 ? manifest.skippedSeqs : localSkipped;
-  const fallbackSeconds = segments.reduce(
-    (sum, segment) => sum + (playableTake(segment) ? segment.seconds : 0),
-    0,
-  );
+  const data = manifestState?.data;
+  const sameEpisode =
+    !episodeId ||
+    !data?.manifest ||
+    !("episodeId" in data.manifest) ||
+    data.manifest.episodeId === episodeId;
+  const manifest = data && sameEpisode && "programDiagnostics" in data === useV2 ? data : null;
+  const programDiagnostics = manifestState?.programDiagnostics?.length
+    ? manifestState.programDiagnostics
+    : manifestProgramDiagnostics(manifest);
+  const check = composeCheck(segments, jobConflictReason(jobs, "compose", [no]), {
+    ratio: drama.ratio,
+    programAudioCount,
+    manifestV2: useV2 ? manifest : null,
+  });
+  const composeBlockedReason = episodeIdentityStale
+    ? "当前分集已被替换，请先刷新工作台"
+    : programError
+      ? "读取节目单状态失败，请先重试"
+      : check.reason;
+  const skipped = missingVideoSeqs(segments, manifest);
+  const fallbackSeconds = stageC
+    ? programTimeline(segments).totalFrames / 24
+    : segments.reduce((sum, segment) => sum + (playableTake(segment) ? segment.seconds : 0), 0);
   const fps = manifest?.manifest?.fps && manifest.manifest.fps > 0 ? manifest.manifest.fps : 24;
   const seconds =
     manifest?.manifest && typeof manifest.manifest.totalFrames === "number"
       ? manifest.manifest.totalFrames / fps
       : fallbackSeconds;
-  const clipBySegmentId = new Map<string, DramaManifestClip>();
-  const clipBySeq = new Map<number, DramaManifestClip>();
+  const clipBySegmentId = new Map<string, Pick<DramaManifestClip, "masterInF" | "masterOutF">>();
+  const clipBySeq = new Map<number, Pick<DramaManifestClip, "masterInF" | "masterOutF">>();
   for (const clip of manifest?.manifest?.clips ?? []) {
     clipBySegmentId.set(clip.segmentId, clip);
     clipBySeq.set(clip.seq, clip);
@@ -447,7 +695,7 @@ export function FinalArea({
               <button
                 type="button"
                 className="shrink-0 underline underline-offset-2"
-                onClick={() => void loadManifest(no)}
+                onClick={() => void refreshDiscovery()}
               >
                 刷新
               </button>
@@ -462,7 +710,41 @@ export function FinalArea({
               <button
                 type="button"
                 className="inline-flex shrink-0 items-center gap-1 underline underline-offset-2"
-                onClick={() => void loadManifest(no)}
+                onClick={() => void refreshDiscovery()}
+              >
+                <RefreshCw className="size-3" />
+                重试
+              </button>
+            </div>
+          )}
+          {episodeIdentityStale && (
+            <div
+              role="alert"
+              className="border-destructive/40 bg-destructive/10 text-destructive flex items-start justify-between gap-2 rounded-xl border px-3 py-2.5 text-xs"
+            >
+              <span>当前分集内容已更新或被替换，请刷新工作台后重试。</span>
+              <button
+                type="button"
+                aria-label="刷新工作台"
+                className="inline-flex shrink-0 items-center gap-1 underline underline-offset-2"
+                onClick={() => void Promise.all([refreshWorkspace?.(), refreshDiscovery()])}
+              >
+                <RefreshCw className="size-3" />
+                刷新工作台
+              </button>
+            </div>
+          )}
+          {programError && (
+            <div
+              role="alert"
+              className="border-destructive/40 bg-destructive/10 text-destructive flex items-start justify-between gap-2 rounded-xl border px-3 py-2.5 text-xs"
+            >
+              <span>读取节目单状态失败，请重试以确认合成版本。</span>
+              <button
+                type="button"
+                aria-label="重试读取节目单"
+                className="inline-flex shrink-0 items-center gap-1 underline underline-offset-2"
+                onClick={() => void refreshDiscovery()}
               >
                 <RefreshCw className="size-3" />
                 重试
@@ -489,6 +771,21 @@ export function FinalArea({
                 <RefreshCw className="size-3" />
                 重试
               </button>
+            </div>
+          )}
+          {programDiagnostics.length > 0 && (
+            <div
+              role="alert"
+              className="border-status-warning/30 bg-status-warning/10 rounded-xl border p-3 text-xs"
+            >
+              <div className="text-status-warning font-medium">节目单需要修复</div>
+              <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                {programDiagnostics.map((issue, index) => (
+                  <li key={`${issue.cue_id ?? issue.segment_id}:${issue.field}:${index}`}>
+                    {programDiagnosticText(issue)}
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
           {manifest && manifest.diagnostics.length > 0 && (
@@ -616,6 +913,20 @@ export function FinalArea({
                         <div className="text-muted-foreground font-mono text-[11px]">
                           {item.width}×{item.height}
                         </div>
+                        {item.loudnessStatus === "silence" && (
+                          <div className="text-muted-foreground">静音母带</div>
+                        )}
+                        {item.loudnessStatus === "accepted" &&
+                          typeof item.lufs === "number" &&
+                          typeof item.truePeak === "number" && (
+                            <div
+                              className="text-muted-foreground font-mono"
+                              title={item.audioSha256}
+                            >
+                              {item.lufs.toFixed(1)} LUFS / TP {item.truePeak.toFixed(1)} dBTP
+                              {item.audioSha256 && <span> · #{item.audioSha256.slice(0, 8)}</span>}
+                            </div>
+                          )}
                       </div>
                       <div className="flex shrink-0 items-center gap-1">
                         <Button
@@ -653,13 +964,17 @@ export function FinalArea({
 
           <ul className="grid gap-0.5">
             {segments.map((segment) => {
-              const take = playableTake(segment);
+              const take = isVideoVisual(segment) ? playableTake(segment) : null;
+              const isRenderable = hasRenderableVisual(segment) && !skipped.includes(segment.seq);
+              const visual = visualBadges(segment);
               const clip = clipBySegmentId.get(segment.id) ?? clipBySeq.get(segment.seq);
               const clipFrames = clip ? clip.masterOutF - clip.masterInF : 0;
               const segDuration =
-                take && clip && clipFrames > 0
+                isRenderable && clip && clipFrames > 0
                   ? formatSegmentDuration(clipFrames / fps)
-                  : `${segment.seconds}s`;
+                  : isVideoVisual(segment)
+                    ? `${segment.seconds}s`
+                    : formatSegmentDuration(programTimeline([segment]).totalFrames / 24);
               return (
                 <li
                   key={segment.id}
@@ -677,10 +992,10 @@ export function FinalArea({
                       {segDuration}
                     </small>
                   </span>
-                  {take ? (
+                  {isRenderable ? (
                     <span className="bg-status-success/15 text-status-success inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium">
                       <Check className="size-3" aria-hidden />
-                      已采用
+                      {visual.length ? visual.join(" · ") : "已采用"}
                     </span>
                   ) : segment.status === "running" ? (
                     <span className="bg-primary/15 text-primary rounded-md px-1.5 py-0.5 text-[11px] font-medium">
@@ -719,14 +1034,41 @@ export function FinalArea({
             <Button
               className="w-full"
               variant={state === "fresh" ? "outline" : "default"}
-              disabled={!check.enabled || composing}
-              title={check.reason ?? "按顺序拼接各片段采用的视频，不扣积分"}
+              disabled={
+                !check.enabled ||
+                composing ||
+                episodeIdentityStale ||
+                (programPending && !useV2) ||
+                programError ||
+                programDiagnostics.length > 0
+              }
+              title={composeBlockedReason ?? "按顺序拼接各片段采用的视频，不扣积分"}
               onClick={() =>
                 void compose(
                   no,
                   manifestEnabled
-                    ? { useManifest: true, ratio: drama.ratio, size, variants, manifest }
-                    : { useManifest: false, ratio: drama.ratio, segmentVersion, segments },
+                    ? {
+                        useManifest: true,
+                        ratio: drama.ratio,
+                        size,
+                        variants,
+                        manifest,
+                        manifestV2: useV2,
+                        programAudioCount,
+                        expectedEpisodeId: episodeId,
+                        onManifestStale: refreshDiscovery,
+                        segments,
+                      }
+                    : {
+                        useManifest: false,
+                        ratio: drama.ratio,
+                        segmentVersion,
+                        expectedEpisodeId: episodeId,
+                        onEpisodeStale: async () => {
+                          await Promise.all([refreshWorkspace?.(), refreshDiscovery()]);
+                        },
+                        segments,
+                      },
                 )
               }
             >
@@ -734,8 +1076,8 @@ export function FinalArea({
               {state === "none" ? `合成第 ${no} 集` : "重新合成"}
             </Button>
           )}
-          {check.reason && !running && (
-            <p className="text-muted-foreground mt-2 text-center text-xs">{check.reason}</p>
+          {composeBlockedReason && !running && (
+            <p className="text-muted-foreground mt-2 text-center text-xs">{composeBlockedReason}</p>
           )}
         </div>
       </aside>
