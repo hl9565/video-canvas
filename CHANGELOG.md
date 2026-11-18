@@ -4,6 +4,15 @@
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-18
+
+### 安全与日志修复
+
+- **访问日志脱敏 `ticket` 参数**：`middleware.Logger` 的查询参数脱敏规则补全对 `ticket` 的忽略大小写子串匹配（覆盖 `ticket`、`ws_ticket` 等），避免 `/api/v1/ws` 一次性连接票据明文写入后端访问日志。
+- **HTTPS 反向代理下补全会话 Cookie `Secure` 属性**：
+  - `web/nginx.conf` 在存在入站 `X-Forwarded-Proto` 时保留外层协议，缺省时才回落为 `$scheme`，不再把宿主 TLS 反代传入的 `https` 覆写为 `http`。
+  - 后端统一通过 `requestIsHTTPS`（直连 TLS 或 `X-Forwarded-Proto` 首跳为 `https`）判定 `Secure`，使公网 HTTPS 反向代理下分集预览会话 Cookie `vc_preview_sess` 与 River UI 会话 Cookie 正确携带 `Secure`，同时保留纯 HTTP 本地/内网部署可用性。
+
 ## [0.7.0] - 2026-11-18
 
 ### Fork Stage A 与上游 v0.6.12 合并

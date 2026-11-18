@@ -198,6 +198,53 @@ func previewHTTPRouterWithRepo(t *testing.T, configure ...func(*service.DramaDep
 	return r, svc, repo
 }
 
+func TestDramaPreviewHTTP_CookieSecureByScheme(t *testing.T) {
+	router, svc := previewHTTPRouter(t)
+	manifest, err := svc.ResolveEpisodeManifest(t.Context(), 1, 7, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/dramas/" + idcodec.Encode(7) + "/episodes/1/preview"
+	body := `{"segment_version":0,"manifest_hash":"` + manifest.ManifestHash + `","variant":"clean"}`
+	cases := []struct {
+		name      string
+		scheme    string
+		forwarded string
+		secure    bool
+	}{
+		{name: "local HTTP"},
+		{name: "forwarded HTTP", forwarded: "http"},
+		{name: "forwarded HTTPS", forwarded: "https", secure: true},
+		{name: "uppercase HTTPS", forwarded: "HTTPS", secure: true},
+		{name: "HTTPS first hop", forwarded: "https, http", secure: true},
+		{name: "trim first hop", forwarded: " HTTPS , http", secure: true},
+		{name: "HTTP first hop", forwarded: "http, https"},
+		{name: "direct TLS takes precedence", scheme: "https://example.test", forwarded: "http", secure: true},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.scheme+path, strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer test")
+			req.Header.Set("Content-Type", "application/json")
+			if tt.forwarded != "" {
+				req.Header.Set("X-Forwarded-Proto", tt.forwarded)
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("创建预览失败: %d %s", recorder.Code, recorder.Body.String())
+			}
+			cookies := recorder.Result().Cookies()
+			if len(cookies) != 1 || cookies[0].Name != "vc_preview_sess" || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode || cookies[0].Path != "/api/v1/dramas" {
+				t.Fatal("预览会话 Cookie 缺失或 Name、HttpOnly、SameSite、Path 不符")
+			}
+			if cookies[0].Secure != tt.secure {
+				t.Errorf("Secure = %t, want %t", cookies[0].Secure, tt.secure)
+			}
+		})
+	}
+}
+
 func TestDramaPreviewHTTP_CookieRangeAndIsolation(t *testing.T) {
 	r, svc := previewHTTPRouter(t)
 	base := "/api/v1/dramas/" + idcodec.Encode(7) + "/episodes/1"

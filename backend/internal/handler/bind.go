@@ -44,6 +44,14 @@ func init() {
 	_ = zhtrans.RegisterDefaultTranslations(v, trans)
 }
 
+func requestIsHTTPS(c *gin.Context) bool {
+	if c.Request.TLS != nil {
+		return true
+	}
+	proto, _, _ := strings.Cut(c.GetHeader("X-Forwarded-Proto"), ",")
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
+}
+
 // BindJSON 解析 JSON 请求体到 req，失败时直接返回中文错误提示并返回 false。
 func BindJSON(c *gin.Context, req any) bool {
 	return bindWith(c, c.ShouldBindJSON(req))

@@ -131,7 +131,7 @@ func (h *RiverUIHandler) sign(payload string) string {
 func (h *RiverUIHandler) setSession(c *gin.Context, userID uint64) {
 	exp := h.now().Add(riverSessionTTL)
 	payload := strconv.FormatUint(userID, 10) + "." + strconv.FormatInt(exp.Unix(), 10)
-	secure := c.Request.TLS != nil || strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+	secure := requestIsHTTPS(c)
 	//nolint:gosec // G124: Secure 取决于请求是否经过 TLS（含反向代理的 X-Forwarded-Proto）：纯 http 的内网部署下强制 Secure 会让浏览器直接丢掉 cookie，River UI 就打不开了
 	http.SetCookie(c.Writer, &http.Cookie{
 		Name: riverCookieName, Value: payload + "." + h.sign(payload), Path: h.prefix, Expires: exp, MaxAge: int(riverSessionTTL.Seconds()),

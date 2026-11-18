@@ -32,7 +32,7 @@ func (h *DramaHandler) CreatePreview(c *gin.Context) {
 		return
 	}
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie("vc_preview_sess", cookie, 3600, "/api/v1/dramas", "", c.Request.TLS != nil, true)
+	c.SetCookie("vc_preview_sess", cookie, 3600, "/api/v1/dramas", "", requestIsHTTPS(c), true)
 	c.Header("Cache-Control", "no-store")
 	response.OK(c, view)
 }

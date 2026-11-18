@@ -384,13 +384,17 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
       ["Host", "$host"],
       ["X-Real-IP", "$remote_addr"],
       ["X-Forwarded-For", "$proxy_add_x_forwarded_for"],
-      ["X-Forwarded-Proto", "$scheme"],
+      ["X-Forwarded-Proto", "$forwarded_proto"],
     ]);
 
     const apiLoc = locations[apiIndex]!;
     expect(directiveArgs(apiLoc.block, "client_max_body_size")).toEqual([["110m"]]);
     expect(directiveArgs(apiLoc.block, "proxy_request_buffering")).toEqual([["off"]]);
     expect(directiveArgs(apiLoc.block, "proxy_pass")).toEqual([["http://backend:8080"]]);
+    expect(directiveArgs(apiLoc.block, "proxy_set_header")).toContainEqual([
+      "X-Forwarded-Proto",
+      "$forwarded_proto",
+    ]);
 
     const filesLoc = locations.find((loc) => loc.pattern === "/files/");
     expect(filesLoc).toBeDefined();
@@ -484,10 +488,13 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
       const pidFile = join(workDir, "nginx.pid");
       const testSiteConf = join(workDir, "default.conf");
       const mainConf = join(workDir, "nginx.conf");
+      const spaHTML = "<!doctype html><title>Video Canvas SPA</title>";
+      writeFileSync(join(workDir, "index.html"), spaHTML, "utf8");
       let sawRangeHeaders = false;
 
       upstream = createHttpServer((req, res) => {
         const url = new URL(req.url ?? "/", "http://127.0.0.1");
+        res.setHeader("X-Test-Upstream-Proto", req.headers["x-forwarded-proto"] ?? "");
         if (url.pathname.toLowerCase().includes("/stream")) {
           const token = url.searchParams.get("token");
           if (token === "SECRET_FORBIDDEN") {
@@ -532,6 +539,7 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
 
       const rewrittenServer = nginxConf
         .replace(/listen\s+80\s*;/, `listen 127.0.0.1:${nginxPort};`)
+        .replace("root /usr/share/nginx/html;", `root ${workDir};`)
         .replaceAll(
           "proxy_pass http://backend:8080;",
           `proxy_pass http://127.0.0.1:${upstreamAddr.port};`,
@@ -592,6 +600,20 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
       }
       expect(ready).toBe(true);
 
+      for (const path of ["/", "/drama/123"]) {
+        const spa = await fetch(`${base}${path}`, { headers: { "X-Forwarded-Proto": "https" } });
+        expect(spa.status, path).toBe(200);
+        expect(await spa.text(), path).toBe(spaHTML);
+      }
+
+      const apiPath = "/api/v1/dramas/d1/episodes/1/preview/tkt1";
+      for (const path of [apiPath, `${apiPath}/stream`]) {
+        const direct = await fetch(`${base}${path}`);
+        expect(direct.status, path).toBe(200);
+        expect(direct.headers.get("X-Test-Upstream-Proto"), path).toBe("http");
+        await direct.text();
+      }
+
       const okRes = await fetch(
         `${base}/api/v1/dramas/d1/episodes/1/preview/tkt1/stream?token=SECRET_OK_206`,
         { headers: { Range: "bytes=0-3", "If-Range": '"etag-1"' } },
@@ -623,6 +645,15 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
         `${base}/api/v1/dramas/d1/episodes/1/preview/tkt1/stream?token=SECRET_FORBIDDEN`,
       );
       expect(forbiddenRes.status).toBe(403);
+
+      for (const path of [apiPath, `${apiPath}/stream`]) {
+        const forwarded = await fetch(`${base}${path}`, {
+          headers: { "X-Forwarded-Proto": "https" },
+        });
+        expect(forwarded.status, path).toBe(200);
+        expect(forwarded.headers.get("X-Test-Upstream-Proto"), path).toBe("https");
+        await forwarded.text();
+      }
 
       await closeHttpServer(upstream);
       upstream = null;

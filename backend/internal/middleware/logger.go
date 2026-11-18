@@ -63,7 +63,9 @@ func redactQuery(raw string) string {
 	}
 	for key := range values {
 		k := strings.ToLower(key)
-		if strings.Contains(k, "token") || strings.Contains(k, "sig") || strings.Contains(k, "secret") || strings.Contains(k, "password") || strings.Contains(k, "credential") || strings.Contains(k, "key") || strings.Contains(k, "auth") {
+		if strings.Contains(k, "ticket") || strings.Contains(k, "token") || strings.Contains(k, "sig") ||
+			strings.Contains(k, "secret") || strings.Contains(k, "password") || strings.Contains(k, "credential") ||
+			strings.Contains(k, "key") || strings.Contains(k, "auth") {
 			values[key] = []string{"[REDACTED]"}
 		}
 	}
