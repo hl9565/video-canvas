@@ -2,8 +2,11 @@ package storage_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,6 +29,321 @@ func newTestLocal(t *testing.T, baseURL string) *LocalStorage {
 		t.Fatalf("创建本地存储失败：%v", err)
 	}
 	return l
+}
+
+func TestLocalVariantPublication(t *testing.T) {
+	local := newTestLocal(t, "")
+	key := "u1/original.png"
+	if err := ValidateKey(".variants/u1/original.png"); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("缓存命名空间必须对对象 API 隔离: %v", err)
+	}
+	put := func(data string) {
+		t.Helper()
+		if err := local.Put(t.Context(), key, strings.NewReader(data), int64(len(data)), "image/png"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("original")
+	src, err := local.StatSource(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
+	tree := filepath.Join(filepath.Dir(filepath.Dir(src.Path)), ".variants", hash[:2], hash)
+	final := filepath.Join(tree, "p2", fmt.Sprintf("%d-%d", src.Size, src.MTimeNano), "thumb.webp")
+	write := func(dst io.Writer) error {
+		_, err := io.WriteString(dst, "0123456789")
+		return err
+	}
+	_, err = local.PublishVariant(key, "thumb", "webp", src, func(dst io.Writer) error {
+		if err := write(dst); err != nil {
+			return err
+		}
+		if _, err := os.Stat(final); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("原子发布前不应存在正式文件: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, hit, err := local.LookupVariant(key, "thumb", "webp"); err != nil || !hit {
+		t.Fatalf("期望缓存命中: hit=%t err=%v", hit, err)
+	}
+	put("replacement has different size")
+	if _, hit, err := local.LookupVariant(key, "thumb", "webp"); err != nil || hit {
+		t.Fatalf("旧指纹不得命中: hit=%t err=%v", hit, err)
+	}
+	if _, err := local.PublishVariant(key, "thumb", "jpeg", src, write); err == nil {
+		t.Fatal("旧指纹不得发布")
+	}
+	latest, err := local.StatSource(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, release := make(chan struct{}), make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		_, err := local.PublishVariant(key, "thumb", "webp", latest, func(dst io.Writer) error {
+			close(started)
+			<-release
+			return write(dst)
+		})
+		finished <- err
+	}()
+	defer close(release)
+	select {
+	case <-started:
+	case err := <-finished:
+		t.Fatalf("生成过早结束: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("未开始写入临时文件")
+	}
+	deleted := make(chan error, 1)
+	go func() { deleted <- local.Delete(t.Context(), key) }()
+	select {
+	case err := <-deleted:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Delete 不应等待编码")
+	}
+	release <- struct{}{}
+	select {
+	case err := <-finished:
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("删除后不能发布: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("生成没有退出")
+	}
+	if _, err := os.Stat(tree); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Delete 后不应残留缓存树: %v", err)
+	}
+}
+
+func TestServeLocalVariantPolicies(t *testing.T) {
+	local := newTestLocal(t, "")
+	key := "u1/original.png"
+	if err := local.Put(t.Context(), key, strings.NewReader("0123456789"), 10, "image/png"); err != nil {
+		t.Fatal(err)
+	}
+	original, err := local.OpenLocal(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src, err := local.StatSource(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := local.PublishVariant(key, "thumb", "webp", src, func(dst io.Writer) error {
+		_, err := io.WriteString(dst, "0123456789")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, cache, mime string
+		file              *LocalFile
+		policy            CachePolicy
+	}{
+		{"original", "public, max-age=31536000, immutable", "image/png", original, CachePolicy{MaxAge: 365 * 24 * time.Hour, Public: true, Immutable: true}},
+		{"preview", "public, max-age=86400", "image/webp", preview, CachePolicy{MaxAge: 24 * time.Hour, Public: true}},
+		{"fallback", "private, max-age=60", "image/png", original, CachePolicy{MaxAge: time.Minute}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			router := gin.New()
+			serve := func(c *gin.Context) { ServeLocalFile(c, tc.file, tc.policy) }
+			router.GET("/file.png", serve)
+			router.HEAD("/file.png", serve)
+			get := httptest.NewRequest(http.MethodGet, "/file.png", nil)
+			get.Header.Set("Range", "bytes=2-4")
+			rangeResp := httptest.NewRecorder()
+			router.ServeHTTP(rangeResp, get)
+			if rangeResp.Code != http.StatusPartialContent || rangeResp.Body.String() != "234" {
+				t.Fatalf("Range: %d %q", rangeResp.Code, rangeResp.Body.String())
+			}
+			head := httptest.NewRecorder()
+			router.ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/file.png", nil))
+			if head.Code != http.StatusOK || head.Body.Len() != 0 || head.Header().Get("Content-Length") != "10" {
+				t.Fatalf("HEAD: %d %v %q", head.Code, head.Header(), head.Body.String())
+			}
+			for _, response := range []*httptest.ResponseRecorder{head, rangeResp} {
+				hdr := response.Header()
+				if hdr.Get("Cache-Control") != tc.cache || hdr.Get("Content-Type") != tc.mime || hdr.Get("X-Content-Type-Options") != "nosniff" {
+					t.Fatalf("响应头不符: %v", hdr)
+				}
+			}
+			conditional := httptest.NewRequest(http.MethodGet, "/file.png", nil)
+			if tc.policy.Public {
+				conditional.Header.Set("If-Modified-Since", head.Header().Get("Last-Modified"))
+			} else {
+				if head.Header().Get("Last-Modified") != "" {
+					t.Fatalf("回退响应不应带 Last-Modified: %v", head.Header())
+				}
+				conditional.Header.Set("If-None-Match", head.Header().Get("ETag"))
+			}
+			fresh := httptest.NewRecorder()
+			router.ServeHTTP(fresh, conditional)
+			if fresh.Code != http.StatusNotModified || fresh.Header().Get("Cache-Control") != tc.cache {
+				t.Fatalf("304: %d %v", fresh.Code, fresh.Header())
+			}
+		})
+	}
+
+	t.Run("同一兼容 URL 在变体与旧原图回退之间双向切换不误判 304", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		older := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+		if err := os.Chtimes(src.Path, older, older); err != nil {
+			t.Fatal(err)
+		}
+		var serving *LocalFile
+		var policy CachePolicy
+		router := gin.New()
+		router.GET("/file.png", func(c *gin.Context) { ServeLocalFile(c, serving, policy) })
+
+		// 1. 先提供较新的变体
+		serving, policy = preview, CachePolicy{MaxAge: 24 * time.Hour, Public: true}
+		r1 := httptest.NewRecorder()
+		router.ServeHTTP(r1, httptest.NewRequest(http.MethodGet, "/file.png", nil))
+		if r1.Code != http.StatusOK || r1.Header().Get("ETag") == "" || r1.Header().Get("Last-Modified") == "" {
+			t.Fatalf("变体首次响应异常: %d %v", r1.Code, r1.Header())
+		}
+
+		// 2. 切回较旧的原图回退：即使客户端带了较新变体的 If-Modified-Since 与 If-None-Match，也必须返回 200 原图
+		serving, policy = original, CachePolicy{MaxAge: time.Minute}
+		reqFallback := httptest.NewRequest(http.MethodGet, "/file.png", nil)
+		reqFallback.Header.Set("If-Modified-Since", r1.Header().Get("Last-Modified"))
+		reqFallback.Header.Set("If-None-Match", r1.Header().Get("ETag"))
+		r2 := httptest.NewRecorder()
+		router.ServeHTTP(r2, reqFallback)
+		if r2.Code != http.StatusOK || r2.Body.String() != "0123456789" || r2.Header().Get("ETag") == r1.Header().Get("ETag") {
+			t.Fatalf("切回回退原图不应误回 304: code=%d body=%q etag=%q", r2.Code, r2.Body.String(), r2.Header().Get("ETag"))
+		}
+
+		// 3. 再从回退原图切回变体：带着回退 ETag 也必须返回 200 变体
+		serving, policy = preview, CachePolicy{MaxAge: 24 * time.Hour, Public: true}
+		reqVariant := httptest.NewRequest(http.MethodGet, "/file.png", nil)
+		reqVariant.Header.Set("If-None-Match", r2.Header().Get("ETag"))
+		r3 := httptest.NewRecorder()
+		router.ServeHTTP(r3, reqVariant)
+		if r3.Code != http.StatusOK || r3.Body.String() != "0123456789" || r3.Header().Get("Content-Type") != "image/webp" {
+			t.Fatalf("从回退切回变体不应误回 304: code=%d mime=%q", r3.Code, r3.Header().Get("Content-Type"))
+		}
+	})
+}
+
+func TestLocalVariantDualInstanceDeleteMutex(t *testing.T) {
+	dir := t.TempDir()
+	localA, err := NewLocal(config.LocalStorage{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	localB, err := NewLocal(config.LocalStorage{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "u1/shared.png"
+	if err := localA.Put(t.Context(), key, strings.NewReader("original"), 8, "image/png"); err != nil {
+		t.Fatal(err)
+	}
+	src, err := localA.StatSource(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoding, deleted := make(chan struct{}), make(chan struct{})
+	go func() {
+		<-encoding
+		if err := localB.Delete(t.Context(), key); err != nil {
+			t.Errorf("第二实例删除失败: %v", err)
+		}
+		close(deleted)
+	}()
+	if _, err := localA.PublishVariant(key, "thumb", "webp", src, func(dst io.Writer) error {
+		close(encoding)
+		<-deleted
+		_, werr := io.WriteString(dst, "webp-bytes")
+		return werr
+	}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("另一实例已删除原文件，发布必须失败: %v", err)
+	}
+	if _, hit, err := localA.LookupVariant(key, "thumb", "webp"); !errors.Is(err, ErrNotFound) || hit {
+		t.Fatalf("不能残留孤儿变体: hit=%v err=%v", hit, err)
+	}
+	// 并发交错竞态：双实例无外部同步屏障直接争夺关键区与 os.RemoveAll，任何一方先后顺序都不得在 Delete 完成后残留变体
+	for idx := range 32 {
+		raceKey := fmt.Sprintf("u1/race-%d.png", idx)
+		if err := localA.Put(t.Context(), raceKey, strings.NewReader("original"), 8, "image/png"); err != nil {
+			t.Fatal(err)
+		}
+		raceSrc, err := localA.StatSource(raceKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ready := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			<-ready
+			done <- localB.Delete(t.Context(), raceKey)
+		}()
+		_, _ = localA.PublishVariant(raceKey, "thumb", "webp", raceSrc, func(dst io.Writer) error {
+			close(ready)
+			_, werr := io.WriteString(dst, "webp-bytes")
+			return werr
+		})
+		if delErr := <-done; delErr != nil {
+			t.Fatalf("迭代 %d 删除失败: %v", idx, delErr)
+		}
+		if _, hit, err := localA.LookupVariant(raceKey, "thumb", "webp"); !errors.Is(err, ErrNotFound) || hit {
+			t.Fatalf("迭代 %d 存在跨实例竞争残留变体: hit=%v err=%v", idx, hit, err)
+		}
+	}
+	if err := filepath.WalkDir(filepath.Join(dir, ".variants"), func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() {
+			t.Errorf("跨实例并发删除后磁盘仍残留变体文件: %s", p)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	assertNoTmpFiles(t, dir)
+}
+
+func TestLocalVariantCanceledPublication(t *testing.T) {
+	const key = "original.png"
+	local := newTestLocal(t, "")
+	if err := local.Put(t.Context(), key, strings.NewReader("original"), 8, "image/png"); err != nil {
+		t.Fatal(err)
+	}
+	src, err := local.StatSource(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	_, err = local.PublishVariantContext(ctx, key, "thumb", "webp", src, func(dst io.Writer) error {
+		_, err := io.WriteString(dst, "encoded data")
+		cancel()
+		return err
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("发布前取消: %v", err)
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(key)))
+	dir := filepath.Join(filepath.Dir(src.Path), ".variants", hash[:2], hash, "p2", fmt.Sprintf("%d-%d", src.Size, src.MTimeNano))
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("取消后不能残留缓存或临时文件: %v %v", entries, err)
+	}
 }
 
 func TestValidateKey(t *testing.T) {

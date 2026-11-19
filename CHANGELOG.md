@@ -4,6 +4,22 @@
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-11-19
+
+### 画布预览提速与日志隔离
+
+- **本地存储按需缩略图与视频封面缓存**：
+  - 新增 `videoframe.PreviewEncoder`，复用内置 `ffmpeg`/`ffprobe` 将本地磁盘存储的图片与视频首帧按显示比例缩放至长边 `<= 512px`，优先输出保留透明通道的 WebP（宿主缺少 `libwebp` 时自动降级 JPEG），前置 4000 万像素限制、`-threads 1`、协议/解复用白名单与 1 MiB 输出上限。
+  - 衍生缓存原子写入本地存储私有目录 `.variants/`（带源文件大小与修改时间指纹），与包级按「目录 + key」分片互斥锁协作，删除原文件时同步清理对应变体目录；不改变数据库表结构与 `ValidateKey` 规则。
+  - 新增 `service.LocalVariantService`，实现同指纹共享等待（`task.done`）、进程内并发 `2` / 排队上限 `64` / 入队起算 15 秒总超时、确定性失败 30 秒冷却，以及 `App` 关停阶段先于 HTTP drain 取消并回收临时文件。
+- **严格预览模式（`pv=2`）与缓存策略修正**：
+  - `FileTarget` 收窄为 `*storage.LocalFile` + `storage.CachePolicy`，原文件保持 `public, max-age=31536000, immutable`，本地变体设为 `public, max-age=86400`，非严格兼容回退修正为 `private, max-age=60` 并以 `localFileETag` 及省略 `Last-Modified` 避免误判 `304`。
+  - 新增严格预览参数 `pv=2`（不可生成返回 `404`、繁忙/超时返回 `503` 并附 `Cache-Control: no-store`），既穿透旧 `?v=thumb` 长期缓存，又禁止对支持前端降级的预览入口悄悄回退多 MB 原图；聊天附件与列表封面继续保持兼容 `?v=thumb`。
+- **前端顺序渐进加载与比例探测防回退**：
+  - 画布 `MediaPreview`、灯箱 `ImageStage`/`VideoStage` 与 `VideoPoster` 启用 `?pv=2`，先只加载缩略图，结算后再按缩放/选中/灯箱策略加载原图，原图可见后隐藏底层缩略图避免透明图透过低清图显影，消除并发与回退双倍下载；`probeMediaAspect` 对站内视频封面失败直接返回 `null`，不再触发 `<video>` 拉取原视频元数据。
+- **WebSocket `/api/v1/ws` Nginx 日志隔离加强**：
+  - `web/nginx.conf` 使用 `~* "^/+api/+v1/+ws(?:;[^/]*)?/?$"` 隔离握手路径及斜杠/大小写变体（不吞掉 `/api/v1/ws/ticket` 签发接口日志），并在 server 级引入 `$vc_safe_request`（`map`）+ `log_format vc_safe` 对前置 400/414/431 拒绝请求里的查询串（含百分号编码参数）做脱敏。
+
 ## [0.7.1] - 2026-11-18
 
 ### 安全与日志修复

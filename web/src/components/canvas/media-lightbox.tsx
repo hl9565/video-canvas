@@ -16,7 +16,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { DURATION, EASE_OUT, SPRING, TAP } from "@/lib/motion";
 import { cn } from "@/lib/utils";
 import { downloadMedia, downloadName } from "@/utils/canvas/download";
-import { variantUrl } from "@/utils/canvas/media-lod";
+import { resolveImageLayers, variantUrl, type ImageLoadPhase } from "@/utils/canvas/media-lod";
 import {
   formatFileSize,
   resolveActiveIndex,
@@ -86,16 +86,38 @@ type StageProps = {
 };
 
 /**
- * 图片舞台：先铺缩略图（节点里多半已缓存），原图加载完成再淡入盖上去，避免黑屏。
+ * 图片舞台：先等缩略图加载，再请求原图；原图加载完成才淡入盖上去，避免黑屏。
  * 原图失败给占位、重试和下载入口，缩略图失败直接看原图。
  */
-function ImageStage({ item, onRatio, onNatural }: StageProps) {
+function ImageStage(props: StageProps) {
+  return <ImageStageInner key={props.item.src} {...props} />;
+}
+
+function ImageStageInner({ item, onRatio, onNatural }: StageProps) {
   const reduce = useReducedMotion();
-  const thumb = variantUrl(item.src, "thumb");
-  const [thumbFailed, setThumbFailed] = useState(false);
-  const [state, setState] = useState<"pending" | "loaded" | "failed">("pending");
+  const thumb = variantUrl(item.src, "thumb", { strict: true });
+  const [thumbState, setThumbState] = useState<ImageLoadPhase>("pending");
+  const [state, setState] = useState<ImageLoadPhase>("pending");
   const [attempt, setAttempt] = useState(0);
-  const showThumb = thumb.hasVariant && !thumbFailed;
+  const { showThumb, showOriginal } = resolveImageLayers({
+    hasVariant: thumb.hasVariant,
+    thumbState,
+    preferThumb: false,
+    originalStarted: false,
+  });
+
+  function onThumbLoad({ naturalWidth, naturalHeight }: HTMLImageElement) {
+    if (thumbState !== "pending") return;
+    setThumbState("loaded");
+    onRatio(naturalWidth, naturalHeight);
+  }
+
+  function onOriginalLoad({ naturalWidth, naturalHeight }: HTMLImageElement) {
+    if (state !== "pending") return;
+    setState("loaded");
+    onRatio(naturalWidth, naturalHeight);
+    onNatural(naturalWidth, naturalHeight);
+  }
 
   if (state === "failed") {
     return (
@@ -128,37 +150,43 @@ function ImageStage({ item, onRatio, onNatural }: StageProps) {
           src={thumb.url}
           alt=""
           draggable={false}
-          onLoad={(event) =>
-            onRatio(event.currentTarget.naturalWidth, event.currentTarget.naturalHeight)
-          }
-          onError={() => setThumbFailed(true)}
+          onLoad={(event) => onThumbLoad(event.currentTarget)}
+          onError={() => setThumbState("failed")}
+          ref={(el) => {
+            if (el?.complete && el.naturalWidth > 0) onThumbLoad(el);
+          }}
+          style={{ opacity: state === "loaded" ? 0 : 1 }}
           className="absolute inset-0 size-full object-contain"
         />
       )}
-      <motion.img
-        key={attempt}
-        src={item.src}
-        alt={item.label}
-        draggable={false}
-        initial={false}
-        animate={{ opacity: state === "loaded" || !showThumb ? 1 : 0 }}
-        transition={{ duration: reduce ? 0 : DURATION.base, ease: EASE_OUT }}
-        onLoad={(event) => {
-          const { naturalWidth, naturalHeight } = event.currentTarget;
-          setState("loaded");
-          onRatio(naturalWidth, naturalHeight);
-          onNatural(naturalWidth, naturalHeight);
-        }}
-        onError={() => setState("failed")}
-        className="absolute inset-0 size-full object-contain"
-      />
+      {showOriginal && (
+        <motion.img
+          key={attempt}
+          src={item.src}
+          alt={item.label}
+          draggable={false}
+          initial={false}
+          animate={{ opacity: state === "loaded" || !showThumb ? 1 : 0 }}
+          transition={{ duration: reduce ? 0 : DURATION.base, ease: EASE_OUT }}
+          onLoad={(event) => onOriginalLoad(event.currentTarget)}
+          onError={() => setState("failed")}
+          ref={(el) => {
+            if (el?.complete && el.naturalWidth > 0) onOriginalLoad(el);
+          }}
+          className="absolute inset-0 size-full object-contain"
+        />
+      )}
     </div>
   );
 }
 
 /** 视频舞台：先露封面占位，视频能播后接管；无法播放给说明 */
-function VideoStage({ item, onRatio, onNatural }: StageProps) {
-  const poster = variantUrl(item.src, "poster");
+function VideoStage(props: StageProps) {
+  return <VideoStageInner key={props.item.src} {...props} />;
+}
+
+function VideoStageInner({ item, onRatio, onNatural }: StageProps) {
+  const poster = variantUrl(item.src, "poster", { strict: true });
   const [failed, setFailed] = useState(false);
   const [attempt, setAttempt] = useState(0);
 
@@ -364,6 +392,7 @@ export function MediaLightbox({
                   >
                     {item.mediaType === "image" ? (
                       <ImageStage
+                        key={item.src}
                         item={item}
                         onRatio={(w, h) => setRatios((prev) => ({ ...prev, [item.src]: w / h }))}
                         onNatural={(w, h) =>

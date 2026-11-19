@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -19,8 +18,8 @@ import (
 // FileResolver 决定一个对象 key 怎么提供给浏览器，由 service.AssetService 实现。
 type FileResolver interface {
 	ResolveFile(ctx context.Context, key string) (*service.FileTarget, error)
-	// ResolveVariant 解析素材变体（?v=thumb|poster）：有处理服务时跳转到处理地址，否则缩略图回退原图、封面 404。
-	ResolveVariant(ctx context.Context, key, variant string) (*service.FileTarget, error)
+	// ResolveVariantWithOptions 解析缩略图或封面，并按请求版本决定是否允许回退。
+	ResolveVariantWithOptions(ctx context.Context, key, variant string, opts service.VariantOptions) (*service.FileTarget, error)
 }
 
 // NewFilesHandler 返回 /files/*filepath 的处理器（GET 与 HEAD 都挂它）。
@@ -37,11 +36,16 @@ func NewFilesHandler(res FileResolver) gin.HandlerFunc {
 			err    error
 		)
 		if variant := c.Query("v"); variant != "" {
-			target, err = res.ResolveVariant(c.Request.Context(), key, variant)
+			c.Writer = variantResponseWriter{c.Writer}
+			target, err = res.ResolveVariantWithOptions(c.Request.Context(), key, variant, service.VariantOptions{Strict: c.Query("pv") == "2"})
 		} else {
 			target, err = res.ResolveFile(c.Request.Context(), key)
 		}
 		if err != nil {
+			if c.Request.Context().Err() != nil {
+				c.Abort()
+				return
+			}
 			var e *errcode.Error
 			if errors.As(err, &e) {
 				c.AbortWithStatus(e.HTTPStatus())
@@ -52,16 +56,27 @@ func NewFilesHandler(res FileResolver) gin.HandlerFunc {
 			return
 		}
 
+		cache := storage.CachePolicy{MaxAge: target.MaxAge, Public: target.CachePublic, Immutable: target.CacheImmutable}
 		if target.Local != nil {
-			storage.FileServer(target.Local)(c)
+			storage.ServeLocalFile(c, target.Local, cache)
 			return
 		}
 
 		// 跳转本身可以缓存一段时间（不超过签名有效期的 1/4，保证浏览器拿到的地址一定还没过期）；
 		// no-referrer 避免把站点页面地址带给存储服务商
 		h := c.Writer.Header()
-		h.Set("Cache-Control", "private, max-age="+strconv.Itoa(int(target.MaxAge.Seconds())))
+		h.Set("Cache-Control", cache.HeaderValue())
 		h.Set("Referrer-Policy", "no-referrer")
 		c.Redirect(http.StatusFound, target.RedirectURL)
 	}
+}
+
+type variantResponseWriter struct{ gin.ResponseWriter }
+
+func (w variantResponseWriter) WriteHeader(status int) {
+	if status >= http.StatusBadRequest {
+		// ServeContent 会移除失败响应的缓存头，因此在发送状态时明确写回 no-store。
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	w.ResponseWriter.WriteHeader(status)
 }

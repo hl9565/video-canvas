@@ -111,7 +111,8 @@ func TestAssetService_ResolveFile(t *testing.T) {
 		seed(repo, 1)
 		reg := newFakeRegistry(1, &storage.Handle{ID: 1, Provider: storage.ProviderLocal, Storage: local})
 		tgt, err := NewAssetService(repo, reg, config.Storage{}).ResolveFile(ctx, "u1/202610/a.png")
-		if err != nil || tgt.Local != local || tgt.RedirectURL != "" {
+		if err != nil || tgt.Local == nil || tgt.RedirectURL != "" || tgt.Local.ContentType != "image/png" ||
+			tgt.MaxAge != 365*24*time.Hour || !tgt.CachePublic || !tgt.CacheImmutable {
 			t.Fatalf("实际 %+v err=%v", tgt, err)
 		}
 	})

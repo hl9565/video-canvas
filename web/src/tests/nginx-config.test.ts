@@ -9,8 +9,12 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
-import { createServer as createNetServer } from "node:net";
+import {
+  createConnection,
+  createServer as createNetServer,
+  type Server as NetServer,
+  type Socket,
+} from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -314,13 +318,6 @@ async function allocatePort(): Promise<number> {
   });
 }
 
-async function closeHttpServer(server: HttpServer): Promise<void> {
-  await new Promise<void>((resolve) => {
-    server.closeAllConnections?.();
-    server.close(() => resolve());
-  });
-}
-
 async function stopProcess(proc: ChildProcess): Promise<void> {
   if (proc.exitCode !== null || proc.signalCode !== null) return;
   await new Promise<void>((resolve) => {
@@ -339,15 +336,20 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
   const nginxConf = readFileSync(NGINX_CONF_PATH, "utf8");
   const dockerfile = readFileSync(DOCKERFILE_PATH, "utf8");
   const parsed = parseNginxConfig(nginxConf);
-  const server = parsed.blocks[0];
+  const mapBlock = parsed.blocks.find((b) => b.name === "map");
+  const server = parsed.blocks.find((b) => b.name === "server");
   const locations = server ? extractLocations(server) : [];
 
-  test("挂载于 /etc/nginx/conf.d/default.conf，严格单 server {} 且零 log_format", () => {
+  test("挂载于 /etc/nginx/conf.d/default.conf，声明 ticket/token 脱敏日志格式且仅单 server {}", () => {
     expect(dockerfile).toContain("COPY nginx.conf /etc/nginx/conf.d/default.conf");
-    expect(parsed.directives).toEqual([]);
-    expect(parsed.blocks).toHaveLength(1);
-    expect(server?.name).toBe("server");
-    expect(nginxConf).not.toMatch(/\blog_format\b/);
+    expect(parsed.blocks.filter((b) => b.name === "server")).toHaveLength(1);
+    expect(mapBlock?.args).toEqual(["$request", "$vc_safe_request"]);
+    expect(parsed.directives.map((d) => d.name)).toEqual(["log_format"]);
+    expect(parsed.directives[0]?.args[0]).toBe("vc_safe");
+    expect(directiveArgs(server!, "access_log")).toEqual([
+      ["/var/log/nginx/access.log", "vc_safe"],
+    ]);
+    expect(directiveArgs(server!, "error_log")).toEqual([["/var/log/nginx/error.log", "warn"]]);
     expect(nginxConf).not.toMatch(/\bhttp\s*\{/);
     expect(nginxConf).not.toMatch(/\bevents\s*\{/);
   });
@@ -400,8 +402,13 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
     expect(filesLoc).toBeDefined();
     expect(directiveArgs(filesLoc!.block, "proxy_pass")).toEqual([["http://backend:8080"]]);
 
-    const wsLoc = locations.find((loc) => loc.pattern === "/api/v1/ws");
+    const wsLoc = locations.find(
+      (loc) => loc.modifier === "~*" && loc.pattern === "^/+api/+v1/+ws(?:;[^/]*)?/?$",
+    );
     expect(wsLoc).toBeDefined();
+    expect(directiveArgs(wsLoc!.block, "access_log")).toEqual([["off"]]);
+    expect(directiveArgs(wsLoc!.block, "error_log")).toEqual([["/dev/null", "emerg"]]);
+    expect(directiveArgs(wsLoc!.block, "proxy_pass")).toEqual([["http://backend:8080"]]);
     expect(directiveArgs(wsLoc!.block, "proxy_http_version")).toEqual([["1.1"]]);
     expect(directiveArgs(wsLoc!.block, "proxy_set_header")).toContainEqual([
       "Upgrade",
@@ -410,6 +417,14 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
     expect(directiveArgs(wsLoc!.block, "proxy_set_header")).toContainEqual([
       "Connection",
       "upgrade",
+    ]);
+    expect(directiveArgs(wsLoc!.block, "proxy_set_header")).toContainEqual([
+      "X-Real-IP",
+      "$remote_addr",
+    ]);
+    expect(directiveArgs(wsLoc!.block, "proxy_set_header")).toContainEqual([
+      "X-Forwarded-Proto",
+      "$forwarded_proto",
     ]);
 
     const rootLoc = locations.find((loc) => loc.pattern === "/");
@@ -446,7 +461,11 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
       ["/api/v1/dramas/d1/episodes/1/preview/0123456789abcdef", "/api/"],
       ["/api/v1/dramas/d1/episodes/1/manifest", "/api/"],
       ["/api/v1/dramas/d1/episodes/1/segments", "/api/"],
-      ["/api/v1/ws?ticket=t1", "/api/v1/ws"],
+      ["/api/v1/ws?ticket=t1", "^/+api/+v1/+ws(?:;[^/]*)?/?$"],
+      ["/api/v1/ws/?ticket=t1", "^/+api/+v1/+ws(?:;[^/]*)?/?$"],
+      ["/api/v1/WS/?ticket=t1", "^/+api/+v1/+ws(?:;[^/]*)?/?$"],
+      ["/api/v1//ws?ticket=t1", "^/+api/+v1/+ws(?:;[^/]*)?/?$"],
+      ["/api/v1/ws/ticket", "/api/"],
       ["/files/asset.mp4", "/files/"],
       ["/drama/123", "/"],
     ];
@@ -473,13 +492,22 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
     );
   });
 
-  test("可用 nginx 时校验 nginx -t 与正常/拒绝/上游失败零明文 token 日志；缺失按环境策略处理", async () => {
+  test("可用 nginx 时校验 nginx -t 与预览流 token、WebSocket ticket 日志隔离；缺失按环境策略处理", async () => {
     const nginxBin = resolveNginxBinaryOrReport(findNginxBinary(), process.env);
     if (!nginxBin) return;
 
     const workDir = mkdtempSync(join(tmpdir(), "vc-nginx-test-"));
     let proc: ChildProcess | null = null;
-    let upstream: HttpServer | null = null;
+    let upstream: NetServer | null = null;
+    const upstreamSockets = new Set<Socket>();
+    const closeUpstream = async () => {
+      if (!upstream) return;
+      const srv = upstream;
+      upstream = null;
+      for (const s of upstreamSockets) s.destroy();
+      upstreamSockets.clear();
+      await new Promise<void>((resolve) => srv.close(() => resolve()));
+    };
     try {
       const nginxPort = await allocatePort();
       const accessLog = join(workDir, "access.log");
@@ -492,46 +520,77 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
       writeFileSync(join(workDir, "index.html"), spaHTML, "utf8");
       let sawRangeHeaders = false;
 
-      upstream = createHttpServer((req, res) => {
-        const url = new URL(req.url ?? "/", "http://127.0.0.1");
-        res.setHeader("X-Test-Upstream-Proto", req.headers["x-forwarded-proto"] ?? "");
-        if (url.pathname.toLowerCase().includes("/stream")) {
-          const token = url.searchParams.get("token");
-          if (token === "SECRET_FORBIDDEN") {
-            res.writeHead(403);
-            res.end();
+      upstream = createNetServer((socket) => {
+        upstreamSockets.add(socket);
+        socket.on("close", () => upstreamSockets.delete(socket));
+        let buf = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (chunk) => {
+          buf += chunk;
+          const endIdx = buf.indexOf("\r\n\r\n");
+          if (endIdx < 0) return;
+          const lines = buf.slice(0, endIdx).split("\r\n");
+          const reqTarget = lines[0]?.split(" ")[1] ?? "/";
+          const hdrs = new Map<string, string>();
+          for (const line of lines.slice(1)) {
+            const sep = line.indexOf(":");
+            if (sep > 0) hdrs.set(line.slice(0, sep).toLowerCase(), line.slice(sep + 1).trim());
+          }
+          const url = new URL(reqTarget, "http://127.0.0.1");
+          const proto = hdrs.get("x-forwarded-proto") ?? "";
+          if (hdrs.get("upgrade")?.toLowerCase() === "websocket") {
+            socket.write(
+              [
+                "HTTP/1.1 101 Switching Protocols",
+                "Upgrade: websocket",
+                "Connection: Upgrade",
+                "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+                `X-Test-Upgrade-Proto: ${proto}`,
+                "",
+                "",
+              ].join("\r\n"),
+            );
             return;
           }
-          if (token === "SECRET_REJECTED") {
-            res.writeHead(401);
-            res.end();
-            return;
+          const writeResp = (status: string, extra: Record<string, string>, body: string) => {
+            const headLines = [
+              `HTTP/1.1 ${status}`,
+              `X-Test-Upstream-Proto: ${proto}`,
+              `Content-Length: ${Buffer.byteLength(body)}`,
+              "Connection: close",
+              ...Object.entries(extra).map(([k, v]) => `${k}: ${v}`),
+              "",
+              "",
+            ];
+            socket.end(headLines.join("\r\n") + body);
+          };
+          if (url.pathname.toLowerCase().includes("/stream")) {
+            const token = url.searchParams.get("token");
+            if (token === "SECRET_FORBIDDEN") return writeResp("403 Forbidden", {}, "");
+            if (token === "SECRET_REJECTED") return writeResp("401 Unauthorized", {}, "");
+            if (hdrs.get("range") === "bytes=0-3") {
+              sawRangeHeaders =
+                hdrs.get("if-range") === '"etag-1"' &&
+                Boolean(hdrs.get("x-real-ip")) &&
+                Boolean(hdrs.get("x-forwarded-for")) &&
+                proto === "http";
+              return writeResp(
+                "206 Partial Content",
+                {
+                  "Content-Range": "bytes 0-3/8",
+                  "Accept-Ranges": "bytes",
+                  "Content-Type": "video/mp4",
+                },
+                "mp4!",
+              );
+            }
+            return writeResp("200 OK", {}, "mp4-full");
           }
-          if (req.headers.range === "bytes=0-3") {
-            sawRangeHeaders =
-              req.headers["if-range"] === '"etag-1"' &&
-              Boolean(req.headers["x-real-ip"]) &&
-              Boolean(req.headers["x-forwarded-for"]) &&
-              req.headers["x-forwarded-proto"] === "http";
-            res.writeHead(206, {
-              "Content-Range": "bytes 0-3/8",
-              "Accept-Ranges": "bytes",
-              "Content-Type": "video/mp4",
-            });
-            res.end("mp4!");
-            return;
-          }
-          res.writeHead(200);
-          res.end("mp4-full");
-          return;
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end('{"status":"ready"}');
+          return writeResp("200 OK", { "Content-Type": "application/json" }, '{"status":"ready"}');
+        });
       });
 
-      await new Promise<void>((resolve) => {
-        upstream!.listen(0, "127.0.0.1", () => resolve());
-      });
+      await new Promise<void>((resolve) => upstream!.listen(0, "127.0.0.1", () => resolve()));
       const upstreamAddr = upstream.address();
       if (!upstreamAddr || typeof upstreamAddr === "string") {
         throw new Error("Failed to bind mock upstream server");
@@ -540,6 +599,11 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
       const rewrittenServer = nginxConf
         .replace(/listen\s+80\s*;/, `listen 127.0.0.1:${nginxPort};`)
         .replace("root /usr/share/nginx/html;", `root ${workDir};`)
+        .replace(
+          "access_log /var/log/nginx/access.log vc_safe;",
+          `access_log ${accessLog} vc_safe;`,
+        )
+        .replace("error_log /var/log/nginx/error.log warn;", `error_log ${errorLog} warn;`)
         .replaceAll(
           "proxy_pass http://backend:8080;",
           `proxy_pass http://127.0.0.1:${upstreamAddr.port};`,
@@ -655,8 +719,84 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
         await forwarded.text();
       }
 
-      await closeHttpServer(upstream);
-      upstream = null;
+      const wsPath = "/api/v1/ws";
+      const wsOK = await fetch(`${base}${wsPath}?ticket=SECRET_WS_TICKET`);
+      expect(wsOK.status).toBe(200);
+      expect(await wsOK.json()).toEqual({ status: "ready" });
+
+      const rawRequest = (payload: string) =>
+        new Promise<string>((resolve, reject) => {
+          const sock = createConnection({ host: "127.0.0.1", port: nginxPort }, () => {
+            sock.write(payload);
+          });
+          let data = "";
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            sock.destroy();
+            resolve(data);
+          };
+          sock.setEncoding("utf8");
+          sock.on("data", (chunk) => {
+            data += chunk;
+            if (data.includes("\r\n\r\n")) finish();
+          });
+          sock.on("end", finish);
+          sock.on("error", (err) => {
+            if (!settled) {
+              settled = true;
+              reject(err);
+            }
+          });
+        });
+
+      // 真实 WebSocket 101 握手：保留 Upgrade / Connection 与外层 X-Forwarded-Proto，且不落日志
+      const wsUpgradeRaw = await rawRequest(
+        [
+          `GET ${wsPath}?ticket=SECRET_WS_UPGRADE_101 HTTP/1.1`,
+          "Host: canvas.example.test",
+          "Upgrade: websocket",
+          "Connection: Upgrade",
+          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+          "Sec-WebSocket-Version: 13",
+          "X-Forwarded-Proto: https",
+          "",
+          "",
+        ].join("\r\n"),
+      );
+      expect(wsUpgradeRaw).toContain("101 Switching Protocols");
+      expect(wsUpgradeRaw).toContain("X-Test-Upgrade-Proto: https");
+
+      // 进入 location 之前被 400 拒绝（超长请求头 > 8KB），覆盖字面与百分号编码参数名：必须脱敏不得泄露未消费凭据
+      const hugeHeader = "a".repeat(12 * 1024);
+      for (const badTarget of [
+        `${wsPath}?ticket=SECRET_WS_PRELOC_400`,
+        `${wsPath}?%74icket=SECRET_WS_PCT_400`,
+        "/api/v1/dramas/d1/episodes/1/preview/tkt1/stream?token=SECRET_TOKEN_PRELOC_400",
+        "/api/v1/dramas/d1/episodes/1/preview/tkt1/stream?t%6fken=SECRET_TOKEN_PCT_400",
+      ]) {
+        const preLoc400 = await rawRequest(
+          [
+            `GET ${badTarget} HTTP/1.1`,
+            "Host: canvas.example.test",
+            `X-Huge: ${hugeHeader}`,
+            "",
+            "",
+          ].join("\r\n"),
+        );
+        expect(preLoc400, badTarget).toMatch(/^HTTP\/1\.1 400 /);
+      }
+
+      // POST /api/v1/ws/ticket 签发接口与普通查询请求不被 /api/v1/ws 吞掉，且查询值被脱敏
+      const issueTicket = await fetch(`${base}/api/v1/ws/ticket`, { method: "POST" });
+      expect(issueTicket.status).toBe(200);
+      await issueTicket.text();
+      const normalQuery = await fetch(`${base}/api/v1/health?tab=overview`);
+      expect(normalQuery.status).toBe(200);
+      await normalQuery.text();
+
+      await closeUpstream();
 
       const failCanonical = await fetch(
         `${base}/api/v1/dramas/d1/episodes/1/preview/tkt1/stream?token=SECRET_UPSTREAM_502`,
@@ -671,18 +811,37 @@ describe("web/nginx.conf 预览流日志与代理不变量", () => {
       const failApi = await fetch(`${base}/api/v1/dramas/d1/episodes/1/preview/tkt1`);
       expect(failApi.status).toBe(502);
 
+      const failWS = await fetch(`${base}${wsPath}?ticket=SECRET_WS_502`);
+      expect(failWS.status).toBe(502);
+      await failWS.text();
+
+      const failWSSlash = await fetch(`${base}${wsPath}/?ticket=SECRET_WS_SLASH_502`);
+      expect(failWSSlash.status).toBe(502);
+      await failWSSlash.text();
+
+      const failWSDouble = await fetch(`${base}/api/v1//ws/?ticket=SECRET_WS_DBL_502`);
+      expect(failWSDouble.status).toBe(502);
+      await failWSDouble.text();
+
       await delay(100);
       const accessText = existsSync(accessLog) ? readFileSync(accessLog, "utf8") : "";
       const errorText = existsSync(errorLog) ? readFileSync(errorLog, "utf8") : "";
 
       expect(accessText).toContain("/api/v1/dramas/d1/episodes/1/preview/tkt1");
+      expect(accessText).toContain('POST /api/v1/ws/ticket HTTP/1.1" 200');
+      expect(accessText).toContain('GET /api/v1/health?[redacted] HTTP/1.1" 200');
+      expect(accessText).toContain('GET /api/v1/ws?[redacted] HTTP/1.1" 400');
       expect(errorText).toContain("/api/v1/dramas/d1/episodes/1/preview/tkt1");
+      expect(errorText).not.toContain(wsPath);
+      expect(accessText).not.toContain("SECRET_WS_");
+      expect(errorText).not.toContain("SECRET_WS_");
+      expect(accessText).not.toContain("SECRET_TOKEN_");
+      expect(errorText).not.toContain("SECRET_TOKEN_");
       expect(accessText).not.toContain("SECRET_");
-      expect(accessText).not.toContain("/stream");
       expect(errorText).not.toContain("SECRET_");
       expect(errorText).not.toContain("/stream");
     } finally {
-      if (upstream) await closeHttpServer(upstream);
+      await closeUpstream();
       if (proc) await stopProcess(proc);
       rmSync(workDir, { recursive: true, force: true });
     }

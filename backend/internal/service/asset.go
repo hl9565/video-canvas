@@ -72,10 +72,11 @@ type AssetService struct {
 	cfg    config.Storage
 	now    func() time.Time
 
-	redirects redirectCache        // /files 跳转的签名结果缓存
-	intents   UploadIntentRepo     // 浏览器直传的上传意图；没有开启直传能力时为 nil
-	variants  AssetVariantResolver // 缩略图 / 封面的处理服务解析；没有配置时变体一律回退
-	avatars   AvatarLocator        // 头像反查（头像不在 assets 表里）；为 nil 时 /files/avatars/... 一律 404
+	redirects     redirectCache        // /files 跳转的签名结果缓存
+	intents       UploadIntentRepo     // 浏览器直传的上传意图；没有开启直传能力时为 nil
+	variants      AssetVariantResolver // 缩略图 / 封面的云处理服务解析
+	localVariants *LocalVariantService // 本地缩略图 / 封面生成和磁盘缓存
+	avatars       AvatarLocator        // 头像反查（头像不在 assets 表里）；为 nil 时 /files/avatars/... 一律 404
 }
 
 // AvatarLocator 按头像 key 反查它所在的存储，由 repository.UserRepository 实现。
@@ -560,9 +561,11 @@ func sanitizeAssetFileName(name string) string {
 
 // FileTarget 是 /files/<key> 的处理结果：本地存储由后端直接提供文件，对象存储跳转到签名 / 公开地址。
 type FileTarget struct {
-	Local       *storage.LocalStorage // 非空：由后端直接提供文件
-	RedirectURL string                // 非空：302 跳转目标
-	MaxAge      time.Duration         // 允许浏览器缓存这次跳转的时长
+	Local          *storage.LocalFile // 非空：由后端直接提供文件
+	RedirectURL    string             // 非空：302 跳转目标
+	MaxAge         time.Duration
+	CachePublic    bool
+	CacheImmutable bool
 }
 
 // ResolveFile 按对象 key 找到素材所在的存储，并决定怎么提供这个文件。
@@ -624,7 +627,7 @@ func (s *AssetService) lookupAvatar(ctx context.Context, key string) (*model.Ass
 func (s *AssetService) targetOf(ctx context.Context, h *storage.Handle, key string, a *model.Asset) (*FileTarget, error) {
 	// 1. 本地磁盘：后端直接提供（支持 Range，视频可拖动）
 	if ls, ok := h.Storage.(*storage.LocalStorage); ok {
-		return &FileTarget{Local: ls}, nil
+		return localOriginalTarget(ls, key, a.MimeType)
 	}
 
 	// 2. 对象存储：跳转到签名（或公开）地址。同一个文件在 ttl/2 内复用同一个地址，
@@ -645,6 +648,18 @@ func (s *AssetService) targetOf(ctx context.Context, h *storage.Handle, key stri
 	}
 	s.redirects.put(cacheKey, url, now.Add(ttl/2), now)
 	return &FileTarget{RedirectURL: url, MaxAge: ttl / 4}, nil
+}
+
+// localOriginalTarget 用素材记录的真实 MIME 提供原文件；旧头像无 MIME 时保留扩展名推断。
+func localOriginalTarget(local *storage.LocalStorage, key, mimeType string) (*FileTarget, error) {
+	file, err := local.OpenLocal(key)
+	if err != nil {
+		return nil, errcode.ErrAssetNotFound
+	}
+	if mimeType != "" {
+		file.ContentType = mimeType
+	}
+	return &FileTarget{Local: file, MaxAge: 365 * 24 * time.Hour, CachePublic: true, CacheImmutable: true}, nil
 }
 
 // redirectCacheMax 是跳转地址缓存的条目上限，防止被大量不同 key 撑爆内存。

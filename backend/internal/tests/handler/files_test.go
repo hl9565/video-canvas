@@ -3,10 +3,10 @@ package handler_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,11 +27,12 @@ type fakeFileResolver struct {
 	err        error
 	gotKey     string
 	gotVariant string
+	gotStrict  bool
 	fileCalls  int
 }
 
-func (f *fakeFileResolver) ResolveVariant(ctx context.Context, key, variant string) (*service.FileTarget, error) {
-	f.gotKey, f.gotVariant = key, variant
+func (f *fakeFileResolver) ResolveVariantWithOptions(_ context.Context, key, variant string, opts service.VariantOptions) (*service.FileTarget, error) {
+	f.gotKey, f.gotVariant, f.gotStrict = key, variant, opts.Strict
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -64,16 +65,28 @@ func newFilesRouter(res *fakeFileResolver) *gin.Engine {
 	return r
 }
 
+func localFilesFixture(t *testing.T, key string) (*storage.LocalStorage, *storage.LocalFile) {
+	t.Helper()
+	local, err := storage.NewLocal(config.LocalStorage{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := local.Put(t.Context(), key, strings.NewReader("0123456789"), 10, "image/png"); err != nil {
+		t.Fatal(err)
+	}
+	file, err := local.OpenLocal(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return local, file
+}
+
 func TestFilesHandler(t *testing.T) {
 	t.Run("本地存储：直接提供文件，支持 Range", func(t *testing.T) {
-		dir := t.TempDir()
-		local, err := storage.NewLocal(config.LocalStorage{Dir: dir})
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = os.MkdirAll(filepath.Join(dir, "u1"), 0o755)
-		_ = os.WriteFile(filepath.Join(dir, "u1", "a.png"), []byte("0123456789"), 0o644)
-		res := &fakeFileResolver{targets: map[string]*service.FileTarget{"u1/a.png": {Local: local}}}
+		_, local := localFilesFixture(t, "u1/a.png")
+		res := &fakeFileResolver{targets: map[string]*service.FileTarget{
+			"u1/a.png": {Local: local, MaxAge: 365 * 24 * time.Hour, CachePublic: true, CacheImmutable: true},
+		}}
 		r := newFilesRouter(res)
 
 		w := httptest.NewRecorder()
@@ -85,6 +98,9 @@ func TestFilesHandler(t *testing.T) {
 		}
 		if res.gotKey != "u1/a.png" {
 			t.Errorf("应把去掉前导斜杠的 key 交给 service，实际 %q", res.gotKey)
+		}
+		if got := w.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+			t.Fatalf("原图缓存策略不变: %q", got)
 		}
 	})
 
@@ -146,7 +162,7 @@ func TestFilesHandler_Variant(t *testing.T) {
 		if w.Header().Get("Cache-Control") != "private, max-age=86400" {
 			t.Errorf("缓存头不对：%q", w.Header().Get("Cache-Control"))
 		}
-		if res.gotKey != "u1/a.png" || res.gotVariant != "thumb" || res.fileCalls != 0 {
+		if res.gotKey != "u1/a.png" || res.gotVariant != "thumb" || res.gotStrict || res.fileCalls != 0 {
 			t.Errorf("应只走 ResolveVariant：key=%q variant=%q 原图调用 %d 次", res.gotKey, res.gotVariant, res.fileCalls)
 		}
 	})
@@ -163,23 +179,17 @@ func TestFilesHandler_Variant(t *testing.T) {
 	t.Run("封面没有处理服务：404，不带跳转", func(t *testing.T) {
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/files/u1/a.mp4?v=poster", nil))
-		if w.Code != http.StatusNotFound || w.Header().Get("Location") != "" {
+		if w.Code != http.StatusNotFound || w.Header().Get("Location") != "" || w.Header().Get("Cache-Control") != "no-store" {
 			t.Fatalf("实际 %d %q", w.Code, w.Header().Get("Location"))
 		}
 	})
 
 	t.Run("变体回退到本地文件：直接提供", func(t *testing.T) {
-		dir := t.TempDir()
-		local, err := storage.NewLocal(config.LocalStorage{Dir: dir})
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = os.MkdirAll(filepath.Join(dir, "u1"), 0o755)
-		_ = os.WriteFile(filepath.Join(dir, "u1", "a.png"), []byte("0123456789"), 0o644)
-		res3 := &fakeFileResolver{variants: map[string]*service.FileTarget{"u1/a.png?v=thumb": {Local: local}}}
+		_, local := localFilesFixture(t, "u1/a.png")
+		res3 := &fakeFileResolver{variants: map[string]*service.FileTarget{"u1/a.png?v=thumb": {Local: local, MaxAge: time.Minute}}}
 		w := httptest.NewRecorder()
 		newFilesRouter(res3).ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/files/u1/a.png?v=thumb", nil))
-		if w.Code != http.StatusOK || w.Body.String() != "0123456789" {
+		if w.Code != http.StatusOK || w.Body.String() != "0123456789" || w.Header().Get("Cache-Control") != "private, max-age=60" {
 			t.Fatalf("实际 %d %q", w.Code, w.Body.String())
 		}
 	})
@@ -191,4 +201,66 @@ func TestFilesHandler_Variant(t *testing.T) {
 			t.Fatalf("实际 %d", w.Code)
 		}
 	})
+}
+
+func TestFilesHandlerStrictLocalVariant(t *testing.T) {
+	const key = "u1/a.png"
+	const url = "/files/" + key + "?v=thumb&pv=2"
+	for _, expected := range []*errcode.Error{errcode.ErrAssetNotFound, errcode.ErrVariantUnavailable} {
+		res := &fakeFileResolver{err: expected}
+		resp := httptest.NewRecorder()
+		newFilesRouter(res).ServeHTTP(resp, httptest.NewRequest(http.MethodGet, url, nil))
+		if !res.gotStrict || resp.Code != expected.HTTPStatus() || resp.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("严格变体错误: strict=%v code=%d headers=%v", res.gotStrict, resp.Code, resp.Header())
+		}
+	}
+	local, _ := localFilesFixture(t, key)
+	source, err := local.StatSource(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := local.PublishVariant(key, "thumb", "webp", source, func(dst io.Writer) error {
+		_, err := io.WriteString(dst, "RIFFxxxxWEBP")
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := &fakeFileResolver{variants: map[string]*service.FileTarget{
+		key + "?v=thumb": {Local: preview, MaxAge: 24 * time.Hour, CachePublic: true},
+	}}
+	router := newFilesRouter(res)
+	for _, tc := range []struct {
+		method, byteRange string
+		code              int
+		body              string
+	}{
+		{http.MethodGet, "", http.StatusOK, "RIFFxxxxWEBP"},
+		{http.MethodHead, "", http.StatusOK, ""},
+		{http.MethodGet, "bytes=8-11", http.StatusPartialContent, "WEBP"},
+	} {
+		req := httptest.NewRequest(tc.method, url, nil)
+		req.Header.Set("Range", tc.byteRange)
+		resp := httptest.NewRecorder()
+		router.ServeHTTP(resp, req)
+		if resp.Code != tc.code || resp.Body.String() != tc.body || !res.gotStrict || resp.Header().Get("Content-Type") != "image/webp" ||
+			resp.Header().Get("Cache-Control") != "public, max-age=86400" || resp.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Fatalf("%s %q: code=%d body=%q headers=%v", tc.method, tc.byteRange, resp.Code, resp.Body, resp.Header())
+		}
+	}
+	badRange := httptest.NewRequest(http.MethodGet, url, nil)
+	badRange.Header.Set("Range", "bytes=200-300")
+	rangeError := httptest.NewRecorder()
+	router.ServeHTTP(rangeError, badRange)
+	if rangeError.Code != http.StatusRequestedRangeNotSatisfiable || rangeError.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("无效 Range: code=%d headers=%v", rangeError.Code, rangeError.Header())
+	}
+	if err := local.Delete(t.Context(), key); err != nil {
+		t.Fatal(err)
+	}
+	missing := httptest.NewRecorder()
+	router.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, url, nil))
+	if missing.Code != http.StatusNotFound || missing.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("解析后文件被删: code=%d headers=%v", missing.Code, missing.Header())
+	}
 }

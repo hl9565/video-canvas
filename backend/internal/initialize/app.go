@@ -55,16 +55,17 @@ type App struct {
 	marketing      *service.MarketingService
 	dramaFrameRuns *service.DramaFrameRunService
 
-	hub        *ws.Hub                  // WebSocket 连接管理，退出时需要显式关闭（Shutdown 不会等已劫持的连接）
-	taskQueue  *queue.Runtime           // 生成任务队列（River）：本实例是否执行任务由 ai.worker.enabled 决定，但入队和后台操作总是可用
-	queueConn  *pgxpool.Pool            // 队列用来 LISTEN 新任务通知的专用连接池，退出时关闭
-	skills     *agentsvc.SkillService   // Agent 技能库；后台周期清理过期暂存和待删除的版本
-	agent      *agentRuntime            // 画布 Agent 的桥和运行进程；agent.enabled=false 时为 nil
-	runnerStop func()                   // 停止 plugin-runner 子进程的监督并结束进程；非 spawn 模式为 nil
-	assets     *service.AssetService    // 素材服务；后台定期用它清理过期未登记的直传对象
-	loginLogs  *service.LoginLogCleaner // 登录记录清理器；后台每天清理超过保留天数的记录
-	observe    *agentsvc.ObserveService // Agent 运行观测；后台每天清理超过 30 天的工具参数和结果
-	payment    *service.PaymentService  // 积分充值；后台每 30 秒补单、处理超时订单
+	hub           *ws.Hub                      // WebSocket 连接管理，退出时需要显式关闭（Shutdown 不会等已劫持的连接）
+	taskQueue     *queue.Runtime               // 生成任务队列（River）：本实例是否执行任务由 ai.worker.enabled 决定，但入队和后台操作总是可用
+	queueConn     *pgxpool.Pool                // 队列用来 LISTEN 新任务通知的专用连接池，退出时关闭
+	skills        *agentsvc.SkillService       // Agent 技能库；后台周期清理过期暂存和待删除的版本
+	agent         *agentRuntime                // 画布 Agent 的桥和运行进程；agent.enabled=false 时为 nil
+	runnerStop    func()                       // 停止 plugin-runner 子进程的监督并结束进程；非 spawn 模式为 nil
+	assets        *service.AssetService        // 素材服务；后台定期用它清理过期未登记的直传对象
+	localVariants *service.LocalVariantService // 本地素材预览；关闭时取消并清理生成任务
+	loginLogs     *service.LoginLogCleaner     // 登录记录清理器；后台每天清理超过保留天数的记录
+	observe       *agentsvc.ObserveService     // Agent 运行观测；后台每天清理超过 30 天的工具参数和结果
+	payment       *service.PaymentService      // 积分充值；后台每 30 秒补单、处理超时订单
 }
 
 // NewApp 初始化基础设施并手动组装依赖：repository -> service -> handler -> router。
@@ -348,6 +349,9 @@ func NewApp(cfg *config.Config) (*App, error) {
 	if agentProxy != nil {
 		agentProxy.WithRoleLookup(roleLookup)
 	}
+	// 在所有可能返回启动错误的依赖之后接入本地预览；App.close 统一回收。
+	localVariants := service.NewLocalVariantService(context.Background(), videoframe.NewPreviewEncoder(videoframe.PreviewOptions{}))
+	assetSvc.SetLocalVariantResolver(localVariants)
 	engineHTTP := router.New(cfg.Server.Mode, cfg.JWT.Secret, router.Handlers{
 		PricingSettings: handler.NewPricingSettingsHandler(pricingSvc),
 		AgentProxy:      agentProxy,
@@ -431,6 +435,7 @@ func NewApp(cfg *config.Config) (*App, error) {
 		queueConn:      queueConn,
 		runnerStop:     runnerStop,
 		assets:         assetSvc,
+		localVariants:  localVariants,
 		loginLogs:      service.NewLoginLogCleaner(userRepo),
 		observe:        observeSvc,
 		payment:        pay.svc,
@@ -674,8 +679,12 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	logger.Info("正在关闭 http 服务")
-	// http.Server.Shutdown 不会等已劫持的 WebSocket 连接，必须显式关闭 Hub，否则会一直等到超时
+	// http.Server.Shutdown 不会等已劫持的 WebSocket 连接，必须显式关闭 Hub；
+	// 同时先停本地预览调度器，避免 15 秒编码任务卡满 10 秒关停宽限期导致强杀残留临时文件
 	a.hub.Close()
+	if a.localVariants != nil {
+		a.localVariants.Close()
+	}
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.Server.ShutdownTimeout)
 	defer cancel()
 	if err := a.server.Shutdown(shutdownCtx); err != nil {
@@ -780,6 +789,9 @@ func (a *App) cleanupObserve(ctx context.Context) {
 }
 
 func (a *App) close() {
+	if a.localVariants != nil {
+		a.localVariants.Close()
+	}
 	if a.drama != nil {
 		a.drama.ClosePreviews()
 	}

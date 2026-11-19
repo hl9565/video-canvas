@@ -1,14 +1,19 @@
 import { useEffect, useState } from "react";
-import { motion, useReducedMotion } from "motion/react";
+import { motion } from "motion/react";
 
-import { DURATION, EASE_OUT } from "@/lib/motion";
+import { DURATION, EASE_OUT, EASE_OUT_CSS } from "@/lib/motion";
 import { cn } from "@/lib/utils";
-import { variantUrl } from "@/utils/canvas/media-lod";
+import { resolveImageLayers, variantUrl, type ImageLoadPhase } from "@/utils/canvas/media-lod";
 import { isMediaPending, type MediaLoadState } from "@/utils/canvas/media-pending";
 
 import { useLowDetail, useNodeSelected } from "./hooks/use-low-detail";
 import { MediaSkeleton } from "./media-skeleton";
 import { ImagePlaceholderIcon, VideoPlaceholderIcon } from "./placeholder-icons";
+
+const IMAGE_FADE = {
+  transitionDuration: `${DURATION.base}s`,
+  transitionTimingFunction: EASE_OUT_CSS,
+};
 
 type MediaPreviewProps = {
   /** 素材地址（payload 里的稳定地址，不带变体） */
@@ -30,8 +35,8 @@ type MediaPreviewProps = {
 };
 
 /**
- * 图片预览的统一出口：低缩放且未选中时只请求 `?v=thumb`，
- * 放大或选中后在缩略图上叠原图，原图加载完成再淡入，避免闪白。
+ * 图片预览的统一出口：先等严格缩略图加载，低缩放且未选中时只看缩略图。
+ * 放大或选中后请求原图，加载完成再淡入，避免闪白。
  * 缩略图失败自动改用原图，原图也失败才显示破图占位。
  * 两层都还没加载出来时盖一层灰色扫光占位（设计稿 6.12），缩略图到了就淡入替换它。
  * 填满父级盒子，画幅由父级决定（节点预览框固定 16:9）。
@@ -69,19 +74,29 @@ function ImageLayersInner({
   className,
   draggable,
 }: ImageLayersProps) {
-  const reduce = useReducedMotion();
-  const thumb = variantUrl(src, "thumb");
-  const [thumbState, setThumbState] = useState<"pending" | "loaded" | "failed">("pending");
-  const [originalState, setOriginalState] = useState<"pending" | "loaded" | "failed">("pending");
+  const thumb = variantUrl(src, "thumb", { strict: true });
+  const [thumbState, setThumbState] = useState<ImageLoadPhase>("pending");
+  const [originalState, setOriginalState] = useState<ImageLoadPhase>("pending");
+  const [originalStarted, setOriginalStarted] = useState(false);
 
-  const thumbUsable = thumb.hasVariant && thumbState !== "failed";
-  // 没有可用缩略图时只能直接看原图；否则按缩放档决定要不要叠原图
-  const showOriginal = !thumbUsable || !preferThumb;
+  const { showThumb, startOriginal, showOriginal } = resolveImageLayers({
+    hasVariant: thumb.hasVariant,
+    thumbState,
+    preferThumb,
+    originalStarted,
+  });
+  if (startOriginal && !originalStarted) setOriginalStarted(true);
+
+  const originalVisible = originalState === "loaded" && (!preferThumb || !showThumb);
   const showBroken = originalState === "failed" && thumbState !== "loaded";
   const fitClass = fit === "cover" ? "object-cover" : "object-contain";
+  const layerClass = cn(
+    "absolute inset-0 size-full transition-opacity motion-reduce:transition-none",
+    fitClass,
+  );
   // 只统计此刻真正在渲染的图层，没渲染的缩略图 / 原图不能算“还在等”
   const pending = isMediaPending([
-    ...(thumbUsable ? [thumbState] : []),
+    ...(showThumb ? [thumbState] : []),
     ...(showOriginal ? [originalState] : []),
   ]);
 
@@ -102,40 +117,43 @@ function ImageLayersInner({
 
   return (
     <div className={cn("relative size-full", className)}>
-      {thumbUsable && (
-        <motion.img
+      {showThumb && (
+        <img
           src={thumb.url}
           alt={alt}
           loading="lazy"
           decoding="async"
           draggable={draggable}
-          initial={false}
-          animate={{ opacity: thumbState === "loaded" ? 1 : 0 }}
-          transition={{ duration: DURATION.base, ease: EASE_OUT }}
+          style={{
+            ...IMAGE_FADE,
+            opacity: thumbState === "loaded" && !originalVisible ? 1 : 0,
+          }}
           onLoad={() => setThumbState("loaded")}
           onError={() => setThumbState("failed")}
           ref={(el: HTMLImageElement | null) => {
-            if (el?.complete && el.naturalWidth > 0) setThumbState("loaded");
+            if (thumbState === "pending" && el?.complete && el.naturalWidth > 0) {
+              setThumbState("loaded");
+            }
           }}
-          className={cn("absolute inset-0 size-full", fitClass)}
+          className={layerClass}
         />
       )}
       {showOriginal && (
-        <motion.img
+        <img
           src={src}
-          alt={thumbUsable ? "" : alt}
+          alt={showThumb ? "" : alt}
           loading="lazy"
           decoding="async"
           draggable={draggable}
-          initial={false}
-          animate={{ opacity: originalState === "loaded" ? 1 : 0 }}
-          transition={{ duration: reduce ? 0 : DURATION.base, ease: EASE_OUT }}
+          style={{ ...IMAGE_FADE, opacity: originalVisible ? 1 : 0 }}
           onLoad={() => setOriginalState("loaded")}
           onError={() => setOriginalState("failed")}
           ref={(el: HTMLImageElement | null) => {
-            if (el?.complete && el.naturalWidth > 0) setOriginalState("loaded");
+            if (originalState === "pending" && el?.complete && el.naturalWidth > 0) {
+              setOriginalState("loaded");
+            }
           }}
-          className={cn("absolute inset-0 size-full", fitClass)}
+          className={layerClass}
         />
       )}
       <MediaSkeleton pending={pending} />
@@ -157,7 +175,7 @@ type VideoPosterProps = {
 };
 
 /**
- * 视频封面 `?v=poster`：不挂载 video，零视频文件请求。
+ * 严格视频封面：不挂载 video，零视频文件请求。
  * 封面到之前盖一层灰色扫光占位（设计稿 6.12），到了淡入替换它。
  * 地址不归后端管、或封面请求失败（404 等）时显示视频占位图标。
  */
@@ -166,7 +184,7 @@ export function VideoPoster({ src, ...rest }: VideoPosterProps) {
 }
 
 function VideoPosterInner({ src, className, iconClassName, onSettledChange }: VideoPosterProps) {
-  const poster = variantUrl(src, "poster");
+  const poster = variantUrl(src, "poster", { strict: true });
   const [state, setState] = useState<MediaLoadState>("pending");
 
   const noPoster = !poster.hasVariant || state === "failed";
@@ -196,7 +214,7 @@ function VideoPosterInner({ src, className, iconClassName, onSettledChange }: Vi
         onLoad={() => setState("loaded")}
         onError={() => setState("failed")}
         ref={(el: HTMLImageElement | null) => {
-          if (el?.complete && el.naturalWidth > 0) setState("loaded");
+          if (state === "pending" && el?.complete && el.naturalWidth > 0) setState("loaded");
         }}
         className={cn("size-full object-cover", className)}
       />

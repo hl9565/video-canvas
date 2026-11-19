@@ -2,6 +2,8 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,7 +12,9 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,6 +24,9 @@ import (
 
 // filesRoutePrefix 是本地存储静态路由的对外前缀，URL() 与 FileServer 必须一致。
 const filesRoutePrefix = "/files/"
+
+// localKeyLocks 按「存储目录 + 对象 key」分片加锁，保证同目录多 LocalStorage 实例并发发布变体与删除仍互斥。
+var localKeyLocks [64]sync.Mutex
 
 // LocalStorage 把对象写到本地磁盘，仅用于开发环境：没有签名、没有过期，
 // 文件通过 /files/*filepath 静态路由公开访问（对象 key 不可猜测，但不要用于生产）。
@@ -91,7 +98,11 @@ func (l *LocalStorage) Put(ctx context.Context, key string, r io.Reader, size in
 	if err = tmp.Close(); err != nil {
 		return fmt.Errorf("storage: 关闭临时文件失败: %w", err)
 	}
-	if err = os.Rename(tmpName, full); err != nil {
+	lock := l.keyLock(key)
+	lock.Lock()
+	err = os.Rename(tmpName, full)
+	lock.Unlock()
+	if err != nil {
 		return fmt.Errorf("storage: 重命名失败: %w", err)
 	}
 	return nil
@@ -99,21 +110,37 @@ func (l *LocalStorage) Put(ctx context.Context, key string, r io.Reader, size in
 
 // Open 读取对象，不存在返回 ErrNotFound。
 func (l *LocalStorage) Open(ctx context.Context, key string) (io.ReadCloser, error) {
-	f, _, err := l.openFile(key)
+	local, err := l.OpenLocal(key)
+	if err != nil {
+		return nil, err
+	}
+	f, _, err := local.Open()
 	if err != nil {
 		return nil, err
 	}
 	return f, nil
 }
 
-// openFile 打开磁盘文件并返回 stat 信息，目录和非法 key 都视为不存在。
-func (l *LocalStorage) openFile(key string) (*os.File, fs.FileInfo, error) {
+// LocalFile 保存已经校验的本地路径和响应元数据，不共享文件句柄。
+type LocalFile struct {
+	path        string
+	name        string
+	ContentType string
+	variant     bool
+}
+
+// OpenLocal 构造本地原文件的句柄信息，非法对象 key 按文件不存在处理。
+func (l *LocalStorage) OpenLocal(key string) (*LocalFile, error) {
 	full, err := l.path(key)
 	if err != nil {
-		// 非法 key 不可能对应任何对象，对读取方等价于不存在
-		return nil, nil, ErrNotFound
+		return nil, ErrNotFound
 	}
-	f, err := os.Open(full)
+	return &LocalFile{path: full, name: filepath.Base(full), ContentType: mime.TypeByExtension(filepath.Ext(full))}, nil
+}
+
+// Open 为本次读取独立打开文件；需由调用方关闭。
+func (l *LocalFile) Open() (*os.File, fs.FileInfo, error) {
+	f, err := os.Open(l.path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil, ErrNotFound
@@ -125,7 +152,7 @@ func (l *LocalStorage) openFile(key string) (*os.File, fs.FileInfo, error) {
 		_ = f.Close()
 		return nil, nil, fmt.Errorf("storage: 读取文件信息失败: %w", err)
 	}
-	if info.IsDir() {
+	if !info.Mode().IsRegular() {
 		_ = f.Close()
 		return nil, nil, ErrNotFound
 	}
@@ -146,10 +173,68 @@ func (l *LocalStorage) Delete(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
+	lock := l.keyLock(key)
+	lock.Lock()
+	defer lock.Unlock()
 	if err := os.Remove(full); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("storage: 删除失败: %w", err)
 	}
+	if err := os.RemoveAll(l.variantDir(key)); err != nil {
+		return fmt.Errorf("storage: 清理变体失败: %w", err)
+	}
 	return nil
+}
+
+// CachePolicy 描述素材响应的浏览器和共享缓存策略。
+type CachePolicy struct {
+	MaxAge    time.Duration
+	Public    bool
+	Immutable bool
+}
+
+// HeaderValue 返回 Cache-Control 的值。
+func (p CachePolicy) HeaderValue() string {
+	visibility := "private"
+	if p.Public {
+		visibility = "public"
+	}
+	value := visibility + ", max-age=" + strconv.FormatInt(int64(p.MaxAge/time.Second), 10)
+	if p.Immutable {
+		value += ", immutable"
+	}
+	return value
+}
+
+// ServeLocalFile 按指定策略提供文件，并支持 Range、HEAD 和条件请求。
+func ServeLocalFile(c *gin.Context, local *LocalFile, cache CachePolicy) {
+	file, info, err := local.Open()
+	if err != nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	defer file.Close()
+	if local.ContentType != "" {
+		c.Header("Content-Type", local.ContentType)
+	}
+	c.Header("X-Content-Type-Options", "nosniff")
+	c.Header("Cache-Control", cache.HeaderValue())
+	c.Header("ETag", localFileETag(local, info))
+	// 私有回退响应（如旧版 ?v=thumb 临时回退到原图）不发 Last-Modified，
+	// 避免客户端带着较新变体的 If-Modified-Since 访问较旧原图时误判 304。
+	modTime := info.ModTime()
+	if !cache.Public {
+		modTime = time.Time{}
+	}
+	http.ServeContent(c.Writer, c.Request, local.name, modTime, file)
+}
+
+func localFileETag(local *LocalFile, info fs.FileInfo) string {
+	kind := "orig"
+	if local.variant {
+		kind = "var"
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d\x00%d", kind, local.ContentType, info.Size(), info.ModTime().UnixNano())))
+	return `"` + kind + "-" + hex.EncodeToString(sum[:8]) + `"`
 }
 
 // FileServer 返回本地存储的静态文件处理器，挂在 /files/*filepath（GET 与 HEAD）。
@@ -159,21 +244,12 @@ func (l *LocalStorage) Delete(ctx context.Context, key string) error {
 func FileServer(l *LocalStorage) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		key := strings.TrimPrefix(c.Param("filepath"), "/")
-		f, info, err := l.openFile(key)
+		file, err := l.OpenLocal(key)
 		if err != nil {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
-		defer f.Close()
-
-		h := c.Writer.Header()
-		if ct := mime.TypeByExtension(filepath.Ext(key)); ct != "" {
-			h.Set("Content-Type", ct)
-		}
-		// 禁止浏览器嗅探成可执行类型；key 不可猜测且内容不可变，可以长期缓存
-		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("Cache-Control", "public, max-age=31536000, immutable")
-		http.ServeContent(c.Writer, c.Request, filepath.Base(key), info.ModTime(), f)
+		ServeLocalFile(c, file, CachePolicy{MaxAge: 365 * 24 * time.Hour, Public: true, Immutable: true})
 	}
 }
 

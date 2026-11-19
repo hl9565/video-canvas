@@ -1,3 +1,5 @@
+import type { MediaLoadState } from "./media-pending";
+
 /**
  * 画布素材加载提速的纯逻辑（设计稿 docs/design/画布素材加载设计 第 6.3、6.4 节）：
  * 变体地址、缩放分档的滞回、视频并发名额。不碰 React，方便单测。
@@ -14,28 +16,78 @@ export type VariantUrl = {
   hasVariant: boolean;
 };
 
+/** 变体请求策略 */
+export type VariantUrlOptions = {
+  /** 启用 pv=2，绕过旧变体缓存并禁止服务端回退原文件 */
+  strict?: boolean;
+};
+
 /** 匹配「可选的 http(s) 域名 + /files/ 路径」 */
 const FILES_URL = /^(?:https?:\/\/[^/?#]+)?\/files\//i;
+
+function isVariantParam(name: string, strict: boolean): boolean {
+  try {
+    const key = strict && name.includes("%") ? decodeURIComponent(name) : name;
+    return key === "v" || (strict && key === "pv");
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 给后端 /files/ 地址追加 `v=thumb|poster`，其余 query 与 hash 原样保留；已有的 v 会被替换。
  * 为什么不改 src 本身：payload 里的稳定地址不能变，变体只在展示时拼出来。
  * @param src 节点里的素材地址，相对或绝对均可
  * @param variant 要的变体
+ * @param opts 是否启用严格变体请求，默认兼容旧地址
  * @returns 变体地址；非 /files/ 地址原样返回并标记无变体
  */
-export function variantUrl(src: string, variant: MediaVariant): VariantUrl {
+export function variantUrl(
+  src: string,
+  variant: MediaVariant,
+  opts?: VariantUrlOptions,
+): VariantUrl {
   if (!FILES_URL.test(src)) return { url: src, hasVariant: false };
+  const strict = opts?.strict === true;
   const hashAt = src.indexOf("#");
   const hash = hashAt >= 0 ? src.slice(hashAt) : "";
   const rest = hashAt >= 0 ? src.slice(0, hashAt) : src;
   const queryAt = rest.indexOf("?");
   const path = queryAt >= 0 ? rest.slice(0, queryAt) : rest;
-  const kept = (queryAt >= 0 ? rest.slice(queryAt + 1) : "")
-    .split("&")
-    .filter((pair) => pair !== "" && pair.split("=")[0] !== "v");
+  const query = queryAt >= 0 ? rest.slice(queryAt + 1) : "";
+  const kept = (query ? query.split("&") : []).filter(
+    (pair) => pair !== "" && !isVariantParam(pair.split("=", 1)[0], strict),
+  );
   kept.push(`v=${variant}`);
+  if (strict) kept.push("pv=2");
   return { url: `${path}?${kept.join("&")}${hash}`, hasVariant: true };
+}
+
+/** 单张图片的加载阶段 */
+export type ImageLoadPhase = MediaLoadState;
+
+/** 图片渐进加载的输入状态 */
+type ImageLayerState = {
+  /** 地址是否支持变体请求 */
+  hasVariant: boolean;
+  /** 缩略图请求的阶段 */
+  thumbState: ImageLoadPhase;
+  /** 当前是否优先显示缩略图 */
+  preferThumb: boolean;
+  /** 当前地址的原图请求是否已发起 */
+  originalStarted: boolean;
+};
+
+/** 缩略图先结算才允许请求原图；已发起的原图请求不随显示档位卸载。 */
+export function resolveImageLayers({
+  hasVariant,
+  thumbState,
+  preferThumb,
+  originalStarted,
+}: ImageLayerState) {
+  const showThumb = hasVariant && thumbState !== "failed";
+  const startOriginal = !showThumb || (thumbState === "loaded" && !preferThumb);
+  return { showThumb, startOriginal, showOriginal: startOriginal || originalStarted };
 }
 
 /** 缩放低于它（降级）才切到缩略图 */

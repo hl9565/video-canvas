@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
+import * as mediaLod from "@/utils/canvas/media-lod";
 import {
   LOD_DOWN_ZOOM,
   LOD_UP_ZOOM,
@@ -35,6 +36,31 @@ describe("variantUrl：给 /files/ 地址追加变体参数", () => {
     expect(variantUrl("/files/x.png#a", "thumb").url).toBe("/files/x.png?v=thumb#a");
   });
 
+  test("严格模式追加 pv=2，并替换旧版本和变体参数，保留其余 query 与 hash", () => {
+    expect(variantUrl("/files/a/b.png", "thumb", { strict: true })).toEqual({
+      url: "/files/a/b.png?v=thumb&pv=2",
+      hasVariant: true,
+    });
+    expect(
+      variantUrl("https://cdn.example.com/files/x.mp4?pv=1&sig=a%2Fb&v=thumb&pv=0#t=2", "poster", {
+        strict: true,
+      }).url,
+    ).toBe("https://cdn.example.com/files/x.mp4?sig=a%2Fb&v=poster&pv=2#t=2");
+  });
+
+  test("strict: false 保留兼容路径，不添加或替换 pv", () => {
+    expect(variantUrl("/files/x.png", "thumb", { strict: false }).url).toBe("/files/x.png?v=thumb");
+    const src = "/files/x.png?pv=1&v=poster#ref";
+    expect(variantUrl(src, "thumb", { strict: false }).url).toBe("/files/x.png?pv=1&v=thumb#ref");
+    expect(variantUrl(src, "thumb").url).toBe("/files/x.png?pv=1&v=thumb#ref");
+  });
+
+  test("严格模式也替换编码过的 v 和 pv，不重写其他参数", () => {
+    expect(
+      variantUrl("/files/x.png?sig=a+b&&%76=poster&p%76=1&flag#ref", "thumb", { strict: true }).url,
+    ).toBe("/files/x.png?sig=a+b&flag&v=thumb&pv=2#ref");
+  });
+
   test("非 /files/ 地址原样返回并标记无变体", () => {
     for (const src of [
       "https://other.com/a.png",
@@ -44,8 +70,45 @@ describe("variantUrl：给 /files/ 地址追加变体参数", () => {
       "",
     ]) {
       expect(variantUrl(src, "thumb")).toEqual({ url: src, hasVariant: false });
+      expect(variantUrl(src, "thumb", { strict: true })).toEqual({ url: src, hasVariant: false });
     }
   });
+});
+
+describe("resolveImageLayers：图片先等缩略图，再按需挂原图", () => {
+  test.each([
+    ["无变体直接加载原图", false, "pending", true, false, false, true, true],
+    ["缩略图未完成时只挂缩略图", true, "pending", true, false, true, false, false],
+    ["高清模式也先等缩略图", true, "pending", false, false, true, false, false],
+    ["缩略图未完成时也保留已发起的请求", true, "pending", false, true, true, true, false],
+    ["低清模式不请求原图", true, "loaded", true, false, true, false, false],
+    ["高清模式开始请求原图", true, "loaded", false, false, true, true, true],
+    ["切回低清模式不卸载原图", true, "loaded", true, true, true, true, false],
+    ["高清模式保留已发起的原图", true, "loaded", false, true, true, true, true],
+    ["缩略图失败后低清模式也回退", true, "failed", true, false, false, true, true],
+    ["缩略图失败后高清模式直接回退", true, "failed", false, false, false, true, true],
+    ["缩略图失败后保留已启动的原图", true, "failed", true, true, false, true, true],
+  ] as const)(
+    "%s",
+    (
+      _name,
+      hasVariant,
+      thumbState,
+      preferThumb,
+      originalStarted,
+      showThumb,
+      showOriginal,
+      startOriginal,
+    ) => {
+      expect(
+        mediaLod.resolveImageLayers({ hasVariant, thumbState, preferThumb, originalStarted }),
+      ).toEqual({
+        showThumb,
+        showOriginal,
+        startOriginal,
+      });
+    },
+  );
 });
 
 describe("nextLowDetail：缩放滞回", () => {

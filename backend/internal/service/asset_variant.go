@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"go.uber.org/zap"
@@ -13,9 +14,9 @@ import (
 )
 
 const (
-	// variantPublicMaxAge 是公开读处理地址（永久稳定、不带签名）允许浏览器缓存跳转的时长。
+	// variantPublicMaxAge 用于本地变体及不带签名的云处理地址。
 	variantPublicMaxAge = 24 * time.Hour
-	// variantFallbackMaxAge 是回退到原图时跳转的缓存上限：处理服务发布后要尽快生效，所以不能缓存太久。
+	// variantFallbackMaxAge 是回退到原图的缓存上限，避免后续可用的变体被旧响应遮蔽。
 	variantFallbackMaxAge = 60 * time.Second
 )
 
@@ -28,13 +29,26 @@ type AssetVariantResolver interface {
 
 var _ AssetVariantResolver = (*ImageProcessorService)(nil)
 
-// SetVariantResolver 设置缩略图 / 封面的处理服务解析器；不设置时所有变体都按“没有处理服务”回退。
+// SetVariantResolver 设置缩略图 / 封面的云处理服务解析器。
 func (s *AssetService) SetVariantResolver(r AssetVariantResolver) { s.variants = r }
 
-// ResolveVariant 决定 /files/<key>?v=thumb|poster 怎么响应：
-// 素材所在存储有已发布的处理服务时跳转到厂商的处理地址；否则缩略图回退到原图，封面返回 404
-// （视频没有“原图可回退”：回退到几十 MB 的原视频会让低缩放下的大画布更慢，前端显示占位即可）。
+// SetLocalVariantResolver 设置本地存储的按需预览调度器。
+func (s *AssetService) SetLocalVariantResolver(resolver *LocalVariantService) {
+	s.localVariants = resolver
+}
+
+// VariantOptions 控制没有可用变体时是否允许回退到原图。
+type VariantOptions struct {
+	Strict bool
+}
+
+// ResolveVariant 保持旧客户端的缩略图回退行为，封面仍不得回退到原视频。
 func (s *AssetService) ResolveVariant(ctx context.Context, key, variant string) (*FileTarget, error) {
+	return s.ResolveVariantWithOptions(ctx, key, variant, VariantOptions{})
+}
+
+// ResolveVariantWithOptions 优先提供云或本地预览，仅兼容缩略图请求可回退原图。
+func (s *AssetService) ResolveVariantWithOptions(ctx context.Context, key, variant string, opts VariantOptions) (*FileTarget, error) {
 	// 1. 变体只有两种，取值不对按不存在处理
 	if variant != imageproc.VariantThumb && variant != imageproc.VariantPoster {
 		return nil, errcode.ErrAssetNotFound
@@ -52,29 +66,51 @@ func (s *AssetService) ResolveVariant(ctx context.Context, key, variant string) 
 		return nil, errcode.ErrAssetNotFound
 	}
 
-	// 4. 有处理服务就跳转到处理地址；生成地址出错只记日志并回退，不能让画布因为处理服务出问题而坏掉
-	if s.variants != nil {
-		tgt, ok, err := s.variants.Resolve(ctx, a.StorageID, h, key, variant)
-		switch {
-		case err != nil:
-			logger.Warn("生成素材变体地址失败，已回退", zap.Uint64("storage_id", a.StorageID), zap.String("variant", variant), zap.Error(err))
-		case ok:
-			return &FileTarget{RedirectURL: tgt.URL, MaxAge: s.variantMaxAge(h, tgt)}, nil
+	// 4. 保留云处理服务的跳转策略，未命中时才尝试本地预览。
+	if target := s.cloudVariantTarget(ctx, a.StorageID, h, key, variant); target != nil {
+		return target, nil
+	}
+	strict := opts.Strict || variant == imageproc.VariantPoster
+	if local, ok := h.Storage.(*storage.LocalStorage); ok && s.localVariants != nil {
+		file, err := s.localVariants.Resolve(ctx, local, key, variant)
+		if err == nil {
+			return &FileTarget{Local: file, MaxAge: variantPublicMaxAge, CachePublic: true}, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if strict && errors.Is(err, errcode.ErrVariantUnavailable) {
+			return nil, errcode.ErrVariantUnavailable
 		}
 	}
 
-	// 5. 回退：封面没有可回退的原图；缩略图回到原图，并把缓存压短
-	if variant == imageproc.VariantPoster {
+	// 5. 封面和严格缩略图返回 404，避免画布误下载原始大文件；兼容缩略图仅短期私有缓存。
+	if strict {
 		return nil, errcode.ErrAssetNotFound
 	}
-	t, err := s.targetOf(ctx, h, key, a)
+	target, err := s.targetOf(ctx, h, key, a)
 	if err != nil {
 		return nil, err
 	}
-	if t.MaxAge > variantFallbackMaxAge {
-		t.MaxAge = variantFallbackMaxAge
+	target.MaxAge = min(target.MaxAge, variantFallbackMaxAge)
+	target.CachePublic, target.CacheImmutable = false, false
+	return target, nil
+}
+
+// cloudVariantTarget 仅在已有云处理服务命中时返回跳转，错误由下一候选处理。
+func (s *AssetService) cloudVariantTarget(ctx context.Context, storageID uint64, handle *storage.Handle, key, variant string) *FileTarget {
+	if s.variants == nil {
+		return nil
 	}
-	return t, nil
+	target, ok, err := s.variants.Resolve(ctx, storageID, handle, key, variant)
+	if err != nil {
+		logger.Warn("生成素材云变体地址失败", zap.Uint64("storage_id", storageID), zap.String("variant", variant), zap.Error(err))
+		return nil
+	}
+	if !ok {
+		return nil
+	}
+	return &FileTarget{RedirectURL: target.URL, MaxAge: s.variantMaxAge(handle, target)}
 }
 
 // variantMaxAge 决定处理地址的跳转缓存时长：公开读地址永久稳定，可以缓存一天；

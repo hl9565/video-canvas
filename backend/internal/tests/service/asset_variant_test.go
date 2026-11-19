@@ -3,6 +3,13 @@ package service_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +18,7 @@ import (
 	"video-canvas/internal/config"
 	"video-canvas/internal/model"
 	"video-canvas/internal/pkg/errcode"
+	"video-canvas/internal/pkg/videoframe"
 	"video-canvas/internal/storage"
 )
 
@@ -106,8 +114,11 @@ func TestAssetService_ResolveVariant(t *testing.T) {
 		repo.rows[5] = &model.Asset{ID: 5, UserID: 1, Kind: "image", StorageID: 1, StorageKey: key, MimeType: "image/png"}
 		svc := NewAssetService(repo, newFakeRegistry(1, &storage.Handle{ID: 1, Provider: storage.ProviderLocal, Storage: local}), config.Storage{})
 		tgt, err := svc.ResolveVariant(ctx, key, "thumb")
-		if err != nil || tgt.Local != local {
+		if err != nil || tgt.Local == nil || tgt.MaxAge != time.Minute || tgt.CachePublic || tgt.CacheImmutable {
 			t.Fatalf("实际 %+v err=%v", tgt, err)
+		}
+		if tgt, err := svc.ResolveVariantWithOptions(ctx, key, "thumb", VariantOptions{Strict: true}); tgt != nil || !errors.Is(err, errcode.ErrAssetNotFound) {
+			t.Fatalf("严格模式不能返回原图: %+v %v", tgt, err)
 		}
 	})
 
@@ -172,4 +183,267 @@ func TestAssetService_ResolveVariant(t *testing.T) {
 			t.Fatalf("实际 %d", got)
 		}
 	})
+}
+
+type localPreviewFake func(context.Context, string, io.Writer) error
+
+func (f localPreviewFake) Format(_ context.Context) (videoframe.PreviewInfo, error) {
+	return videoframe.PreviewInfo{Format: "webp", MIME: "image/webp"}, nil
+}
+
+func (f localPreviewFake) Encode(ctx context.Context, path string, dst io.Writer) (videoframe.PreviewInfo, error) {
+	info, _ := f.Format(ctx)
+	return info, f(ctx, path, dst)
+}
+
+type previewWaitingContext struct {
+	context.Context
+	waiting chan struct{}
+	once    sync.Once
+}
+
+func (c *previewWaitingContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.waiting) })
+	return c.Context.Done()
+}
+
+func awaitPreview[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待预览超时")
+		var zero T
+		return zero
+	}
+}
+
+func seedLocalPreview(t *testing.T, local *storage.LocalStorage, key, contents string) {
+	t.Helper()
+	if err := local.Put(t.Context(), key, strings.NewReader(contents), int64(len(contents)), "image/png"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newPreviewStorage(t *testing.T) (*storage.LocalStorage, string) {
+	t.Helper()
+	dir := t.TempDir()
+	local, err := storage.NewLocal(config.LocalStorage{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return local, dir
+}
+
+func beginPreview(ctx context.Context, t *testing.T, svc *LocalVariantService, local *storage.LocalStorage, key string) <-chan error {
+	t.Helper()
+	waiter := &previewWaitingContext{Context: ctx, waiting: make(chan struct{})}
+	result := make(chan error, 1)
+	go func() {
+		_, err := svc.Resolve(waiter, local, key, "thumb")
+		result <- err
+	}()
+	select {
+	case <-waiter.waiting:
+		return result
+	case err := <-result:
+		t.Fatalf("请求未等候就返回: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("请求未进入调度")
+	}
+	return nil
+}
+
+func TestLocalVariantSharedGeneration(t *testing.T) {
+	local, _ := newPreviewStorage(t)
+	const key = "source.png"
+	seedLocalPreview(t, local, key, "original")
+	started, release := make(chan struct{}, 2), make(chan struct{})
+	var calls atomic.Int32
+	svc := NewLocalVariantService(t.Context(), localPreviewFake(func(ctx context.Context, _ string, dst io.Writer) error {
+		calls.Add(1)
+		started <- struct{}{}
+		select {
+		case <-release:
+			_, err := io.WriteString(dst, "preview")
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}))
+	t.Cleanup(svc.Close)
+	firstCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	first := beginPreview(firstCtx, t, svc, local, key)
+	awaitPreview(t, started)
+	second := beginPreview(t.Context(), t, svc, local, key)
+	cancel()
+	if err := awaitPreview(t, first); !errors.Is(err, context.Canceled) {
+		t.Fatalf("首请求取消: %v", err)
+	}
+	// 大量热点重复请求取消退出，不影响共享任务与存活等待者
+	for range 32 {
+		burstCtx, burstCancel := context.WithCancel(t.Context())
+		burst := beginPreview(burstCtx, t, svc, local, key)
+		burstCancel()
+		if err := awaitPreview(t, burst); !errors.Is(err, context.Canceled) {
+			t.Fatalf("突发取消请求应立即返回 Canceled: %v", err)
+		}
+	}
+	close(release)
+	if err := awaitPreview(t, second); err != nil {
+		t.Fatalf("另一个等待者应正常完成: %v", err)
+	}
+	file, err := svc.Resolve(t.Context(), local, key, "thumb")
+	if err != nil || file.ContentType != "image/webp" || calls.Load() != 1 {
+		t.Fatalf("缓存应复用编码结果: file=%+v calls=%d err=%v", file, calls.Load(), err)
+	}
+}
+
+func TestLocalVariantQueueAndClose(t *testing.T) {
+	local, dir := newPreviewStorage(t)
+	started := make(chan struct{}, 66)
+	var calls atomic.Int32
+	svc := NewLocalVariantService(t.Context(), localPreviewFake(func(ctx context.Context, _ string, dst io.Writer) error {
+		calls.Add(1)
+		if _, err := io.WriteString(dst, "partial"); err != nil {
+			return err
+		}
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}))
+	t.Cleanup(svc.Close)
+	var results []<-chan error
+	for index := range 66 {
+		key := fmt.Sprintf("source-%d.png", index)
+		seedLocalPreview(t, local, key, "original")
+		results = append(results, beginPreview(t.Context(), t, svc, local, key))
+		if index < 2 {
+			awaitPreview(t, started)
+		}
+	}
+	seedLocalPreview(t, local, "extra.png", "original")
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if _, err := svc.Resolve(ctx, local, "extra.png", "thumb"); !errors.Is(err, errcode.ErrVariantUnavailable) {
+		t.Fatalf("2 个运行 + 64 个等待时应立即 503: %v", err)
+	}
+	duplicate := beginPreview(t.Context(), t, svc, local, "source-0.png")
+	closed := make(chan struct{})
+	go func() { svc.Close(); close(closed) }()
+	awaitPreview(t, closed)
+	for _, result := range append(results, duplicate) {
+		if err := awaitPreview(t, result); !errors.Is(err, errcode.ErrVariantUnavailable) {
+			t.Fatalf("关闭应取消运行与排队: %v", err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("关闭时不应启动排队编码: %d", calls.Load())
+	}
+	if _, err := svc.Resolve(t.Context(), local, "extra.png", "thumb"); !errors.Is(err, errcode.ErrVariantUnavailable) {
+		t.Fatalf("关闭后应停止接单: %v", err)
+	}
+	if err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+		if err == nil && strings.HasPrefix(entry.Name(), ".tmp-") {
+			t.Errorf("关闭后临时文件残留: %s", path)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocalVariantFailureCooldown(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"decode failure", videoframe.ErrDecode, 1},
+		{"oversized", videoframe.ErrTooLarge, 1},
+		{"no encoder", videoframe.ErrUnavailable, 1},
+		{"timeout", context.DeadlineExceeded, 2},
+		{"busy", errcode.ErrVariantUnavailable, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local, _ := newPreviewStorage(t)
+			seedLocalPreview(t, local, "source.png", "original")
+			var calls atomic.Int32
+			svc := NewLocalVariantService(t.Context(), localPreviewFake(func(_ context.Context, _ string, _ io.Writer) error {
+				calls.Add(1)
+				return tc.err
+			}))
+			t.Cleanup(svc.Close)
+			wantErr := tc.err
+			if errors.Is(wantErr, context.DeadlineExceeded) {
+				wantErr = errcode.ErrVariantUnavailable
+			}
+			for range 2 {
+				if _, err := svc.Resolve(t.Context(), local, "source.png", "thumb"); !errors.Is(err, wantErr) {
+					t.Fatalf("err=%v want=%v", err, wantErr)
+				}
+			}
+			if got := int(calls.Load()); got != tc.want {
+				t.Fatalf("编码次数 %d，期望 %d", got, tc.want)
+			}
+			seedLocalPreview(t, local, "source.png", "different fingerprint")
+			_, _ = svc.Resolve(t.Context(), local, "source.png", "thumb")
+			if got := int(calls.Load()); got != tc.want+1 {
+				t.Fatalf("新指纹不应沿用旧失败: calls=%d", got)
+			}
+		})
+	}
+}
+
+func TestAssetServiceLocalVariantPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, variant string
+		strict              bool
+		encodeErr, want     error
+		cache               time.Duration
+	}{
+		{"strict thumb success", "image", "thumb", true, nil, nil, 24 * time.Hour},
+		{"poster success", "video", "poster", false, nil, nil, 24 * time.Hour},
+		{"strict thumb invalid", "image", "thumb", true, videoframe.ErrDecode, errcode.ErrAssetNotFound, 0},
+		{"poster invalid", "video", "poster", false, videoframe.ErrDecode, errcode.ErrAssetNotFound, 0},
+		{"legacy thumb invalid", "image", "thumb", false, videoframe.ErrDecode, nil, time.Minute},
+		{"strict thumb busy", "image", "thumb", true, context.DeadlineExceeded, errcode.ErrVariantUnavailable, 0},
+		{"poster busy", "video", "poster", false, context.DeadlineExceeded, errcode.ErrVariantUnavailable, 0},
+		{"legacy thumb busy", "image", "thumb", false, context.DeadlineExceeded, nil, time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			local, _ := newPreviewStorage(t)
+			const key = "local-source.bin"
+			seedLocalPreview(t, local, key, "original")
+			repo := newFakeAssetRepo()
+			repo.rows[5] = &model.Asset{ID: 5, Kind: tc.kind, StorageID: 1, StorageKey: key, MimeType: tc.kind + "/original"}
+			assets := NewAssetService(repo, newFakeRegistry(1, &storage.Handle{ID: 1, Provider: storage.ProviderLocal, Storage: local}), config.Storage{})
+			svc := NewLocalVariantService(t.Context(), localPreviewFake(func(_ context.Context, _ string, dst io.Writer) error {
+				if tc.encodeErr != nil {
+					return tc.encodeErr
+				}
+				_, err := io.WriteString(dst, "encoded preview")
+				return err
+			}))
+			t.Cleanup(svc.Close)
+			assets.SetLocalVariantResolver(svc)
+			target, err := assets.ResolveVariantWithOptions(t.Context(), key, tc.variant, VariantOptions{Strict: tc.strict})
+			if tc.want != nil {
+				if !errors.Is(err, tc.want) || target != nil {
+					t.Fatalf("target=%+v err=%v want=%v", target, err, tc.want)
+				}
+				return
+			}
+			mime := tc.kind + "/original"
+			if tc.encodeErr == nil {
+				mime = "image/webp"
+			}
+			if err != nil || target.Local == nil || target.Local.ContentType != mime || target.MaxAge != tc.cache ||
+				target.CachePublic != (tc.encodeErr == nil) || target.CacheImmutable {
+				t.Fatalf("target=%+v err=%v", target, err)
+			}
+		})
+	}
 }

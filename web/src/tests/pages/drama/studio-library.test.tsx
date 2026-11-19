@@ -39,7 +39,7 @@ describe("片场资产库", () => {
         <Component />
       </StudioContext.Provider>,
     );
-    expect(html).toContain(`src="${src}?v=thumb"`);
+    expect(html).toContain(`src="${src}?v=thumb&amp;pv=2"`);
     expect(html).not.toContain(`src="${src}"`);
     expect(html).toContain("object-cover");
     expect(html).toContain('data-slot="media-skeleton"');

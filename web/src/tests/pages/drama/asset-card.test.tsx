@@ -56,7 +56,7 @@ describe("AssetCard：短剧资产卡", () => {
   test.each(["character", "image"] as const)("%s 资产封面只加载缩略图", (kind) => {
     const src = "/files/assets/sheet.png";
     const out = card(item({ status: "done", data: { kind, src } as CanvasNodeData }));
-    expect(out).toContain(`src="${src}?v=thumb"`);
+    expect(out).toContain(`src="${src}?v=thumb&amp;pv=2"`);
     expect(out).not.toContain(`src="${src}"`);
     expect(out).toContain('data-slot="media-skeleton"');
   });

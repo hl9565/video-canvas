@@ -46,7 +46,7 @@ function probeVideo(url: string, cors = true): Promise<number | null> {
 
 /**
  * 量素材的真实画幅：图片读缩略图、视频读封面（变体都按长边等比缩放，比例不变），
- * 这样低缩放档也不会为了量尺寸去拉原图；没有变体的地址（外链、blob:）才直接读原图或视频元数据。
+ * 缩略图失败才读原图；站内视频封面失败不读原视频，只有无变体的视频才读元数据。
  * @param src 节点里的素材地址
  * @param mediaType 素材种类；音频没有画面，直接返回 null
  * @returns 宽 / 高；量不出来为 null
@@ -56,10 +56,10 @@ export async function probeMediaAspect(
   mediaType: NodeMediaType,
 ): Promise<number | null> {
   if (mediaType === "audio") return null;
-  const variant = variantUrl(src, mediaType === "image" ? "thumb" : "poster");
+  const variant = variantUrl(src, mediaType === "image" ? "thumb" : "poster", { strict: true });
   if (variant.hasVariant) {
     const aspect = await probeImage(variant.url);
-    if (aspect !== null) return aspect;
+    if (aspect !== null || mediaType === "video") return aspect;
   }
   return mediaType === "image" ? probeImage(src) : probeVideo(src);
 }
